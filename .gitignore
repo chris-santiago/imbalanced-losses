@@ -1,0 +1,97 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.dylib
+*.dll
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments / Conda envs
+.env
+.venv
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.conda/
+
+# Python version / tool files
+.python-version
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache
+coverage.xml
+nosetests.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE / editor
+.vscode/
+.idea/
+.zed/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local secrets / config
+.env.local
+.env.*.local
+
+# SQLite
+*.sqlite3
+*.db
+
+# PyTorch / model artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Misc
+tmp/
+temp/
