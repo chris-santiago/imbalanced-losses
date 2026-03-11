@@ -138,12 +138,30 @@ class LossWarmupWrapper(nn.Module):
 
     @property
     def in_warmup(self) -> bool:
-        """True while ``_epoch < warmup_epochs``."""
+        """
+        Whether the wrapper is currently in the warmup phase.
+
+        Returns
+        -------
+        bool
+            True while ``_epoch < warmup_epochs``; False once the main
+            loss is active.
+        """
         return self._epoch < self.warmup_epochs
 
     @property
     def current_temperature(self) -> float | None:
-        """Current ``main_loss.temperature``, or None if unavailable."""
+        """
+        The temperature currently set on ``main_loss``.
+
+        Returns
+        -------
+        float or None
+            ``float(main_loss.temperature)`` if ``main_loss`` has a
+            ``temperature`` attribute, ``None`` otherwise.  During
+            warmup the value reflects whatever was last written to
+            ``main_loss.temperature`` (typically ``temp_start``).
+        """
         if not self._has_temperature:
             return None
         return float(self.main_loss.temperature)  # type: ignore[union-attr]
@@ -152,16 +170,23 @@ class LossWarmupWrapper(nn.Module):
 
     def on_train_epoch_start(self, epoch: int) -> None:
         """
-        Call from ``LightningModule.on_train_epoch_start``.
+        Advance the epoch counter and handle phase transition bookkeeping.
 
-        Advances the epoch counter, detects the warmup→main phase
-        transition (recording the switch step and setting temperature
-        to ``temp_start``), and optionally resets the main loss queue.
+        Call this from ``LightningModule.on_train_epoch_start`` passing
+        ``self.current_epoch``.  Responsibilities:
+
+        - Updates the internal epoch counter.
+        - On the first epoch of the main phase, sets the ``_switch_step``
+          sentinel so that :meth:`on_train_batch_start` can latch the
+          exact global step.
+        - Calls ``main_loss.reset_queue()`` at the start of each main-phase
+          epoch when ``reset_queue_each_epoch=True`` and the method exists.
 
         Parameters
         ----------
         epoch : int
-            Zero-indexed current epoch (``self.current_epoch`` in Lightning).
+            Zero-indexed current epoch number, as provided by
+            ``self.current_epoch`` in a LightningModule.
         """
         self._epoch = epoch
 
@@ -176,16 +201,22 @@ class LossWarmupWrapper(nn.Module):
 
     def on_train_batch_start(self, global_step: int) -> None:
         """
-        Call from ``LightningModule.on_train_batch_start``.
+        Update the temperature schedule for the current training step.
 
-        Records the switch step on the first main-phase batch and updates
-        ``main_loss.temperature`` via geometric decay.
+        Call this from ``LightningModule.on_train_batch_start`` passing
+        ``self.global_step``.  Responsibilities:
+
+        - On the first main-phase batch, latches ``_switch_step`` to
+          ``global_step`` and sets temperature to ``temp_start``.
+        - On all subsequent main-phase batches, applies the geometric
+          decay formula and writes the result to ``main_loss.temperature``.
+        - Is a no-op during warmup or before the phase sentinel is set.
 
         Parameters
         ----------
         global_step : int
-            Monotonically increasing step counter (``self.global_step`` in
-            Lightning).
+            Monotonically increasing global step counter, as provided by
+            ``self.global_step`` in a LightningModule.
         """
         if self.in_warmup or self._switch_step is None:
             return
@@ -206,6 +237,19 @@ class LossWarmupWrapper(nn.Module):
     # ─�� helpers ─────────────────────────────────────────────────────────────
 
     def _apply_temperature(self, temp: float) -> None:
+        """
+        Write a temperature value to ``main_loss.temperature``.
+
+        Parameters
+        ----------
+        temp : float
+            Temperature value to assign.
+
+        Notes
+        -----
+        No-op if ``main_loss`` has no ``temperature`` attribute
+        (``_has_temperature`` is False).
+        """
         if self._has_temperature:
             self.main_loss.temperature = temp  # type: ignore[union-attr]
 
@@ -213,10 +257,27 @@ class LossWarmupWrapper(nn.Module):
 
     def forward(self, logits, targets, **kwargs):
         """
-        Delegate to the active loss.
+        Compute loss using the currently active loss module.
 
-        ``**kwargs`` (e.g. ``return_per_class=True``) are forwarded to
-        ``main_loss`` only; they are silently ignored during warmup.
+        Parameters
+        ----------
+        logits : torch.Tensor
+            Raw class scores, shape as expected by the active loss.
+        targets : torch.Tensor
+            Integer class labels or binary targets, shape as expected by
+            the active loss.
+        **kwargs
+            Additional keyword arguments forwarded to ``main_loss`` only
+            (e.g. ``return_per_class=True``).  Silently ignored during
+            the warmup phase.
+
+        Returns
+        -------
+        torch.Tensor or tuple
+            Output of the active loss module.  Shape and type match the
+            active module's contract: scalar (or ``[C]`` tensor) from
+            ``SmoothAPLoss`` / ``RecallAtQuantileLoss``; scalar from
+            standard ``nn.Module`` warmup losses.
         """
         if self.in_warmup:
             return self.warmup_loss(logits, targets)
