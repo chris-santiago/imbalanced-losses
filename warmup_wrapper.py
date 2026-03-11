@@ -1,0 +1,260 @@
+"""
+LossWarmupWrapper — phase-switching loss with geometric temperature decay.
+
+Usage in a LightningModule
+---------------------------
+    class MyModel(pl.LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.loss_fn = LossWarmupWrapper(
+                warmup_loss=nn.CrossEntropyLoss(),
+                main_loss=SmoothAPLoss(num_classes=10, queue_size=1024),
+                warmup_epochs=5,
+                temp_start=0.05,
+                temp_end=0.005,
+                temp_decay_steps=10_000,
+            )
+
+        def on_train_epoch_start(self):
+            self.loss_fn.on_train_epoch_start(self.current_epoch)
+
+        def on_train_batch_start(self, batch, batch_idx):
+            self.loss_fn.on_train_batch_start(self.global_step)
+
+        def training_step(self, batch, batch_idx):
+            logits, targets = batch
+            loss = self.loss_fn(logits, targets)
+            self.log("train/loss", loss)
+            self.log("train/in_warmup", float(self.loss_fn.in_warmup))
+            if (t := self.loss_fn.current_temperature) is not None:
+                self.log("train/temperature", t)
+            return loss
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+
+import torch.nn as nn
+
+
+class LossWarmupWrapper(nn.Module):
+    """
+    Wraps a warmup loss and a main ranking loss with two features:
+
+    1. **Phase switching** — ``warmup_loss`` is active for epochs
+       ``< warmup_epochs``; ``main_loss`` is active thereafter.
+
+    2. **Geometric temperature decay** — ``main_loss.temperature`` decays
+       from ``temp_start`` to ``temp_end`` over ``temp_decay_steps``
+       global training steps, starting from the moment of phase switch::
+
+           temp(t) = temp_start * (temp_end / temp_start) ** (t / temp_decay_steps)
+
+       After ``temp_decay_steps`` steps the temperature is held at
+       ``temp_end``.
+
+    Call :meth:`on_train_epoch_start` and :meth:`on_train_batch_start`
+    from the corresponding PyTorch Lightning hooks (or your training loop).
+
+    Parameters
+    ----------
+    warmup_loss : nn.Module
+        Loss used during warmup.  Must accept ``(logits, targets)``.
+        Typical choice: ``nn.CrossEntropyLoss()``.
+    main_loss : nn.Module
+        Loss used after warmup.  Must accept ``(logits, targets, **kwargs)``.
+        Typical choice: ``SmoothAPLoss``, ``RecallAtQuantileLoss``.
+    warmup_epochs : int
+        Number of epochs to use ``warmup_loss`` (0 = skip warmup entirely).
+    temp_start : float
+        Temperature at the start of the main phase.
+    temp_end : float
+        Temperature after ``temp_decay_steps`` steps.
+    temp_decay_steps : int
+        Number of global training steps over which to decay temperature.
+    reset_queue_each_epoch : bool, optional
+        Call ``main_loss.reset_queue()`` at the start of each epoch in
+        the main phase (if the method exists).  Default: False.
+    """
+
+    def __init__(
+        self,
+        warmup_loss: nn.Module,
+        main_loss: nn.Module,
+        warmup_epochs: int,
+        temp_start: float,
+        temp_end: float,
+        temp_decay_steps: int,
+        *,
+        reset_queue_each_epoch: bool = False,
+    ) -> None:
+        super().__init__()
+
+        if warmup_epochs < 0:
+            raise ValueError(f"warmup_epochs must be >= 0, got {warmup_epochs}")
+        if temp_start <= 0 or temp_end <= 0:
+            raise ValueError("temp_start and temp_end must be positive")
+        if temp_decay_steps <= 0:
+            raise ValueError(
+                f"temp_decay_steps must be positive, got {temp_decay_steps}"
+            )
+
+        self.warmup_loss = warmup_loss
+        self.main_loss = main_loss
+        self.warmup_epochs = warmup_epochs
+        self.temp_start = float(temp_start)
+        self.temp_end = float(temp_end)
+        self.temp_decay_steps = temp_decay_steps
+        self.reset_queue_each_epoch = reset_queue_each_epoch
+
+        self._has_temperature: bool = hasattr(main_loss, "temperature")
+        self._has_reset_queue: bool = hasattr(main_loss, "reset_queue")
+
+        if not self._has_temperature:
+            warnings.warn(
+                f"{type(main_loss).__name__} has no 'temperature' attribute; "
+                "temperature scheduling will be skipped.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if reset_queue_each_epoch and not self._has_reset_queue:
+            warnings.warn(
+                f"{type(main_loss).__name__} has no 'reset_queue' method; "
+                "reset_queue_each_epoch will have no effect.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        self._epoch: int = 0
+        self._switch_step: int | None = None  # global step when main phase began
+
+        if warmup_epochs == 0:
+            self._switch_step = 0
+            self._apply_temperature(self.temp_start)
+
+    # ── properties ──────────────────────────────────────────────────────────
+
+    @property
+    def in_warmup(self) -> bool:
+        """True while ``_epoch < warmup_epochs``."""
+        return self._epoch < self.warmup_epochs
+
+    @property
+    def current_temperature(self) -> float | None:
+        """Current ``main_loss.temperature``, or None if unavailable."""
+        if not self._has_temperature:
+            return None
+        return float(self.main_loss.temperature)  # type: ignore[union-attr]
+
+    # ── Lightning / training-loop hooks ─────────────────────────────────────
+
+    def on_train_epoch_start(self, epoch: int) -> None:
+        """
+        Call from ``LightningModule.on_train_epoch_start``.
+
+        Advances the epoch counter, detects the warmup→main phase
+        transition (recording the switch step and setting temperature
+        to ``temp_start``), and optionally resets the main loss queue.
+
+        Parameters
+        ----------
+        epoch : int
+            Zero-indexed current epoch (``self.current_epoch`` in Lightning).
+        """
+        self._epoch = epoch
+
+        if not self.in_warmup and self._switch_step is None:
+            # First epoch in the main phase — record switch point.
+            # _step is not tracked; we derive temperature from global_step
+            # passed to on_train_batch_start, so initialise switch_step lazily.
+            self._switch_step = -1  # sentinel; overwritten on first batch hook
+
+        if not self.in_warmup and self.reset_queue_each_epoch and self._has_reset_queue:
+            self.main_loss.reset_queue()  # type: ignore[union-attr]
+
+    def on_train_batch_start(self, global_step: int) -> None:
+        """
+        Call from ``LightningModule.on_train_batch_start``.
+
+        Records the switch step on the first main-phase batch and updates
+        ``main_loss.temperature`` via geometric decay.
+
+        Parameters
+        ----------
+        global_step : int
+            Monotonically increasing step counter (``self.global_step`` in
+            Lightning).
+        """
+        if self.in_warmup or self._switch_step is None:
+            return
+
+        # Latch the exact step at which the main phase began.
+        if self._switch_step == -1:
+            self._switch_step = global_step
+            self._apply_temperature(self.temp_start)
+            return
+
+        elapsed = global_step - self._switch_step
+        frac = min(1.0, elapsed / self.temp_decay_steps)
+        temp = self.temp_start * math.exp(
+            frac * math.log(self.temp_end / self.temp_start)
+        )
+        self._apply_temperature(temp)
+
+    # ─�� helpers ─────────────────────────────────────────────────────────────
+
+    def _apply_temperature(self, temp: float) -> None:
+        if self._has_temperature:
+            self.main_loss.temperature = temp  # type: ignore[union-attr]
+
+    # ── forward ─────────────────────────────────────────────────────────────
+
+    def forward(self, logits, targets, **kwargs):
+        """
+        Delegate to the active loss.
+
+        ``**kwargs`` (e.g. ``return_per_class=True``) are forwarded to
+        ``main_loss`` only; they are silently ignored during warmup.
+        """
+        if self.in_warmup:
+            return self.warmup_loss(logits, targets)
+        return self.main_loss(logits, targets, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import torch
+    import torch.nn as nn
+
+    from ap_loss import SmoothAPLoss
+
+    torch.manual_seed(0)
+    C, B = 4, 16
+    logits = torch.randn(B, C, requires_grad=True)
+    targets = torch.randint(0, C, (B,))
+
+    wrapper = LossWarmupWrapper(
+        warmup_loss=nn.CrossEntropyLoss(),
+        main_loss=SmoothAPLoss(num_classes=C, queue_size=64),
+        warmup_epochs=2,
+        temp_start=0.5,
+        temp_end=0.01,
+        temp_decay_steps=100,
+    )
+
+    for epoch in range(4):
+        wrapper.on_train_epoch_start(epoch)
+        for step in range(3):
+            global_step = epoch * 3 + step
+            wrapper.on_train_batch_start(global_step)
+            with torch.no_grad():
+                loss = wrapper(logits, targets)
+            t = wrapper.current_temperature
+            print(
+                f"epoch={epoch} step={global_step:3d}  "
+                f"in_warmup={wrapper.in_warmup}  "
+                f"temp={f'{t:.5f}' if t is not None else 'N/A'}  "
+                f"loss={loss.item():.4f}"
+            )
