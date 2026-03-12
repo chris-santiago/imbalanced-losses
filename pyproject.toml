@@ -1,7 +1,27 @@
 [project]
 name = "proxy-losses"
 version = "0.1.0"
+description = """
+proxy-losses** is a PyTorch library of differentiable proxy losses for ranking metrics — intended as drop-in replacements for cross-entropy when the real objective is Average Precision or recall at a specific operating point.
+
+**What's in it:**
+
+- **`SmoothAPLoss`** — Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(M²) in pool size. Supports multi-class, binary, and seq2seq settings.
+- **`RecallAtQuantileLoss`** — Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
+- **`LossWarmupWrapper`** — Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
+
+**Design points:**
+- Circular memory queue stabilizes gradient estimates across small batches — critical at low positive rates (e.g. 0.5%)
+- Compatible with PyTorch Lightning via `on_train_epoch_start` / `on_train_batch_start` hooks
+- `toy_demo.py` demonstrates the full warmup→blend→AP pipeline on a highly imbalanced binary classification task using sklearn's `make_classification
+"""
+authors = [
+    {name = "Chris Santiago", email = "cjsantiago@gatech.edu"},
+]
 requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+
 dependencies = [
     "torch>=2.10.0",
 ]
