@@ -108,15 +108,31 @@ loss_fn.reset_queue()
 
 **Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate.
 
-## `LossWarmupWrapper` — BCE/CE warmup + geometric temperature decay
+## `LossWarmupWrapper` — BCE/CE warmup + loss blending + geometric temperature decay
 
-A wrapper that lets you train with a standard loss (e.g. `CrossEntropyLoss`) for an initial warm-up period, then switch to a ranking loss with a geometrically decaying temperature schedule.
+A wrapper that trains with a standard loss (e.g. `CrossEntropyLoss`) for a warmup period, optionally blends both losses over a transition period, then switches to the ranking loss with a geometrically decaying temperature schedule.
 
 ```
 temp(t) = temp_start × (temp_end / temp_start) ^ (elapsed_steps / temp_decay_steps)
 ```
 
 The schedule clock starts at the moment of phase switch, not at training start.
+
+**Queue poisoning fix:** At the switch point the wrapper automatically calls `main_loss.reset_queue()` (if available), ensuring the ranking loss never sees stale warmup-era logits.
+
+### Blending
+
+`blend_epochs` adds a linear ramp between warmup and pure AP:
+
+```
+Epoch 0–W-1:  warmup_loss only          (ap_weight = 0)
+Epoch W:      (1−w)×warmup + w×AP       w = 1/(blend_epochs+1)
+Epoch W+1:    (1−w)×warmup + w×AP       w = 2/(blend_epochs+1)
+...
+Epoch W+B+:   main_loss only            (ap_weight = 1)
+```
+
+With `warmup_epochs=2, blend_epochs=2`: epochs 2→`1/3 AP`, 3→`2/3 AP`, 4+→pure AP.
 
 ### Usage (PyTorch Lightning)
 
@@ -131,10 +147,10 @@ class MyModel(pl.LightningModule):
             warmup_loss=nn.CrossEntropyLoss(),
             main_loss=SmoothAPLoss(num_classes=10, queue_size=1024),
             warmup_epochs=5,
-            temp_start=0.05,   # soft at switch — stable gradients
-            temp_end=0.005,    # sharp after schedule — closer to true rank
-            temp_decay_steps=10_000,
-            reset_queue_each_epoch=True,
+            blend_epochs=2,        # gradual transition
+            temp_start=0.5,        # soft at switch — stable gradients
+            temp_end=0.01,         # sharp after schedule — closer to true rank
+            temp_decay_steps=50_000,
         )
 
     def on_train_epoch_start(self):
@@ -147,13 +163,13 @@ class MyModel(pl.LightningModule):
         logits, targets = batch
         loss = self.loss_fn(logits, targets)
         self.log("train/loss", loss)
-        self.log("train/in_warmup", float(self.loss_fn.in_warmup))
+        self.log("train/ap_weight", self.loss_fn.ap_weight)
         if (t := self.loss_fn.current_temperature) is not None:
             self.log("train/temperature", t)
         return loss
 ```
 
-`**kwargs` (e.g. `return_per_class=True`) are forwarded to `main_loss` only; they are silently ignored during warmup.
+`**kwargs` (e.g. `return_per_class=True`) are forwarded to `main_loss` only when `ap_weight == 1.0`; silently ignored during warmup and blend phases.
 
 ### Parameters
 
@@ -165,6 +181,7 @@ class MyModel(pl.LightningModule):
 | `temp_start` | required | Temperature at phase switch |
 | `temp_end` | required | Temperature after `temp_decay_steps` steps |
 | `temp_decay_steps` | required | Steps over which to decay temperature |
+| `blend_epochs` | `0` | Epochs to linearly ramp from warmup to main loss; `0` = hard switch |
 | `reset_queue_each_epoch` | `False` | Call `main_loss.reset_queue()` at the start of each main-phase epoch |
 
 ### Properties / methods
@@ -172,9 +189,11 @@ class MyModel(pl.LightningModule):
 | | Description |
 |---|---|
 | `in_warmup` | `True` while `epoch < warmup_epochs` |
+| `in_blend` | `True` during the `blend_epochs` transition period |
+| `ap_weight` | Current AP loss weight: `0.0` during warmup, linear ramp during blend, `1.0` after |
 | `current_temperature` | Current `main_loss.temperature`, or `None` if unavailable |
 | `on_train_epoch_start(epoch)` | Advance epoch counter; detect phase switch; optionally reset queue |
-| `on_train_batch_start(global_step)` | Latch `switch_step` on first main-phase batch; update temperature |
+| `on_train_batch_start(global_step)` | Latch `switch_step` on first main-phase batch; reset queue; update temperature |
 
 ## Tests
 

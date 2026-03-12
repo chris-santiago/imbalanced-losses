@@ -44,6 +44,7 @@ def _make_wrapper(
     temp_end: float = 0.01,
     temp_decay_steps: int = 100,
     *,
+    blend_epochs: int = 0,
     reset_queue_each_epoch: bool = False,
     main_loss: nn.Module | None = None,
     warmup_loss: nn.Module | None = None,
@@ -59,6 +60,7 @@ def _make_wrapper(
         temp_start=temp_start,
         temp_end=temp_end,
         temp_decay_steps=temp_decay_steps,
+        blend_epochs=blend_epochs,
         reset_queue_each_epoch=reset_queue_each_epoch,
     )
 
@@ -530,3 +532,212 @@ class TestIntegration:
             for s in range(5):
                 wrapper.on_train_batch_start(epoch * 5 + s)
         assert wrapper._switch_step == first_switch
+
+
+# ---------------------------------------------------------------------------
+# Queue reset at switch point
+# ---------------------------------------------------------------------------
+
+
+class TestQueueResetAtSwitch:
+    def test_queue_reset_on_phase_switch(self):
+        main = SmoothAPLoss(num_classes=4, queue_size=16)
+        w = _make_wrapper(warmup_epochs=1, main_loss=main)
+        # Fill queue during warmup (direct call, no wrapper involvement)
+        main.training = True
+        logits = torch.randn(4, 4)
+        tgts = torch.randint(0, 4, (4,))
+        main(logits, tgts)
+        assert int(main._q_ptr) > 0
+
+        # Trigger switch
+        w.on_train_epoch_start(1)   # sentinel = -1
+        w.on_train_batch_start(10)  # latch + reset
+        assert int(main._q_ptr) == 0
+
+    def test_queue_reset_only_once(self):
+        main = SmoothAPLoss(num_classes=4, queue_size=16)
+        w = _make_wrapper(warmup_epochs=1, main_loss=main)
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(10)  # latch + reset
+        # Simulate a few main-phase batches filling the queue
+        main.training = True
+        logits = torch.randn(4, 4)
+        tgts = torch.randint(0, 4, (4,))
+        main(logits, tgts)
+        ptr_after_fill = int(main._q_ptr)
+        assert ptr_after_fill > 0
+
+        # Next batch: no second reset
+        w.on_train_batch_start(11)
+        assert int(main._q_ptr) == ptr_after_fill
+
+    def test_no_reset_when_no_reset_queue_method(self):
+        main = nn.Linear(4, 4)  # no reset_queue
+        with pytest.warns(UserWarning):
+            w = LossWarmupWrapper(
+                warmup_loss=nn.CrossEntropyLoss(),
+                main_loss=main,
+                warmup_epochs=1,
+                temp_start=0.1,
+                temp_end=0.01,
+                temp_decay_steps=10,
+            )
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(0)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# blend_epochs — validation and properties
+# ---------------------------------------------------------------------------
+
+
+class TestBlendEpochs:
+    def test_negative_blend_epochs_raises(self):
+        with pytest.raises(ValueError, match="blend_epochs"):
+            _make_wrapper(blend_epochs=-1)
+
+    def test_zero_blend_epochs_default(self):
+        w = _make_wrapper(warmup_epochs=2, blend_epochs=0)
+        w.on_train_epoch_start(2)
+        assert not w.in_blend
+        assert w.ap_weight == 1.0
+
+    def test_in_blend_true_during_blend_epochs(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=2)
+        w.on_train_epoch_start(1)
+        assert w.in_blend
+        w.on_train_epoch_start(2)
+        assert w.in_blend
+
+    def test_in_blend_false_after_blend_epochs(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=2)
+        w.on_train_epoch_start(3)
+        assert not w.in_blend
+
+    def test_in_blend_false_during_warmup(self):
+        w = _make_wrapper(warmup_epochs=2, blend_epochs=2)
+        w.on_train_epoch_start(0)
+        assert not w.in_blend
+        w.on_train_epoch_start(1)
+        assert not w.in_blend
+
+    def test_ap_weight_zero_during_warmup(self):
+        w = _make_wrapper(warmup_epochs=2, blend_epochs=2)
+        for epoch in range(2):
+            w.on_train_epoch_start(epoch)
+            assert w.ap_weight == 0.0
+
+    def test_ap_weight_ramp_during_blend(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=3)
+        # blend_epoch_index 0,1,2 → weights 1/4, 2/4, 3/4
+        w.on_train_epoch_start(1)
+        assert w.ap_weight == pytest.approx(1 / 4)
+        w.on_train_epoch_start(2)
+        assert w.ap_weight == pytest.approx(2 / 4)
+        w.on_train_epoch_start(3)
+        assert w.ap_weight == pytest.approx(3 / 4)
+
+    def test_ap_weight_one_after_blend(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=2)
+        w.on_train_epoch_start(3)
+        assert w.ap_weight == 1.0
+
+    def test_ap_weight_one_with_no_blend(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=0)
+        w.on_train_epoch_start(1)
+        assert w.ap_weight == 1.0
+
+
+# ---------------------------------------------------------------------------
+# forward — blending
+# ---------------------------------------------------------------------------
+
+
+class TestForwardBlend:
+    C, B = 4, 16
+
+    def _batch(self):
+        logits = torch.randn(self.B, self.C)
+        targets = torch.randint(0, self.C, (self.B,))
+        return logits, targets
+
+    def test_blend_arithmetic(self):
+        """Blended loss equals (1-w)*warmup + w*main up to floating point."""
+        warmup = nn.CrossEntropyLoss()
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = LossWarmupWrapper(
+            warmup_loss=warmup,
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=100,
+            blend_epochs=3,
+        )
+        w.on_train_epoch_start(1)   # blend epoch 0 → ap_weight = 1/4
+        w.on_train_batch_start(10)
+        logits, targets = self._batch()
+        with torch.no_grad():
+            blended = w(logits, targets)
+            wt = w.ap_weight
+            expected = (1 - wt) * warmup(logits, targets) + wt * main(logits, targets)
+        assert blended == pytest.approx(expected.item(), rel=1e-5)
+
+    def test_kwargs_forwarded_after_blend(self):
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=1, main_loss=main)
+        w.on_train_epoch_start(2)   # past blend → pure main
+        w.on_train_batch_start(20)
+        logits, targets = self._batch()
+        result = w(logits, targets, return_per_class=True)
+        assert isinstance(result, tuple)
+
+    def test_gradient_flows_through_both_during_blend(self):
+        warmup = nn.CrossEntropyLoss()
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = LossWarmupWrapper(
+            warmup_loss=warmup,
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=100,
+            blend_epochs=2,
+        )
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(0)
+        logits = torch.randn(self.B, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (self.B,))
+        loss = w(logits, targets)
+        loss.backward()
+        assert logits.grad is not None
+        assert logits.grad.norm() > 0
+
+    def test_temperature_active_during_blend(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=2, temp_start=0.1, temp_end=0.01, temp_decay_steps=100)
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(0)   # latch
+        w.on_train_batch_start(50)  # half-way through decay
+        expected = 0.1 * math.exp(0.5 * math.log(0.01 / 0.1))
+        assert w.current_temperature == pytest.approx(expected, rel=1e-6)
+
+    def test_integration_full_loop_with_blend(self):
+        wrapper = LossWarmupWrapper(
+            warmup_loss=nn.CrossEntropyLoss(),
+            main_loss=SmoothAPLoss(num_classes=self.C, queue_size=32),
+            warmup_epochs=2,
+            temp_start=0.1,
+            temp_end=0.005,
+            temp_decay_steps=20,
+            blend_epochs=2,
+        )
+        for epoch in range(6):
+            wrapper.on_train_epoch_start(epoch)
+            for s in range(5):
+                global_step = epoch * 5 + s
+                wrapper.on_train_batch_start(global_step)
+                logits = torch.randn(self.B, self.C, requires_grad=True)
+                targets = torch.randint(0, self.C, (self.B,))
+                loss = wrapper(logits, targets)
+                loss.backward()

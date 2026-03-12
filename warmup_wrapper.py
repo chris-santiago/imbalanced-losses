@@ -74,6 +74,12 @@ class LossWarmupWrapper(nn.Module):
         Temperature after ``temp_decay_steps`` steps.
     temp_decay_steps : int
         Number of global training steps over which to decay temperature.
+    blend_epochs : int, optional
+        Number of epochs after warmup to linearly blend from ``warmup_loss``
+        to ``main_loss``.  During blend epoch ``k`` (0-indexed),
+        ``ap_weight = (k + 1) / (blend_epochs + 1)``.  After the blend
+        period, ``ap_weight = 1.0`` (pure ``main_loss``).  Default: 0
+        (hard switch, backward-compatible).
     reset_queue_each_epoch : bool, optional
         Call ``main_loss.reset_queue()`` at the start of each epoch in
         the main phase (if the method exists).  Default: False.
@@ -88,6 +94,7 @@ class LossWarmupWrapper(nn.Module):
         temp_end: float,
         temp_decay_steps: int,
         *,
+        blend_epochs: int = 0,
         reset_queue_each_epoch: bool = False,
     ) -> None:
         super().__init__()
@@ -100,6 +107,8 @@ class LossWarmupWrapper(nn.Module):
             raise ValueError(
                 f"temp_decay_steps must be positive, got {temp_decay_steps}"
             )
+        if blend_epochs < 0:
+            raise ValueError(f"blend_epochs must be >= 0, got {blend_epochs}")
 
         self.warmup_loss = warmup_loss
         self.main_loss = main_loss
@@ -107,6 +116,7 @@ class LossWarmupWrapper(nn.Module):
         self.temp_start = float(temp_start)
         self.temp_end = float(temp_end)
         self.temp_decay_steps = temp_decay_steps
+        self.blend_epochs = blend_epochs
         self.reset_queue_each_epoch = reset_queue_each_epoch
 
         self._has_temperature: bool = hasattr(main_loss, "temperature")
@@ -135,6 +145,25 @@ class LossWarmupWrapper(nn.Module):
             self._apply_temperature(self.temp_start)
 
     # ── properties ──────────────────────────────────────────────────────────
+
+    @property
+    def in_blend(self) -> bool:
+        """Whether the wrapper is currently in the blend phase."""
+        return (
+            not self.in_warmup
+            and self.blend_epochs > 0
+            and self._epoch < self.warmup_epochs + self.blend_epochs
+        )
+
+    @property
+    def ap_weight(self) -> float:
+        """Current AP loss weight (0.0 during warmup, ramp during blend, 1.0 after)."""
+        if self.in_warmup:
+            return 0.0
+        if self.blend_epochs == 0 or self._epoch >= self.warmup_epochs + self.blend_epochs:
+            return 1.0
+        blend_epoch_index = self._epoch - self.warmup_epochs
+        return (blend_epoch_index + 1) / (self.blend_epochs + 1)
 
     @property
     def in_warmup(self) -> bool:
@@ -225,6 +254,8 @@ class LossWarmupWrapper(nn.Module):
         if self._switch_step == -1:
             self._switch_step = global_step
             self._apply_temperature(self.temp_start)
+            if self._has_reset_queue:
+                self.main_loss.reset_queue()  # type: ignore[union-attr]
             return
 
         elapsed = global_step - self._switch_step
@@ -274,14 +305,18 @@ class LossWarmupWrapper(nn.Module):
         Returns
         -------
         torch.Tensor or tuple
-            Output of the active loss module.  Shape and type match the
-            active module's contract: scalar (or ``[C]`` tensor) from
-            ``SmoothAPLoss`` / ``RecallAtQuantileLoss``; scalar from
-            standard ``nn.Module`` warmup losses.
+            During warmup or blend: scalar tensor.  After blend: output of
+            ``main_loss`` (scalar or tuple when ``return_per_class=True``).
+            ``**kwargs`` are forwarded to ``main_loss`` only when
+            ``ap_weight == 1.0``; they are silently ignored during warmup
+            and blend phases.
         """
         if self.in_warmup:
             return self.warmup_loss(logits, targets)
-        return self.main_loss(logits, targets, **kwargs)
+        w = self.ap_weight
+        if w >= 1.0:
+            return self.main_loss(logits, targets, **kwargs)
+        return (1 - w) * self.warmup_loss(logits, targets) + w * self.main_loss(logits, targets)
 
 
 # ---------------------------------------------------------------------------
