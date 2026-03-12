@@ -10,3 +10,8 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+
+[project.optional-dependencies]
+demo = [
+    "scikit-learn>=1.0",
+]
