@@ -206,29 +206,42 @@ class MyModel(pl.LightningModule):
 | `on_train_epoch_start(epoch)` | Advance epoch counter; detect phase switch; optionally reset queue |
 | `on_train_batch_start(global_step)` | Latch `switch_step` on first main-phase batch; reset queue; update temperature |
 
-## Toy demo
+## Examples
 
-`toy_demo.py` trains a small MLP on an imbalanced binary classification task (default: 0.5% positive rate) using `make_classification` from scikit-learn. It prints epoch-by-epoch AUCPR so you can see whether the warmup→blend→AP transition helps or hurts.
-
-Requires the `demo` extras:
+Require the `demo` extras:
 
 ```bash
 uv sync --extra demo
 # or: pip install scikit-learn
 ```
 
+### `toy_demo.py` — single-run trace
+
+Trains one model (warmup → blend → AP) and prints epoch-by-epoch phase, ap_weight, temperature, loss, and AUCPR.
+
 ```bash
-# Default: 3 warmup + 2 blend epochs, then pure AP
-python examples/toy_demo.py
-
-# Hard switch for comparison
-python examples/toy_demo.py --blend-epochs 0
-
-# Easier problem
-python examples/toy_demo.py --pos-rate 0.05
+python examples/toy_demo.py                    # default: 3 warmup + 2 blend epochs
+python examples/toy_demo.py --blend-epochs 0   # hard switch (no blend)
+python examples/toy_demo.py --pos-rate 0.05    # easier problem
 ```
 
-Key flags: `--pos-rate`, `--warmup-epochs`, `--blend-epochs`, `--total-epochs`, `--batch-size`, `--queue-size`, `--temp-start`, `--temp-end`, `--lr`, `--seed`.
+### `compare_demo.py` — side-by-side comparison
+
+Trains three models on the same data and seed and prints a per-epoch AUCPR table:
+
+| Strategy | Description |
+|---|---|
+| warmup-only | BCE for all epochs; never switches to AP |
+| AP-only | SmoothAPLoss from epoch 0, no warmup |
+| warmup+blend | BCE warmup → linear blend → pure SmoothAPLoss |
+
+```bash
+python examples/compare_demo.py
+python examples/compare_demo.py --pos-rate 0.05
+python examples/compare_demo.py --warmup-epochs 5 --blend-epochs 3
+```
+
+Key flags (both scripts): `--pos-rate`, `--warmup-epochs`, `--blend-epochs`, `--total-epochs`, `--batch-size`, `--queue-size`, `--temp-start`, `--temp-end`, `--lr`, `--seed`.
 
 ## Tests
 
