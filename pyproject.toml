@@ -1,6 +1,6 @@
 [project]
 name = "proxy-losses"
-version = "0.1.2"
+version = "0.1.3"
 description = """
 proxy-losses is a PyTorch library of differentiable proxy losses for ranking metrics — intended as drop-in replacements for cross-entropy when the real objective is Average Precision or recall at a specific operating point.
 """

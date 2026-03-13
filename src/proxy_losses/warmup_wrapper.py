@@ -83,6 +83,11 @@ class LossWarmupWrapper(nn.Module):
     reset_queue_each_epoch : bool, optional
         Call ``main_loss.reset_queue()`` at the start of each epoch in
         the main phase (if the method exists).  Default: False.
+    gather_distributed : bool or None, optional
+        Forwarded to ``main_loss.gather_distributed`` if the attribute
+        exists.  ``None`` (default) auto-detects DDP at first forward;
+        ``False`` explicitly disables gathering.  No-op if ``main_loss``
+        does not have a ``gather_distributed`` attribute.  Default: None.
     """
 
     def __init__(
@@ -96,6 +101,7 @@ class LossWarmupWrapper(nn.Module):
         *,
         blend_epochs: int = 0,
         reset_queue_each_epoch: bool = False,
+        gather_distributed: bool | None = None,
     ) -> None:
         super().__init__()
 
@@ -118,6 +124,9 @@ class LossWarmupWrapper(nn.Module):
         self.temp_decay_steps = temp_decay_steps
         self.blend_epochs = blend_epochs
         self.reset_queue_each_epoch = reset_queue_each_epoch
+
+        if hasattr(main_loss, "gather_distributed"):
+            main_loss.gather_distributed = gather_distributed  # type: ignore[union-attr]
 
         self._has_temperature: bool = hasattr(main_loss, "temperature")
         self._has_reset_queue: bool = hasattr(main_loss, "reset_queue")

@@ -18,6 +18,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+from proxy_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
 class SmoothAPLoss(nn.Module):
@@ -53,6 +54,12 @@ class SmoothAPLoss(nn.Module):
     update_queue_in_eval : bool, optional
         If False (default), the queue is frozen during eval mode. Set to
         True to allow queue updates during validation. Default: False.
+    gather_distributed : bool or None, optional
+        Whether to all-gather logits and targets across DDP workers before
+        computing the loss. ``None`` (default) auto-detects: gathers when
+        ``torch.distributed`` is initialized with world_size > 1. Set
+        ``False`` to explicitly disable. Resolved once on first forward call,
+        so safe to construct before ``dist.init_process_group``. Default: None.
 
     Examples
     --------
@@ -67,6 +74,9 @@ class SmoothAPLoss(nn.Module):
     Complexity of _compute_smooth_ap is O(|P| × M), where |P| is the number
     of positives in the pool and M = batch_size + queue_size. At low positive
     rates this is much cheaper than the naive O(M²) formulation.
+
+    In DDP, set ``gather_distributed=False`` to opt out; otherwise the loss
+    auto-detects and all-gathers on first forward when world_size > 1.
     """
 
     def __init__(
@@ -77,6 +87,7 @@ class SmoothAPLoss(nn.Module):
         reduction: Literal["mean", "sum", "none"] = "mean",
         ignore_index: int = -100,
         update_queue_in_eval: bool = False,
+        gather_distributed: bool | None = None,
     ) -> None:
         super().__init__()
 
@@ -95,6 +106,8 @@ class SmoothAPLoss(nn.Module):
         self.reduction = reduction
         self.ignore_index = ignore_index
         self.update_queue_in_eval = update_queue_in_eval
+        self.gather_distributed = gather_distributed
+        self._gather_resolved: bool | None = None
 
         if queue_size > 0:
             # Unfilled slots carry ignore_index targets and are stripped naturally.
@@ -251,6 +264,28 @@ class SmoothAPLoss(nn.Module):
         ap = (rank_pos / rank_all).mean()
         return ap, True
 
+    def _should_gather(self) -> bool:
+        """
+        Return True if logits/targets should be all-gathered before this forward.
+
+        Resolved once on first call and cached. Safe to call before
+        ``dist.init_process_group`` — will simply return False until dist
+        is initialized.
+
+        Returns
+        -------
+        bool
+        """
+        if self._gather_resolved is None:
+            import torch.distributed as dist
+            self._gather_resolved = (
+                self.gather_distributed is not False
+                and dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            )
+        return self._gather_resolved
+
     def _should_update_queue(self) -> bool:
         """
         Return True if the queue should be updated on this forward pass.
@@ -326,6 +361,10 @@ class SmoothAPLoss(nn.Module):
             raise ValueError(f"Expected logits [N, {self.num_classes}], got {tuple(logits.shape)}")
         if targets.ndim != 1 or targets.size(0) != logits.size(0):
             raise ValueError(f"targets must be [N] matching logits, got {tuple(targets.shape)}")
+
+        if self._should_gather():
+            logits  = all_gather_with_grad(logits)
+            targets = all_gather_no_grad(targets)
 
         all_logits, all_targets = self._merge_with_queue(logits, targets)
 

@@ -26,6 +26,7 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+from proxy_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
 class RecallAtQuantileLoss(nn.Module):
@@ -69,6 +70,12 @@ class RecallAtQuantileLoss(nn.Module):
         estimation and recall. Default: -100.
     update_queue_in_eval : bool, optional
         If False (default), the queue is frozen during eval mode. Default: False.
+    gather_distributed : bool or None, optional
+        Whether to all-gather logits and targets across DDP workers before
+        computing the loss. ``None`` (default) auto-detects: gathers when
+        ``torch.distributed`` is initialized with world_size > 1. Set
+        ``False`` to explicitly disable. Resolved once on first forward call,
+        so safe to construct before ``dist.init_process_group``. Default: None.
     quantile_interpolation : str, optional
         Interpolation method passed to torch.quantile. 'higher' is the
         conservative default — the threshold never undershoots the true
@@ -101,6 +108,7 @@ class RecallAtQuantileLoss(nn.Module):
         reduction: Literal["mean", "sum", "none"] = "mean",
         ignore_index: int = -100,
         update_queue_in_eval: bool = False,
+        gather_distributed: bool | None = None,
         quantile_interpolation: str = "higher",
     ) -> None:
         super().__init__()
@@ -128,6 +136,8 @@ class RecallAtQuantileLoss(nn.Module):
         self.reduction = reduction
         self.ignore_index = ignore_index
         self.update_queue_in_eval = update_queue_in_eval
+        self.gather_distributed = gather_distributed
+        self._gather_resolved: bool | None = None
         self.quantile_interpolation = quantile_interpolation
 
         if queue_size > 0:
@@ -217,6 +227,28 @@ class RecallAtQuantileLoss(nn.Module):
             self._q_logits.zero_()
             self._q_targets.fill_(self.ignore_index)
             self._q_ptr.zero_()
+
+    def _should_gather(self) -> bool:
+        """
+        Return True if logits/targets should be all-gathered before this forward.
+
+        Resolved once on first call and cached. Safe to call before
+        ``dist.init_process_group`` — will simply return False until dist
+        is initialized.
+
+        Returns
+        -------
+        bool
+        """
+        if self._gather_resolved is None:
+            import torch.distributed as dist
+            self._gather_resolved = (
+                self.gather_distributed is not False
+                and dist.is_available()
+                and dist.is_initialized()
+                and dist.get_world_size() > 1
+            )
+        return self._gather_resolved
 
     def _should_update_queue(self) -> bool:
         """
@@ -330,6 +362,10 @@ class RecallAtQuantileLoss(nn.Module):
             raise ValueError(
                 f"targets must be [N] matching logits, got {tuple(targets.shape)}"
             )
+
+        if self._should_gather():
+            logits  = all_gather_with_grad(logits)
+            targets = all_gather_no_grad(targets)
 
         all_logits, all_targets = self._merge_with_queue(logits, targets)
 
