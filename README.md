@@ -1,11 +1,11 @@
-# proxy-losses
+# imbalanced-losses
 
-**proxy-losses** is a PyTorch library of differentiable proxy losses for ranking metrics — intended as drop-in replacements for cross-entropy when the real objective is Average Precision or recall at a specific operating point.
-
-> **Note on naming:** "Proxy loss" here means *surrogate objective* — a differentiable approximation to a metric (AP, recall@q) that is otherwise non-differentiable. This is unrelated to *proxy-based* losses in deep metric learning (e.g. ProxyNCA, Proxy-Anchor), which use learned proxy vectors to represent class distributions.
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification — including Focal Loss, Smooth-AP, and Recall-at-Quantile — with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
 
 **What's in it:**
 
+- **`SigmoidFocalLoss`** — Binary/multi-label focal loss (Lin et al., ICCV 2017). Sigmoid activation; `alpha` re-balances pos/neg, `gamma` down-weights easy examples. Drop-in replacement for `BCEWithLogitsLoss`.
+- **`SoftmaxFocalLoss`** — Multiclass focal loss with softmax. Supports `mean_positive` reduction (RetinaNet convention: normalize by positive count), per-class `alpha` weighting, label smoothing, and arbitrary spatial/sequence input shapes.
 - **`SmoothAPLoss`** — Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(M²) in pool size. Supports multi-class, binary, and seq2seq settings.
 - **`RecallAtQuantileLoss`** — Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
 - **`LossWarmupWrapper`** — Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
@@ -16,6 +16,51 @@
 - `toy_demo.py` demonstrates the full warmup→blend→AP pipeline on a highly imbalanced binary classification task using sklearn's `make_classification
 
 ## Losses
+
+### `SigmoidFocalLoss` — Focal Loss, binary / multi-label (Lin et al., 2017)
+
+Replaces `BCEWithLogitsLoss` for imbalanced binary or multi-label classification. `gamma` suppresses the contribution of easy (well-classified) examples so training focuses on hard ones; `alpha` re-weights the positive class:
+
+```
+p_t  = sigmoid(logit) · y  +  (1 − sigmoid(logit)) · (1 − y)
+loss = −α_t · (1 − p_t)^γ · log(p_t)
+```
+
+```python
+from imbalanced_losses import SigmoidFocalLoss
+
+loss_fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+logits  = torch.randn(32, 1)          # arbitrary shape
+targets = torch.randint(0, 2, (32, 1)).float()  # float 0/1
+loss = loss_fn(logits, targets)
+loss.backward()
+```
+
+### `SoftmaxFocalLoss` — Focal Loss, multiclass (Lin et al., 2017)
+
+Extends focal loss to mutually-exclusive classification via softmax. Supports all standard input shapes `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, etc.
+
+```python
+from imbalanced_losses import SoftmaxFocalLoss
+
+# Standard multiclass
+loss_fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean")
+logits  = torch.randn(32, 10)         # [N, C]
+targets = torch.randint(0, 10, (32,)) # [N] integer labels
+loss = loss_fn(logits, targets)
+
+# RetinaNet-style: normalize by positive count, not total
+loss_fn = SoftmaxFocalLoss(
+    gamma=2.0,
+    alpha=[0.25] * 10,        # per-class weights
+    reduction="mean_positive", # denominator = #positives only
+    background_class=0,
+    ignore_index=-100,
+)
+loss = loss_fn(logits, targets)
+```
+
+**`mean_positive` reduction:** The numerator sums loss over *all* valid (non-ignored) positions including background. The denominator counts only non-background valid positions. This matches the RetinaNet convention and stabilizes the loss scale when the vast majority of samples are background.
 
 ### `SmoothAPLoss` — Smooth Average Precision (Brown et al., 2020)
 
@@ -44,8 +89,17 @@ Gradient flows only through positive scores, pushing them above the cutoff. Usef
 
 ## Features
 
-Both losses share the same interface and design:
+**All losses** support DDP all-gather via `gather_distributed` (auto-detected by default).
 
+**Focal losses** (`SigmoidFocalLoss`, `SoftmaxFocalLoss`):
+- Arbitrary input shapes — `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, …
+- `ignore_index` masking — padded positions contribute zero loss and zero gradient
+- `mean` reduction divides by valid (non-ignored) count, not total tensor size
+- `mean_positive` reduction (softmax only) — normalizes by positive count for detection tasks
+- `alpha` — scalar (sigmoid) or per-class tensor (softmax) class reweighting
+- `label_smoothing` (softmax only) — forwarded directly to `F.cross_entropy`
+
+**Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`):
 - **Memory queue** — circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
 - **Multi-class** — one-vs-rest per class using `logits[:, c]`
 - **Binary** — set `num_classes=1` with targets in `{0, 1}`
@@ -60,21 +114,21 @@ Requires Python ≥ 3.10 and PyTorch ≥ 2.8.
 
 ```bash
 # from PyPI
-pip install proxy-losses
+pip install imbalanced-losses
 
 # from GitHub (latest dev)
-pip install git+https://github.com/chris-santiago/proxy-losses.git
+pip install git+https://github.com/chris-santiago/imbalanced-losses.git
 
 # with uv (for development / contributing)
-git clone https://github.com/chris-santiago/proxy-losses.git
-cd proxy-losses
+git clone https://github.com/chris-santiago/imbalanced-losses.git
+cd imbalanced-losses
 uv sync
 ```
 
 To run the example scripts, install the optional demo dependencies:
 
 ```bash
-pip install "proxy-losses[demo]"
+pip install "imbalanced-losses[demo]"
 # or with uv:
 uv sync --extra demo
 ```
@@ -82,8 +136,8 @@ uv sync --extra demo
 ## Usage
 
 ```python
-from proxy_losses import SmoothAPLoss
-from proxy_losses import RecallAtQuantileLoss
+from imbalanced_losses import SmoothAPLoss
+from imbalanced_losses import RecallAtQuantileLoss
 
 # Multi-class AP loss
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, temperature=0.01)
@@ -119,6 +173,20 @@ loss_fn.reset_queue()
 
 ## Parameters
 
+### Focal losses
+
+| Parameter | Default | Description |
+|---|---|---|
+| `alpha` | `0.25` / `None` | Pos/neg balance weight in `[0,1]` or `-1` to disable (sigmoid); per-class tensor or `None` (softmax) |
+| `gamma` | `2.0` | Focusing exponent; `0` recovers vanilla BCE/CE |
+| `reduction` | `'none'` / `'mean'` | `'none'`, `'mean'`, `'sum'`, or `'mean_positive'` (softmax only) |
+| `ignore_index` | `-100` | *(SoftmaxFocalLoss only)* Target value for padding positions |
+| `background_class` | `0` | *(SoftmaxFocalLoss only)* Class excluded from `mean_positive` denominator |
+| `label_smoothing` | `0.0` | *(SoftmaxFocalLoss only)* Forwarded to `F.cross_entropy` |
+| `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
+
+### Ranking losses
+
 | Parameter | Default | Description |
 |---|---|---|
 | `num_classes` | required | Number of output classes; use `1` for binary |
@@ -127,6 +195,7 @@ loss_fn.reset_queue()
 | `reduction` | `'mean'` | `'mean'`, `'sum'`, or `'none'` |
 | `ignore_index` | `-100` | Target value for padding positions |
 | `update_queue_in_eval` | `False` | Allow queue updates during `model.eval()` |
+| `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss only)* `torch.quantile` interpolation method |
 
@@ -163,8 +232,8 @@ With `warmup_epochs=2, blend_epochs=2`: epochs 2→`1/3 AP`, 3→`2/3 AP`, 4+→
 ### Usage (PyTorch Lightning)
 
 ```python
-from proxy_losses import SmoothAPLoss
-from proxy_losses import LossWarmupWrapper
+from imbalanced_losses import SmoothAPLoss
+from imbalanced_losses import LossWarmupWrapper
 
 class MyModel(pl.LightningModule):
     def __init__(self):
@@ -223,11 +292,11 @@ class MyModel(pl.LightningModule):
 
 ## Distributed Training (DDP)
 
-Both losses work in DDP setups, but rank estimation requires the full global batch — not just the local shard. The `proxy_losses.distributed` module provides two all-gather helpers that handle this correctly.
+Both losses work in DDP setups, but rank estimation requires the full global batch — not just the local shard. The `imbalanced_losses.distributed` module provides two all-gather helpers that handle this correctly.
 
 ### Why this matters
 
-In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `SmoothAPLoss` and the quantile threshold in `RecallAtQuantileLoss` become noisy or biased when computed on a shard. Gathering logits and targets across all workers before passing them to the loss fixes this.
+In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `SmoothAPLoss` and the quantile threshold in `RecallAtQuantileLoss` become noisy or biased when computed on a shard. For `SoftmaxFocalLoss` with `mean_positive` reduction, the positive count in the denominator is similarly unreliable when positives are rare and unevenly distributed across ranks. Gathering logits and targets across all workers before passing them to the loss fixes this for all three cases.
 
 ### Helpers
 
@@ -243,8 +312,8 @@ In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `
 ### Usage
 
 ```python
-from proxy_losses import SmoothAPLoss
-from proxy_losses.distributed import all_gather_with_grad, all_gather_no_grad
+from imbalanced_losses import SmoothAPLoss
+from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_grad
 
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
 
@@ -260,8 +329,8 @@ Both helpers raise `RuntimeError` if `torch.distributed` is not available or not
 ### PyTorch Lightning (DDP)
 
 ```python
-from proxy_losses import SmoothAPLoss, LossWarmupWrapper
-from proxy_losses.distributed import all_gather_with_grad, all_gather_no_grad
+from imbalanced_losses import SmoothAPLoss, LossWarmupWrapper
+from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_grad
 
 class MyModel(pl.LightningModule):
     def __init__(self):
@@ -295,6 +364,23 @@ python examples/toy_demo.py --blend-epochs 0   # hard switch (no blend)
 python examples/toy_demo.py --pos-rate 0.05    # easier problem
 ```
 
+### `focal_demo.py` — BCE vs focal loss comparison
+
+Trains four models on the same imbalanced data and prints per-epoch AUCPR:
+
+| Strategy | Description |
+|---|---|
+| BCE | Vanilla `BCEWithLogitsLoss`; easy negatives dominate |
+| BCE+weight | `BCEWithLogitsLoss` with `pos_weight = n_neg/n_pos` |
+| focal α γ | `SigmoidFocalLoss(alpha=0.25, gamma=2)` — RetinaNet defaults |
+| focal γ only | `SigmoidFocalLoss(alpha=-1, gamma=2)` — focusing only, no alpha |
+
+```bash
+python examples/focal_demo.py
+python examples/focal_demo.py --pos-rate 0.02   # easier problem
+python examples/focal_demo.py --gamma 5 --alpha 0.5
+```
+
 ### `compare_demo.py` — side-by-side comparison
 
 Trains three models on the same data and seed and prints a per-epoch AUCPR table:
@@ -320,5 +406,7 @@ pytest tests/ -v
 ```
 
 ## References
+
+Lin, T.-Y., Goyal, P., Girshick, R., He, K., & Dollár, P. (2017). [Focal Loss for Dense Object Detection](https://arxiv.org/abs/1708.02002). *ICCV 2017*.
 
 Brown, A., Xie, W., Kalogeiton, V., & Zisserman, A. (2020). [Smooth-AP: Smoothing the Path Towards Large-Scale Image Retrieval](https://arxiv.org/abs/2007.12163). *ECCV 2020*.
