@@ -97,3 +97,4 @@ tmp/
 temp/
 .claude/
 .ropeproject/
+*csv
