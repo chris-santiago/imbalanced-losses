@@ -219,6 +219,61 @@ class MyModel(pl.LightningModule):
 | `on_train_epoch_start(epoch)` | Advance epoch counter; detect phase switch; optionally reset queue |
 | `on_train_batch_start(global_step)` | Latch `switch_step` on first main-phase batch; reset queue; update temperature |
 
+## Distributed Training (DDP)
+
+Both losses work in DDP setups, but rank estimation requires the full global batch — not just the local shard. The `proxy_losses.distributed` module provides two all-gather helpers that handle this correctly.
+
+### Why this matters
+
+In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `SmoothAPLoss` and the quantile threshold in `RecallAtQuantileLoss` become noisy or biased when computed on a shard. Gathering logits and targets across all workers before passing them to the loss fixes this.
+
+### Helpers
+
+| Function | Description |
+|---|---|
+| `all_gather_with_grad(tensor)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** so autograd works correctly |
+| `all_gather_no_grad(tensor)` | Gathers tensors without gradient tracking; use for integer targets/labels |
+
+`all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached — matching standard DDP semantics where each worker optimizes its own parameters via all-reduced gradients.
+
+**Queue synchronization:** Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same global-batch data. No extra synchronization of the memory queue is needed.
+
+### Usage
+
+```python
+from proxy_losses import SmoothAPLoss
+from proxy_losses.distributed import all_gather_with_grad, all_gather_no_grad
+
+loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+
+# Inside training_step on each GPU:
+logits_global  = all_gather_with_grad(logits)   # [world_size * N, C] — grad flows
+targets_global = all_gather_no_grad(targets)    # [world_size * N]    — no grad
+loss = loss_fn(logits_global, targets_global)
+loss.backward()
+```
+
+Both helpers raise `RuntimeError` if `torch.distributed` is not available or not initialized. They are no-ops (return the input unchanged) when `world_size == 1`.
+
+### PyTorch Lightning (DDP)
+
+```python
+from proxy_losses import SmoothAPLoss, LossWarmupWrapper
+from proxy_losses.distributed import all_gather_with_grad, all_gather_no_grad
+
+class MyModel(pl.LightningModule):
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+
+    def training_step(self, batch, batch_idx):
+        logits, targets = batch
+        logits_g  = all_gather_with_grad(logits)
+        targets_g = all_gather_no_grad(targets)
+        loss = self.loss_fn(logits_g, targets_g)
+        return loss
+```
+
 ## Examples
 
 Require the `demo` extras:
