@@ -115,6 +115,23 @@ loss = loss_fn(logits, targets)
 loss.backward()
 ```
 
+#### Implicit vs. explicit difficulty weighting
+
+`SmoothAPLoss` already concentrates gradient on poorly-ranked positives — not by design, but as a structural consequence of the ratio `rank_pos[k] / rank_all[k]`.
+
+Consider two extremes. For a **poorly-ranked positive** buried under many negatives, most `σ((s_j − s_k)/τ) ≈ 1` for j ∈ N, so `rank_all[k]` is large and `rank_pos[k] / rank_all[k]` is close to 0. It barely contributes to AP, the loss is high, and its gradient is large. For a **well-ranked positive** above most negatives, `rank_all[k] ≈ rank_pos[k]`, the ratio is close to 1, AP is nearly maximized, and the gradient is small. The ratio is its own curriculum.
+
+`FocalSmoothAPLoss` adds an *explicit* multiplier on top:
+
+```
+SmoothAP:     AP      = (1/P) · Σ_k          ratio[k]
+FocalSmoothAP: FocalAP = (1/P) · Σ_k focal[k] · ratio[k]
+```
+
+For a well-ranked positive, `ratio[k] ≈ 1` in both cases. The difference is that in `SmoothAP` the gradient through that term is small but **nonzero** — it is still maintaining the positive's score against negatives that shift every batch. In `FocalSmoothAP`, `focal[k] ≈ 0` and the focal weight is detached, so the gradient is **exactly zero**. That positive receives no gradient at all.
+
+This distinction determines when each loss is appropriate. When a positive's rank is enforced by data structure (near-duplicates, same-condition pairs, obvious pathology), zero gradient is safe — the positive stays near the top without help. When a positive's rank depends on gradient maintenance in a dynamic embedding space, zeroing its gradient causes it to drift downward as negatives are pushed around by other terms.
+
 #### Gamma scheduling — required to avoid degenerate solutions
 
 > **Warning:** Using a fixed high `gamma` from the start of training is pathological and should be avoided.
