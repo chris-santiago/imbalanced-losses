@@ -194,7 +194,8 @@ def compare(
     # ── side-by-side table ───────────────────────────────────────────────────
     col = 14
     header = f"{'epoch':>5}  " + "  ".join(f"{lbl:>{col}}" for lbl, _ in results)
-    print(f"\n{header}")
+    print(f"\nVal AUCPR per epoch")
+    print(f"{header}")
     print("-" * len(header))
 
     for epoch in range(total_epochs):
@@ -204,7 +205,7 @@ def compare(
 
     bests = [(lbl, max(hist)) for lbl, hist in results]
     print()
-    print("Best AUCPR  " + "  ".join(f"{lbl}: {best:.4f}" for lbl, best in bests))
+    print("Best val AUCPR  " + "  ".join(f"{lbl}: {best:.4f}" for lbl, best in bests))
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
