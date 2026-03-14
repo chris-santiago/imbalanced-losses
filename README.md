@@ -54,14 +54,27 @@ Both losses share the same interface and design:
 
 ## Installation
 
-Requires Python ≥ 3.10 and PyTorch ≥ 2.10.
+Requires Python ≥ 3.10 and PyTorch ≥ 2.8.
 
 ```bash
-# with uv
-uv sync
+# from PyPI
+pip install proxy-losses
 
-# or pip
-pip install torch>=2.10
+# from GitHub (latest dev)
+pip install git+https://github.com/chris-santiago/proxy-losses.git
+
+# with uv (for development / contributing)
+git clone https://github.com/chris-santiago/proxy-losses.git
+cd proxy-losses
+uv sync
+```
+
+To run the example scripts, install the optional demo dependencies:
+
+```bash
+pip install "proxy-losses[demo]"
+# or with uv:
+uv sync --extra demo
 ```
 
 ## Usage
