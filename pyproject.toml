@@ -24,6 +24,9 @@ dev = [
 demo = [
     "scikit-learn>=1.0",
 ]
+notebook = [
+    "ipykernel",
+]
 
 [build-system]
 requires = ["hatchling"]
