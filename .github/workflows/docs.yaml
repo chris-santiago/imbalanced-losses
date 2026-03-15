@@ -25,10 +25,7 @@ jobs:
         uses: astral-sh/setup-uv@v5
 
       - name: Install dependencies
-        run: uv sync
-
-      - name: Install docs dependencies
-        run: uv add --dev mkdocs-material mkdocstrings[python]
+        run: uv sync --group docs
 
       - name: Deploy docs
         run: uv run mkdocs gh-deploy --force
