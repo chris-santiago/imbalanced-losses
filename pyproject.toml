@@ -19,6 +19,12 @@ dependencies = [
 dev = [
     "pytest>=9.0.2",
 ]
+docs = [
+    "mkdocs-material",
+    "mkdocstrings[python]",
+    "mkdocs-gen-files",
+    "mkdocs-literate-nav",
+]
 
 [project.optional-dependencies]
 demo = [
