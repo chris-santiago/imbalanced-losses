@@ -98,3 +98,4 @@ temp/
 .claude/
 .ropeproject/
 *csv
+CLAUDE.md
