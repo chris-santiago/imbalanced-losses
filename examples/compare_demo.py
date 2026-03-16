@@ -26,7 +26,7 @@ import torch.nn as nn
 from sklearn.datasets import make_classification
 from sklearn.metrics import average_precision_score
 
-from imbalanced_losses import LossWarmupWrapper, SmoothAPLoss, RecallAtQuantileLoss
+from imbalanced_losses import LossWarmupWrapper, RecallAtQuantileLoss, SmoothAPLoss
 
 # ── synthetic data ──────────────────────────────────────────────────────────
 
@@ -38,12 +38,12 @@ def make_data(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     X, y = make_classification(
         n_samples=n,
-        n_features=10,
-        n_informative=5,
+        n_features=20,
+        n_informative=10,
         n_redundant=2,
-        n_clusters_per_class=2,
+        n_clusters_per_class=3,
         weights=[1 - pos_rate, pos_rate],
-        flip_y=0.02,
+        flip_y=0.05,
         class_sep=0.8,
         random_state=seed,
     )
@@ -65,12 +65,10 @@ class BCEWarmupLoss(nn.Module):
 
 
 class TinyMLP(nn.Module):
-    def __init__(self, d_in: int = 10, hidden: int = 64):
+    def __init__(self, d_in: int = 20, hidden: int = 64):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_in, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
@@ -144,7 +142,10 @@ def make_main_loss(
 ) -> nn.Module:
     if loss == "recall":
         return RecallAtQuantileLoss(
-            num_classes=1, queue_size=queue_size, quantile=quantile, temperature=temp_start
+            num_classes=1,
+            queue_size=queue_size,
+            quantile=quantile,
+            temperature=temp_start,
         )
     return SmoothAPLoss(num_classes=1, queue_size=queue_size, temperature=temp_start)
 
@@ -187,7 +188,9 @@ def compare(
         blend_epochs=0,
         temp_start=temp_start,
         temp_end=temp_end,
-        temp_decay_steps=decay_steps if decay_steps is not None else total_epochs * steps_per_epoch,
+        temp_decay_steps=decay_steps
+        if decay_steps is not None
+        else total_epochs * steps_per_epoch,
     )
 
     # main loss only: from epoch 0, no warmup
@@ -198,7 +201,9 @@ def compare(
         blend_epochs=0,
         temp_start=temp_start,
         temp_end=temp_end,
-        temp_decay_steps=decay_steps if decay_steps is not None else total_epochs * steps_per_epoch,
+        temp_decay_steps=decay_steps
+        if decay_steps is not None
+        else total_epochs * steps_per_epoch,
     )
 
     # warmup + blend + main loss
@@ -209,7 +214,9 @@ def compare(
         blend_epochs=blend_epochs,
         temp_start=temp_start,
         temp_end=temp_end,
-        temp_decay_steps=decay_steps if decay_steps is not None else (total_epochs - warmup_epochs) * steps_per_epoch,
+        temp_decay_steps=decay_steps
+        if decay_steps is not None
+        else (total_epochs - warmup_epochs) * steps_per_epoch,
     )
 
     print(
@@ -260,7 +267,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--warmup-epochs", type=int, default=3)
+    p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--blend-epochs", type=int, default=2)
     p.add_argument("--total-epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=512)
@@ -268,13 +275,25 @@ if __name__ == "__main__":
     p.add_argument("--queue-size", type=int, default=2048)
     p.add_argument("--temp-start", type=float, default=0.35)
     p.add_argument("--temp-end", type=float, default=0.01)
-    p.add_argument("--pos-rate", type=float, default=0.005)
-    p.add_argument("--loss", choices=["ap", "recall"], default="ap",
-                   help="main loss: SmoothAPLoss (ap) or RecallAtQuantileLoss (recall)")
-    p.add_argument("--quantile", type=float, default=None,
-                   help="quantile for RecallAtQuantileLoss (default: pos-rate)")
-    p.add_argument("--decay-steps", type=int, default=None,
-                   help="temperature decay steps (default: AP-phase steps per strategy)")
+    p.add_argument("--pos-rate", type=float, default=0.01)
+    p.add_argument(
+        "--loss",
+        choices=["ap", "recall"],
+        default="ap",
+        help="main loss: SmoothAPLoss (ap) or RecallAtQuantileLoss (recall)",
+    )
+    p.add_argument(
+        "--quantile",
+        type=float,
+        default=None,
+        help="quantile for RecallAtQuantileLoss (default: pos-rate)",
+    )
+    p.add_argument(
+        "--decay-steps",
+        type=int,
+        default=1000,
+        help="temperature decay steps (default: AP-phase steps per strategy)",
+    )
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
     compare(**vars(args))
