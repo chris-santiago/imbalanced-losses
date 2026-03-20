@@ -31,8 +31,8 @@ uv sync
 
 | Loss | Use case |
 |---|---|
-| `SigmoidFocalLoss` | Binary / multi-label; drop-in for `BCEWithLogitsLoss` |
-| `SoftmaxFocalLoss` | Multiclass with softmax; drop-in for `CrossEntropyLoss` |
+| `SigmoidFocalLoss` | Binary / multi-label (sigmoid per logit, classes are independent); drop-in for `BCEWithLogitsLoss` |
+| `SoftmaxFocalLoss` | Mutually-exclusive multiclass (softmax couples all class logits); drop-in for `CrossEntropyLoss` |
 | `SmoothAPLoss` | Directly optimizes Average Precision |
 | `RecallAtQuantileLoss` | Optimizes recall above a fixed score threshold |
 | `LossWarmupWrapper` | Warmup on CE/BCE, then blend/anneal into a ranking loss |

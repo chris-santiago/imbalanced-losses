@@ -33,6 +33,14 @@ class SigmoidFocalLoss(nn.Module):
     Supports optional DDP all-gather so that the global batch is seen when
     computing mean/sum reductions.
 
+    .. note::
+        **Multi-label vs. multiclass:** This loss treats every output logit as an
+        *independent* binary prediction (sigmoid per element).  Use it when a
+        sample can belong to *multiple* classes simultaneously (multi-label), or
+        for a single yes/no prediction (binary).  If your classes are
+        *mutually exclusive* — each sample belongs to exactly one class — use
+        :class:`SoftmaxFocalLoss` instead, which couples the outputs via softmax.
+
     Parameters
     ----------
     alpha : float

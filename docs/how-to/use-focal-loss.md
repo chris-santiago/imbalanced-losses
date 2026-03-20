@@ -2,6 +2,8 @@
 
 ## Binary / multi-label: SigmoidFocalLoss
 
+> **Multi-label vs. multiclass:** `SigmoidFocalLoss` applies sigmoid *independently* to each logit — every output is a separate binary prediction. This covers binary tasks (one logit) and multi-label tasks (many logits, where a sample can match several classes at once). If your classes are mutually exclusive and each sample has exactly one correct label, use [SoftmaxFocalLoss](#multiclass-softmaxfocalloss) instead.
+
 ### Drop-in replacement for BCEWithLogitsLoss
 
 ```python

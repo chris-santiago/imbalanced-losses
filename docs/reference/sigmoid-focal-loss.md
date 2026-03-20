@@ -2,6 +2,9 @@
 
 Binary / multi-label focal loss operating on raw logits with a sigmoid activation. Drop-in replacement for `BCEWithLogitsLoss` for imbalanced problems.
 
+!!! note "Multi-label vs. multiclass"
+    `SigmoidFocalLoss` applies a **sigmoid independently to each logit**, so every output is a separate binary prediction. Use it when a sample can belong to *multiple* classes at once (multi-label), or for a single yes/no decision (binary). If your classes are *mutually exclusive* — each sample has exactly one correct class — use [`SoftmaxFocalLoss`](softmax-focal-loss.md) instead.
+
 ::: imbalanced_losses.focal_loss.SigmoidFocalLoss
 
 ## Quick example
