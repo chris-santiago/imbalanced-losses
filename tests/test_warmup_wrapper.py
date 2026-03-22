@@ -45,6 +45,7 @@ def _make_wrapper(
     temp_decay_steps: int = 100,
     *,
     blend_epochs: int = 0,
+    final_main_weight: float = 1.0,
     reset_queue_each_epoch: bool = False,
     main_loss: nn.Module | None = None,
     warmup_loss: nn.Module | None = None,
@@ -61,6 +62,7 @@ def _make_wrapper(
         temp_end=temp_end,
         temp_decay_steps=temp_decay_steps,
         blend_epochs=blend_epochs,
+        final_main_weight=final_main_weight,
         reset_queue_each_epoch=reset_queue_each_epoch,
     )
 
@@ -755,6 +757,7 @@ def _make_step_wrapper(
     temp_decay_steps: int = 100,
     *,
     blend_steps: int = 0,
+    final_main_weight: float = 1.0,
     main_loss: nn.Module | None = None,
 ) -> LossWarmupWrapper:
     if main_loss is None:
@@ -767,6 +770,7 @@ def _make_step_wrapper(
         temp_end=temp_end,
         temp_decay_steps=temp_decay_steps,
         blend_steps=blend_steps,
+        final_main_weight=final_main_weight,
     )
 
 
@@ -1071,3 +1075,104 @@ class TestStepModeIntegration:
         assert int(main._q_ptr) > 0
         w.on_train_batch_start(5)  # triggers reset
         assert int(main._q_ptr) == 0
+
+
+# ---------------------------------------------------------------------------
+# final_main_weight
+# ---------------------------------------------------------------------------
+
+
+class TestFinalMainWeight:
+    C, B = 4, 16
+
+    def _batch(self):
+        return torch.randn(self.B, self.C), torch.randint(0, self.C, (self.B,))
+
+    # --- validation ---
+
+    def test_zero_raises(self):
+        with pytest.raises(ValueError, match="final_main_weight"):
+            _make_wrapper(warmup_epochs=1, final_main_weight=0.0)
+
+    def test_negative_raises(self):
+        with pytest.raises(ValueError, match="final_main_weight"):
+            _make_wrapper(warmup_epochs=1, final_main_weight=-0.5)
+
+    def test_above_one_raises(self):
+        with pytest.raises(ValueError, match="final_main_weight"):
+            _make_wrapper(warmup_epochs=1, final_main_weight=1.1)
+
+    def test_exactly_one_ok(self):
+        w = _make_wrapper(warmup_epochs=1, final_main_weight=1.0)
+        assert w.final_main_weight == 1.0
+
+    # --- epoch mode ---
+
+    def test_main_weight_caps_at_final_after_blend_epoch(self):
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=2, final_main_weight=0.75)
+        w.on_train_epoch_start(3)  # past blend
+        assert w.main_weight == pytest.approx(0.75)
+
+    def test_main_weight_caps_at_final_no_blend_epoch(self):
+        w = _make_wrapper(warmup_epochs=1, final_main_weight=0.6)
+        w.on_train_epoch_start(1)
+        assert w.main_weight == pytest.approx(0.6)
+
+    def test_blend_ramp_scales_to_final_epoch(self):
+        # blend_epochs=3, final_main_weight=0.6
+        # ramp: 1/4*0.6, 2/4*0.6, 3/4*0.6
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=3, final_main_weight=0.6)
+        w.on_train_epoch_start(1)
+        assert w.main_weight == pytest.approx(0.6 / 4)
+        w.on_train_epoch_start(2)
+        assert w.main_weight == pytest.approx(2 * 0.6 / 4)
+        w.on_train_epoch_start(3)
+        assert w.main_weight == pytest.approx(3 * 0.6 / 4)
+        w.on_train_epoch_start(4)  # past blend
+        assert w.main_weight == pytest.approx(0.6)
+
+    def test_forward_blended_at_final_weight_epoch(self):
+        """After warmup with no blend, forward computes (1-w)*warmup + w*main."""
+        warmup = nn.CrossEntropyLoss()
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = LossWarmupWrapper(
+            warmup_loss=warmup,
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=100,
+            final_main_weight=0.7,
+        )
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(10)
+        logits, targets = self._batch()
+        with torch.no_grad():
+            result = w(logits, targets)
+            wt = w.main_weight  # should be 0.7
+            expected = (1 - wt) * warmup(logits, targets) + wt * main(logits, targets)
+        assert wt == pytest.approx(0.7)
+        assert result == pytest.approx(expected.item(), rel=1e-5)
+
+    # --- step mode ---
+
+    def test_main_weight_caps_at_final_after_blend_steps(self):
+        w = _make_step_wrapper(warmup_steps=0, blend_steps=3, final_main_weight=0.75)
+        w.on_train_batch_start(3)  # past blend
+        assert w.main_weight == pytest.approx(0.75)
+
+    def test_main_weight_caps_at_final_no_blend_steps(self):
+        w = _make_step_wrapper(warmup_steps=2, final_main_weight=0.5)
+        w.on_train_batch_start(2)
+        assert w.main_weight == pytest.approx(0.5)
+
+    def test_blend_ramp_scales_to_final_steps(self):
+        w = _make_step_wrapper(warmup_steps=0, blend_steps=3, final_main_weight=0.6)
+        w.on_train_batch_start(0)
+        assert w.main_weight == pytest.approx(0.6 / 4)
+        w.on_train_batch_start(1)
+        assert w.main_weight == pytest.approx(2 * 0.6 / 4)
+        w.on_train_batch_start(2)
+        assert w.main_weight == pytest.approx(3 * 0.6 / 4)
+        w.on_train_batch_start(3)  # past blend
+        assert w.main_weight == pytest.approx(0.6)

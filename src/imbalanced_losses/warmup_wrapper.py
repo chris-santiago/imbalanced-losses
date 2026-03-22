@@ -103,8 +103,8 @@ class LossWarmupWrapper(nn.Module):
     blend_epochs : int, optional
         Number of epochs after warmup to linearly blend from ``warmup_loss``
         to ``main_loss``.  During blend epoch ``k`` (0-indexed),
-        ``main_weight = (k + 1) / (blend_epochs + 1)``.  After the blend
-        period, ``main_weight = 1.0`` (pure ``main_loss``).  Mutually
+        ``main_weight`` ramps from 0 to ``final_main_weight``.  After the
+        blend period, ``main_weight = final_main_weight``.  Mutually
         exclusive with ``blend_steps``.  Default: 0 (hard switch).
     warmup_steps : int or None, optional
         Number of global training steps to use ``warmup_loss``.  Mutually
@@ -115,8 +115,21 @@ class LossWarmupWrapper(nn.Module):
     blend_steps : int or None, optional
         Number of global training steps after warmup to linearly blend from
         ``warmup_loss`` to ``main_loss``.  During blend step ``k``
-        (0-indexed), ``main_weight = (k + 1) / (blend_steps + 1)``.  Mutually
-        exclusive with ``blend_epochs > 0``.  Default: None.
+        (0-indexed), ``main_weight`` ramps from 0 to ``final_main_weight``.
+        Mutually exclusive with ``blend_epochs > 0``.  Default: None.
+    final_main_weight : float, optional
+        The ``main_loss`` weight to hold after the blend period (or at the
+        hard switch if no blend is configured).  Must be in ``(0, 1]``.
+        Default: ``1.0`` (pure ``main_loss`` after warmup).
+
+        Use this when you want a permanent mix — e.g.
+        ``final_main_weight=0.75`` keeps a 75 / 25 main / warmup split
+        indefinitely after the blend ramp completes.
+
+        .. note::
+            When ``final_main_weight < 1.0``, ``**kwargs`` are never
+            forwarded to ``main_loss`` (the blended path does not support
+            them).
     reset_queue_each_epoch : bool, optional
         Call ``main_loss.reset_queue()`` at the start of each epoch in
         the main phase (if the method exists).  Default: False.
@@ -139,6 +152,7 @@ class LossWarmupWrapper(nn.Module):
         blend_epochs: int = 0,
         warmup_steps: int | None = None,
         blend_steps: int | None = None,
+        final_main_weight: float = 1.0,
         reset_queue_each_epoch: bool = False,
         gather_distributed: bool | None = None,
     ) -> None:
@@ -163,6 +177,10 @@ class LossWarmupWrapper(nn.Module):
             raise ValueError(f"blend_epochs must be >= 0, got {blend_epochs}")
         if blend_steps is not None and blend_steps < 0:
             raise ValueError(f"blend_steps must be >= 0, got {blend_steps}")
+        if not (0 < final_main_weight <= 1.0):
+            raise ValueError(
+                f"final_main_weight must be in (0, 1], got {final_main_weight}"
+            )
         if temp_start <= 0 or temp_end <= 0:
             raise ValueError("temp_start and temp_end must be positive")
         if temp_decay_steps <= 0:
@@ -177,6 +195,7 @@ class LossWarmupWrapper(nn.Module):
         self.temp_end = float(temp_end)
         self.temp_decay_steps = temp_decay_steps
         self.blend_epochs = blend_epochs
+        self.final_main_weight = float(final_main_weight)
         self.warmup_steps = warmup_steps if warmup_steps is not None else 0
         self.blend_steps = blend_steps if blend_steps is not None else 0
         self._step_mode: bool = warmup_steps is not None
@@ -231,18 +250,18 @@ class LossWarmupWrapper(nn.Module):
 
     @property
     def main_weight(self) -> float:
-        """Current main loss weight (0.0 during warmup, ramp during blend, 1.0 after)."""
+        """Current main loss weight (0.0 during warmup, ramps to ``final_main_weight`` during blend, ``final_main_weight`` after)."""
         if self.in_warmup:
             return 0.0
         if self._step_mode:
             if self.blend_steps == 0 or self._global_step >= self.warmup_steps + self.blend_steps:
-                return 1.0
+                return self.final_main_weight
             blend_step_index = self._global_step - self.warmup_steps
-            return (blend_step_index + 1) / (self.blend_steps + 1)
+            return (blend_step_index + 1) / (self.blend_steps + 1) * self.final_main_weight
         if self.blend_epochs == 0 or self._epoch >= self.warmup_epochs + self.blend_epochs:
-            return 1.0
+            return self.final_main_weight
         blend_epoch_index = self._epoch - self.warmup_epochs
-        return (blend_epoch_index + 1) / (self.blend_epochs + 1)
+        return (blend_epoch_index + 1) / (self.blend_epochs + 1) * self.final_main_weight
 
     @property
     def in_warmup(self) -> bool:
@@ -402,8 +421,8 @@ class LossWarmupWrapper(nn.Module):
             During warmup or blend: scalar tensor.  After blend: output of
             ``main_loss`` (scalar or tuple when ``return_per_class=True``).
             ``**kwargs`` are forwarded to ``main_loss`` only when
-            ``main_weight == 1.0``; they are silently ignored during warmup
-            and blend phases.
+            ``main_weight >= 1.0`` (i.e. ``final_main_weight == 1.0`` and
+            the blend period has ended); they are silently ignored otherwise.
         """
         if self.in_warmup:
             return self.warmup_loss(logits, targets)

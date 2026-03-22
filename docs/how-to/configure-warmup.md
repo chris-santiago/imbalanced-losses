@@ -96,7 +96,7 @@ class MyModel(pl.LightningModule):
 
 ## Add a blend period
 
-`blend_epochs` / `blend_steps` adds a linear ramp between warmup and pure AP loss, avoiding an abrupt gradient change.
+`blend_epochs` / `blend_steps` adds a linear ramp between warmup and the main loss, avoiding an abrupt gradient change.
 
 **Epoch blend:**
 
@@ -126,7 +126,44 @@ loss_fn = LossWarmupWrapper(
 )
 ```
 
-`main_weight` follows the same `(k + 1) / (blend_steps + 1)` formula per step.
+`main_weight` follows the same `(k + 1) / (blend_steps + 1)` formula per step, scaled to `final_main_weight`.
+
+## Hold a permanent mix with `final_main_weight`
+
+By default the blend ramp ends at `main_weight = 1.0` (pure main loss). Set `final_main_weight` to hold a permanent split instead — the ramp scales to that target and stays there.
+
+```python
+loss_fn = LossWarmupWrapper(
+    warmup_loss=nn.CrossEntropyLoss(),
+    main_loss=SmoothAPLoss(num_classes=10, queue_size=1024),
+    warmup_epochs=5,
+    blend_epochs=3,
+    final_main_weight=0.75,  # hold 75% main / 25% CE forever
+    temp_start=0.1,
+    temp_end=0.01,
+    temp_decay_steps=10_000,
+)
+```
+
+| Epoch | Phase | `main_weight` |
+|---|---|---|
+| 0–4 | warmup | 0.0 |
+| 5 | blend | 0.1875 |
+| 6 | blend | 0.375 |
+| 7 | blend | 0.5625 |
+| 8+ | main | 0.75 |
+
+Works without a blend too — the hard switch lands at `final_main_weight` instead of `1.0`:
+
+```python
+loss_fn = LossWarmupWrapper(
+    ...,
+    warmup_epochs=5,
+    final_main_weight=0.75,  # no blend, hard switch to 75%
+)
+```
+
+`final_main_weight` must be in `(0, 1]`. The default is `1.0`.
 
 ## Tune temperature decay
 

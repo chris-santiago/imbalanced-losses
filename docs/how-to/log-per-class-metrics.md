@@ -53,7 +53,7 @@ for c in valid.nonzero(as_tuple=True)[0].tolist():
 
 ## Use with LossWarmupWrapper
 
-`**kwargs` (including `return_per_class=True`) are forwarded to `main_loss` only when `main_weight == 1.0`. During warmup and blend they are silently ignored:
+`**kwargs` (including `return_per_class=True`) are forwarded to `main_loss` only when `main_weight >= 1.0` — i.e. `final_main_weight == 1.0` (default) and the blend period has ended. During warmup, blend, or when `final_main_weight < 1.0`, they are silently ignored:
 
 ```python
 result = self.loss_fn(logits, targets, return_per_class=True)

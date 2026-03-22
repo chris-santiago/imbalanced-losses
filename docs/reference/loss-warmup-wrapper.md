@@ -79,7 +79,7 @@ class MyModel(pl.LightningModule):
 
 ## Phase schedule
 
-**Epoch mode** — with `warmup_epochs=5, blend_epochs=2`:
+**Epoch mode** — with `warmup_epochs=5, blend_epochs=2, final_main_weight=1.0` (default):
 
 | Epoch range | Phase | `in_warmup` | `in_blend` | `main_weight` |
 |---|---|---|---|---|
@@ -88,7 +88,7 @@ class MyModel(pl.LightningModule):
 | 6 | blend | `False` | `True` | `0.667` |
 | 7+ | main | `False` | `False` | `1.0` |
 
-**Step mode** — with `warmup_steps=500, blend_steps=3`:
+**Step mode** — with `warmup_steps=500, blend_steps=3, final_main_weight=1.0` (default):
 
 | Step range | Phase | `in_warmup` | `in_blend` | `main_weight` |
 |---|---|---|---|---|
@@ -97,6 +97,17 @@ class MyModel(pl.LightningModule):
 | 501 | blend | `False` | `True` | `0.50` |
 | 502 | blend | `False` | `True` | `0.75` |
 | 503+ | main | `False` | `False` | `1.0` |
+
+**Permanent mix** — with `warmup_epochs=5, blend_epochs=2, final_main_weight=0.75`:
+
+| Epoch range | Phase | `in_warmup` | `in_blend` | `main_weight` |
+|---|---|---|---|---|
+| 0–4 | warmup | `True` | `False` | `0.0` |
+| 5 | blend | `False` | `True` | `0.25` |
+| 6 | blend | `False` | `True` | `0.50` |
+| 7+ | main | `False` | `False` | `0.75` |
+
+The blend ramp always targets `final_main_weight`, not `1.0`.
 
 ## Temperature schedule
 
@@ -121,6 +132,7 @@ The clock starts at the first main-phase batch, not at training epoch 0.
 | `blend_epochs` | `0` | Linear blend epochs; `0` = hard switch. Mutually exclusive with `blend_steps`. |
 | `warmup_steps` | `None` | Steps before switching. Mutually exclusive with `warmup_epochs > 0`. |
 | `blend_steps` | `None` | Linear blend steps. Mutually exclusive with `blend_epochs > 0`. |
+| `final_main_weight` | `1.0` | Target `main_loss` weight after the blend ramp (or at hard switch). Must be in `(0, 1]`. Use `< 1.0` to hold a permanent mix (e.g. `0.75` = 75 % main / 25 % warmup forever). |
 | `reset_queue_each_epoch` | `False` | Reset `main_loss` queue each main-phase epoch |
 | `gather_distributed` | `None` | Forwarded to `main_loss.gather_distributed`; `None` auto-detects DDP |
 
@@ -130,5 +142,5 @@ The clock starts at the first main-phase batch, not at training epoch 0.
 |---|---|---|
 | `in_warmup` | `bool` | `True` while in the warmup phase |
 | `in_blend` | `bool` | `True` during the blend transition |
-| `main_weight` | `float` | Current main loss weight: `0.0` → ramp → `1.0` |
+| `main_weight` | `float` | Current main loss weight: `0.0` during warmup → ramps to `final_main_weight` → holds at `final_main_weight` |
 | `current_temperature` | `float or None` | Current `main_loss.temperature`; `None` if unavailable |
