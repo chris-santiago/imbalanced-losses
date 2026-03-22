@@ -564,6 +564,36 @@ class TestRecallAtQuantileLossBinary:
         loss = fn(logits, targets)
         assert loss.item() == 0.0
 
+    def test_binary_out_of_range_targets_warns(self):
+        import warnings
+        fn = RecallAtQuantileLoss(num_classes=1, quantile=SANITY_Q, queue_size=0)
+        logits = torch.randn(B, 1)
+        targets = torch.zeros(B, dtype=torch.long)
+        targets[0] = 2  # out of range for binary mode
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn(logits, targets)
+        assert any("expects targets in" in str(warning.message) for warning in w)
+
+    def test_binary_valid_targets_no_warning(self):
+        import warnings
+        fn = RecallAtQuantileLoss(num_classes=1, quantile=SANITY_Q, queue_size=0)
+        logits = torch.randn(B, 1)
+        targets = torch.randint(0, 2, (B,))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn(logits, targets)
+        assert not any("expects targets in" in str(warning.message) for warning in w)
+
+    def test_binary_all_positive_computes_without_error(self):
+        """All-positive binary targets: recall loss should be valid, not nan."""
+        fn = RecallAtQuantileLoss(num_classes=1, quantile=SANITY_Q, queue_size=0)
+        logits = torch.randn(B, 1, requires_grad=True)
+        targets = torch.ones(B, dtype=torch.long)
+        loss = fn(logits, targets)
+        assert not torch.isnan(loss)
+        loss.backward()  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # Forward: return_per_class

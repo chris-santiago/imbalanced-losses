@@ -14,6 +14,7 @@ Padding:     ignore_index=-100 rows dropped before ranking.
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import torch
@@ -36,8 +37,9 @@ class SmoothAPLoss(nn.Module):
         Number of output classes. Use 1 for binary mode.
     queue_size : int, optional
         Number of (logits, targets) rows stored in the circular buffer.
-        Larger queues give more stable AP estimates at the cost of O(M^2)
-        memory in _compute_smooth_ap. Set to 0 to disable. Default: 1024.
+        Larger queues give more stable AP estimates at the cost of O(|P|×M)
+        memory in _compute_smooth_ap, where |P| is the number of positives.
+        Set to 0 to disable. Default: 1024.
     temperature : float, optional
         Sigmoid sharpness τ. Smaller values approximate the true
         discontinuous rank more closely but produce harder gradients.
@@ -385,6 +387,15 @@ class SmoothAPLoss(nn.Module):
 
         # --- compute per-class AP and validity ---------------------------
         if self.num_classes == 1:
+            bad = all_targets[(all_targets != 0) & (all_targets != 1)]
+            if bad.numel() > 0:
+                warnings.warn(
+                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
+                    f"but found values: {bad[:8].tolist()}. "
+                    "Non-zero values are treated as positive.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             ap, is_valid = self._compute_smooth_ap(all_logits[:, 0], all_targets.bool(), self.temperature)
             loss_vals  = [1.0 - ap]
             valid_mask = [is_valid]

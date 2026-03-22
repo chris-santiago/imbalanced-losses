@@ -18,10 +18,16 @@ Binary:      num_classes=1, logits [N,1], targets 0/1.
 Seq2seq:     flatten to [N, C] / [N] upstream.
 Padding:     ignore_index=-100 rows are dropped before threshold estimation
              and recall computation.
+
+Note: This is an original loss design, not from a published paper. It
+combines quantile-based threshold estimation (stop-gradient) with sigmoid
+soft recall in a way that, to our knowledge, has not appeared in prior
+literature.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Literal
 
 import torch
@@ -397,6 +403,15 @@ class RecallAtQuantileLoss(nn.Module):
 
         # --- compute per-class recall and validity -----------------------
         if self.num_classes == 1:
+            bad = all_targets[(all_targets != 0) & (all_targets != 1)]
+            if bad.numel() > 0:
+                warnings.warn(
+                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
+                    f"but found values: {bad[:8].tolist()}. "
+                    "Non-zero values are treated as positive.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             recall, is_valid = self._soft_recall_at_quantile(
                 all_logits[:, 0], all_targets.bool()
             )

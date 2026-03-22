@@ -154,6 +154,47 @@ class TestInit:
             _w.simplefilter("error", UserWarning)
             _make_wrapper()  # SmoothAPLoss has .temperature — no warning
 
+    def test_gather_distributed_none_does_not_overwrite_main_loss(self):
+        """Default gather_distributed=None must not clobber main_loss's explicit setting."""
+        main = SmoothAPLoss(num_classes=4, queue_size=0, gather_distributed=False)
+        LossWarmupWrapper(
+            warmup_loss=nn.CrossEntropyLoss(),
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=10,
+            # gather_distributed not passed → defaults to None
+        )
+        assert main.gather_distributed is False
+
+    def test_gather_distributed_explicit_overwrites_main_loss(self):
+        """Explicit gather_distributed on wrapper should overwrite main_loss's setting."""
+        main = SmoothAPLoss(num_classes=4, queue_size=0, gather_distributed=False)
+        LossWarmupWrapper(
+            warmup_loss=nn.CrossEntropyLoss(),
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=10,
+            gather_distributed=True,
+        )
+        assert main.gather_distributed is True
+
+    def test_blend_steps_without_warmup_steps_raises(self):
+        """blend_steps in epoch mode (no warmup_steps) should raise ValueError."""
+        with pytest.raises(ValueError, match="blend_steps requires warmup_steps"):
+            LossWarmupWrapper(
+                warmup_loss=nn.CrossEntropyLoss(),
+                main_loss=SmoothAPLoss(num_classes=4, queue_size=0),
+                warmup_epochs=5,
+                blend_steps=100,
+                temp_start=0.1,
+                temp_end=0.01,
+                temp_decay_steps=10,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Properties

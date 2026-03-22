@@ -577,6 +577,27 @@ class TestSmoothAPLossBinary:
         loss = fn(logits, targets)
         assert not math.isnan(loss.item())
 
+    def test_binary_out_of_range_targets_warns(self):
+        import warnings
+        fn = SmoothAPLoss(num_classes=1, queue_size=0)
+        logits = torch.randn(self.B, 1)
+        targets = torch.zeros(self.B, dtype=torch.long)
+        targets[0] = 2  # out of range for binary mode
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn(logits, targets)
+        assert any("expects targets in" in str(warning.message) for warning in w)
+
+    def test_binary_valid_targets_no_warning(self):
+        import warnings
+        fn = SmoothAPLoss(num_classes=1, queue_size=0)
+        logits = torch.randn(self.B, 1)
+        targets = torch.randint(0, 2, (self.B,))
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            fn(logits, targets)
+        assert not any("expects targets in" in str(warning.message) for warning in w)
+
 
 # ---------------------------------------------------------------------------
 # Forward: return_per_class

@@ -37,6 +37,13 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
 
     Notes
     -----
+    All workers must contribute tensors with the same shape. The pre-allocated
+    receive buffers use ``torch.zeros_like(tensor)``, which assumes every
+    rank's local tensor has identical dimensions. Unequal batch sizes across
+    ranks will cause a shape mismatch error. When using
+    ``DistributedSampler``, set ``drop_last=True`` to guarantee equal batch
+    sizes across ranks.
+
     All workers' queues stay synchronized automatically: since every worker
     calls ``all_gather`` before passing to the loss, every worker enqueues
     the same global-batch data. No extra synchronization is needed.
@@ -94,6 +101,14 @@ def all_gather_no_grad(tensor: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         Concatenation of all workers' tensors along dim 0, shape
         ``[world_size * N]``.
+
+    Notes
+    -----
+    All workers must contribute tensors with the same shape. The pre-allocated
+    receive buffers use ``torch.zeros_like(tensor)``, which assumes every
+    rank's local tensor has identical dimensions. When using
+    ``DistributedSampler``, set ``drop_last=True`` to guarantee equal batch
+    sizes across ranks.
 
     Raises
     ------

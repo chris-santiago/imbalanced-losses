@@ -169,6 +169,11 @@ class LossWarmupWrapper(nn.Module):
                 "Cannot specify both blend_epochs (non-zero) and blend_steps; "
                 "use one or the other."
             )
+        if blend_steps is not None and warmup_steps is None:
+            raise ValueError(
+                "blend_steps requires warmup_steps (step mode); "
+                "use blend_epochs with warmup_epochs instead."
+            )
         if warmup_epochs < 0:
             raise ValueError(f"warmup_epochs must be >= 0, got {warmup_epochs}")
         if warmup_steps is not None and warmup_steps < 0:
@@ -201,7 +206,7 @@ class LossWarmupWrapper(nn.Module):
         self._step_mode: bool = warmup_steps is not None
         self.reset_queue_each_epoch = reset_queue_each_epoch
 
-        if hasattr(main_loss, "gather_distributed"):
+        if gather_distributed is not None and hasattr(main_loss, "gather_distributed"):
             main_loss.gather_distributed = gather_distributed  # type: ignore[union-attr]
 
         self._has_temperature: bool = hasattr(main_loss, "temperature")
