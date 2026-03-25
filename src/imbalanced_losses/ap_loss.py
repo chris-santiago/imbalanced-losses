@@ -40,6 +40,14 @@ class SmoothAPLoss(nn.Module):
         Larger queues give more stable AP estimates at the cost of O(|P|×M)
         memory in _compute_smooth_ap, where |P| is the number of positives.
         Set to 0 to disable. Default: 1024.
+
+        **DDP note:** when ``gather_distributed=True``, the all-gather runs
+        *before* the enqueue, so each rank stores global-batch rows. The
+        effective pool per forward pass is already
+        ``global_batch_size + queue_size``. At large global batches
+        (e.g. 8 GPUs × 1 500 samples = 12 K) the default queue adds < 10 %
+        to the pool. Consider setting ``queue_size=0`` in that regime to
+        avoid storing redundant data and reduce memory overhead.
     temperature : float, optional
         Sigmoid sharpness τ. Smaller values approximate the true
         discontinuous rank more closely but produce harder gradients.
@@ -79,6 +87,11 @@ class SmoothAPLoss(nn.Module):
 
     In DDP, set ``gather_distributed=False`` to opt out; otherwise the loss
     auto-detects and all-gathers on first forward when world_size > 1.
+    Because the gather happens *before* the enqueue, every rank stores
+    identical global-batch rows — queues stay in sync automatically, but
+    the pool per step is ``global_batch_size + queue_size``. At large
+    global batch sizes the queue contribution may be negligible; prefer
+    ``queue_size=0`` when the global batch already provides a stable pool.
     """
 
     def __init__(

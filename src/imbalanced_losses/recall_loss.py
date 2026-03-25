@@ -62,6 +62,13 @@ class RecallAtQuantileLoss(nn.Module):
         Circular buffer size (rows). Larger queues stabilise the quantile
         estimate — at 50 bps you need at least ~200 samples for a
         meaningful 99.5th percentile. Set to 0 to disable. Default: 1024.
+
+        **DDP note:** when ``gather_distributed=True``, the all-gather runs
+        *before* the enqueue, so each rank stores global-batch rows. The
+        effective pool per forward pass is already
+        ``global_batch_size + queue_size``. At large global batches the
+        quantile is already well-estimated from the live batch alone;
+        consider setting ``queue_size=0`` to reduce memory overhead.
     temperature : float, optional
         Sigmoid sharpness τ around the threshold. Larger values give
         smoother gradients but less precise recall estimates. Default: 0.01.
@@ -101,6 +108,13 @@ class RecallAtQuantileLoss(nn.Module):
     The quantile must exceed the positive class fraction for the threshold
     to fall in the negative region under perfect classification. With C=4
     balanced classes (25% positives), use quantile > 0.25 for sanity tests.
+
+    In DDP, the all-gather runs *before* the enqueue, so every rank stores
+    identical global-batch rows and queues stay in sync automatically. The
+    effective pool per step is ``global_batch_size + queue_size``. At large
+    global batch sizes the queue contribution may be negligible; prefer
+    ``queue_size=0`` when the global batch already provides a stable quantile
+    estimate.
     """
 
     _VALID_INTERPOLATIONS = ("linear", "lower", "higher", "nearest", "midpoint")
