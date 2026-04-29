@@ -69,3 +69,7 @@ return loss
 ```
 
 **Confirm:** During warmup `result` is a plain scalar tensor. After blend it is a `(loss, per_class, valid)` tuple.
+
+## See also
+
+`examples/per_class_metrics_demo.py` — runnable script demonstrating `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern.

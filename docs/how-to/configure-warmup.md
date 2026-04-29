@@ -224,3 +224,8 @@ loss_fn = LossWarmupWrapper(
 ```
 
 **Confirm:** `loss_fn.in_warmup` is immediately `False`.
+
+## See also
+
+- `examples/compare_demo.py` — side-by-side AUCPR for warmup-only, AP-only (no warmup), and warmup+blend+AP so you can see the effect of each phase
+- `examples/toy_demo.py` — minimal end-to-end binary training loop using `LossWarmupWrapper` with per-epoch loss and AUCPR output

@@ -146,3 +146,7 @@ alpha    = [1.0, 1.0 / pos_rate]    # [negative_weight, positive_weight]
 
 loss_fn = SoftmaxFocalLoss(alpha=alpha, gamma=0.0)   # equivalent to weighted CE
 ```
+
+## See also
+
+`examples/focal_demo.py` — side-by-side AUCPR comparison of BCE, `BCEWithLogitsLoss` with `pos_weight`, `SigmoidFocalLoss(alpha, gamma)`, and `SigmoidFocalLoss(gamma)` (no alpha) on the same imbalanced dataset, so you can isolate the contribution of each component.
