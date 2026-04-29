@@ -245,11 +245,18 @@ You trained the same architecture with three loss strategies on a 5-class imbala
 | SoftmaxFocalLoss (alpha + gamma) | 0.9574 |
 | SmoothAPLoss with warmup | 0.9523 |
 
-**Why are the numbers similar?** On this moderately imbalanced dataset (rarest class at 3%),
-macro-AP is close across strategies because it averages over all classes — and the majority
-class dominates the average. The real differences appear in tail-class AP: `SmoothAPLoss`
-directly optimizes per-class AP, so class 4 (rarest) converges faster and more reliably.
-To see this, run `examples/per_class_metrics_demo.py` which tracks per-class AP each epoch.
+**Why are the numbers close?** With the rarest class at ~3% frequency, this dataset sits in the
+*mild-to-moderate* imbalance range. `CrossEntropyLoss` is surprisingly competitive here
+because even the majority class provides some gradient signal toward the tail. `SmoothAPLoss`
+earns its largest gains under more extreme imbalance — where positives are so rare that
+cross-entropy gradients from easy negatives dominate, not because the dataset is hard, but
+because the easy negatives vastly outnumber the informative positives. The binary
+[Getting Started tutorial](getting-started.md) shows a 5% positive rate case where
+Smooth-AP's AUCPR is roughly 2× higher than focal loss.
+
+Use `SmoothAPLoss` for multiclass when your rarest class falls below ~1–2% of the dataset
+and per-class AP is the metric that matters. For mild imbalance, `SoftmaxFocalLoss` is
+often the simpler choice with comparable results.
 
 **Key multiclass-specific points:**
 - Targets must be `torch.long` class indices `[N]`, not float or one-hot

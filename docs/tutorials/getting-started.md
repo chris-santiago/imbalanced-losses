@@ -201,9 +201,9 @@ You trained the same model architecture with three different loss strategies and
 
 | Loss strategy | AUCPR |
 |---|---|
-| Vanilla BCE | 0.20 |
-| Focal Loss | 0.21 |
-| Smooth-AP with warmup | 0.42 |
+| Vanilla BCE | 0.1822 |
+| Focal Loss | 0.1874 |
+| Smooth-AP with warmup | 0.4248 |
 
 ## Next steps
 

@@ -37,6 +37,19 @@ uv sync
 | `RecallAtQuantileLoss` | Optimizes recall above a fixed score threshold |
 | `LossWarmupWrapper` | Warmup on CE/BCE, then blend/anneal into a ranking loss |
 
+## Which loss should I use?
+
+| Your situation | Recommended loss |
+|---|---|
+| Binary / multi-label, mild-to-moderate imbalance | `SigmoidFocalLoss` |
+| Binary, extreme imbalance (< 1% positives) | `SmoothAPLoss` |
+| Mutually-exclusive multiclass, mild-to-moderate imbalance | `SoftmaxFocalLoss` |
+| Multiclass with tail classes below ~1–2% of data | `SmoothAPLoss` |
+| Need a hard recall guarantee at a fixed score threshold | `RecallAtQuantileLoss` |
+
+For a deeper breakdown, see [Why Imbalanced Losses?](explanation/why-imbalanced-losses.md).
+Before deploying, read [Assumptions and Failure Modes](explanation/assumptions-and-failure-modes.md).
+
 ## Documentation sections
 
 - [**Tutorials**](tutorials/index.md) — hands-on walkthroughs that take you from zero to a working training loop

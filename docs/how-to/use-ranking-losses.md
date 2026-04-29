@@ -115,3 +115,33 @@ loss_fn = RecallAtQuantileLoss(
     quantile_interpolation="linear",
 )
 ```
+
+---
+
+## Queue behavior during validation
+
+By default, both `SmoothAPLoss` and `RecallAtQuantileLoss` freeze the queue when the model is in eval mode (`model.eval()`). This prevents validation-phase logits from contaminating training-phase queue contents:
+
+| Mode | `update_queue_in_eval` | Queue behavior |
+|------|----------------------|----------------|
+| `model.train()` | (ignored) | Queue always updates |
+| `model.eval()` | `False` (default) | Queue frozen — retains training-phase contents |
+| `model.eval()` | `True` | Queue updates with current-phase logits |
+
+**Standard training loop (keep the default `False`):** The queue retains its training-batch statistics across the validation phase and resumes cleanly when training restarts. You do not need to call `reset_queue()` between validation and the next training epoch.
+
+**Online inference or streaming (`True`):** Set `update_queue_in_eval=True` when you want the queue to adapt to the current input distribution continuously during inference.
+
+```python
+# Training loop pattern — no extra handling needed
+for epoch in range(epochs):
+    model.train()
+    for xb, yb in train_loader:
+        loss = loss_fn(model(xb), yb)  # queue updates
+        ...
+
+    model.eval()
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            ...  # queue frozen, no contamination
+```
