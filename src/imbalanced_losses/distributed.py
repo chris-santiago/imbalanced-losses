@@ -12,6 +12,27 @@ import torch
 import torch.distributed as dist
 
 
+def _gather_sizes(
+    local_size: int, world_size: int, device: torch.device
+) -> torch.Tensor:
+    """All-gather the dim-0 size from every rank. Returns ``[world_size]`` int64 tensor."""
+    local = torch.tensor([local_size], dtype=torch.int64, device=device)
+    sizes_list = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(world_size)]
+    dist.all_gather(sizes_list, local)
+    return torch.cat(sizes_list)
+
+
+def _pad_to(tensor: torch.Tensor, target_rows: int) -> torch.Tensor:
+    """Pad *tensor* with zeros along dim 0 to *target_rows*."""
+    pad_rows = target_rows - tensor.size(0)
+    if pad_rows == 0:
+        return tensor
+    padding = torch.zeros(
+        pad_rows, *tensor.shape[1:], dtype=tensor.dtype, device=tensor.device
+    )
+    return torch.cat([tensor, padding], dim=0)
+
+
 def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     """
     All-gather a tensor across all workers, preserving gradients for the
@@ -27,22 +48,23 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     ----------
     tensor : torch.Tensor
         Local tensor to gather. Typically ``[N, C]`` logits from one GPU.
+        ``N`` (dim 0) may differ across ranks; all other dimensions must
+        match.
 
     Returns
     -------
     torch.Tensor
         Concatenation of all workers' tensors along dim 0, shape
-        ``[world_size * N, C]``. Gradient flows only through rows
-        ``[rank*N : (rank+1)*N]``.
+        ``[sum(N_i), C]``. Gradient flows only through the rows
+        contributed by the local rank.
 
     Notes
     -----
-    All workers must contribute tensors with the same shape. The pre-allocated
-    receive buffers use ``torch.zeros_like(tensor)``, which assumes every
-    rank's local tensor has identical dimensions. Unequal batch sizes across
-    ranks will cause a shape mismatch error. When using
-    ``DistributedSampler``, set ``drop_last=True`` to guarantee equal batch
-    sizes across ranks.
+    Dim 0 may vary across ranks (e.g. unequal last-batch sizes). When
+    sizes differ, tensors are zero-padded to the max for the collective,
+    then trimmed back to their true lengths before concatenation. An
+    equal-size fast path skips padding when all ranks contribute the same
+    number of rows.
 
     All workers' queues stay synchronized automatically: since every worker
     calls ``all_gather`` before passing to the loss, every worker enqueues
@@ -59,8 +81,8 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
 
         from imbalanced_losses.distributed import all_gather_with_grad
 
-        logits_global  = all_gather_with_grad(logits)          # [world*N, C]
-        targets_global = all_gather_no_grad(targets)           # [world*N]
+        logits_global  = all_gather_with_grad(logits)          # [sum(N_i), C]
+        targets_global = all_gather_no_grad(targets)           # [sum(N_i)]
         loss = loss_fn(logits_global, targets_global)
         loss.backward()
     """
@@ -77,10 +99,20 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
         return tensor
 
     rank = dist.get_rank()
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
-    # Restore gradient connection for the local slice.
-    # Other slices are already detached (dist.all_gather does not propagate grad).
+    local_size = tensor.size(0)
+    sizes = _gather_sizes(local_size, world_size, tensor.device)
+
+    if sizes.eq(local_size).all():
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+        gathered[rank] = tensor
+        return torch.cat(gathered, dim=0)
+
+    max_size = sizes.max().item()
+    padded = _pad_to(tensor, max_size)
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    gathered = [gathered[i][: sizes[i]] for i in range(world_size)]
     gathered[rank] = tensor
     return torch.cat(gathered, dim=0)
 
@@ -95,20 +127,22 @@ def all_gather_no_grad(tensor: torch.Tensor) -> torch.Tensor:
     ----------
     tensor : torch.Tensor
         Local tensor to gather. Typically ``[N]`` integer targets.
+        ``N`` (dim 0) may differ across ranks; all other dimensions must
+        match.
 
     Returns
     -------
     torch.Tensor
         Concatenation of all workers' tensors along dim 0, shape
-        ``[world_size * N]``.
+        ``[sum(N_i)]``.
 
     Notes
     -----
-    All workers must contribute tensors with the same shape. The pre-allocated
-    receive buffers use ``torch.zeros_like(tensor)``, which assumes every
-    rank's local tensor has identical dimensions. When using
-    ``DistributedSampler``, set ``drop_last=True`` to guarantee equal batch
-    sizes across ranks.
+    Dim 0 may vary across ranks (e.g. unequal last-batch sizes). When
+    sizes differ, tensors are zero-padded to the max for the collective,
+    then trimmed back to their true lengths before concatenation. An
+    equal-size fast path skips padding when all ranks contribute the same
+    number of rows.
 
     Raises
     ------
@@ -127,6 +161,17 @@ def all_gather_no_grad(tensor: torch.Tensor) -> torch.Tensor:
     if world_size == 1:
         return tensor
 
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
+    local_size = tensor.size(0)
+    sizes = _gather_sizes(local_size, world_size, tensor.device)
+
+    if sizes.eq(local_size).all():
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+        return torch.cat(gathered, dim=0)
+
+    max_size = sizes.max().item()
+    padded = _pad_to(tensor, max_size)
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    gathered = [gathered[i][: sizes[i]] for i in range(world_size)]
     return torch.cat(gathered, dim=0)

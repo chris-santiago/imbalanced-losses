@@ -242,3 +242,197 @@ class TestWrapperGatherDistributed:
             gather_distributed=False,
         )
         assert not hasattr(wrapper.main_loss, "gather_distributed")
+
+
+# ---------------------------------------------------------------------------
+# Variable-size gather (mocked multi-rank)
+# ---------------------------------------------------------------------------
+
+
+def _make_gather_mock(rank_tensors: list[torch.Tensor]):
+    """
+    Build a stateful side_effect for ``dist.all_gather`` that simulates
+    multiple ranks.  Each call to the returned callable fills *output_list*
+    with the pre-computed tensors for that round.
+
+    The function is called twice per gather invocation:
+      1. sizes gather  (1-element int64 tensors)
+      2. data gather   (padded data tensors)
+
+    *rank_tensors* are the **original, unpadded** tensors — the helper
+    derives the size tensors and padded tensors internally.
+    """
+    world_size = len(rank_tensors)
+    sizes = [torch.tensor([t.size(0)], dtype=torch.int64) for t in rank_tensors]
+
+    max_rows = max(t.size(0) for t in rank_tensors)
+    padded = []
+    for t in rank_tensors:
+        if t.size(0) < max_rows:
+            pad = torch.zeros(max_rows, *t.shape[1:], dtype=t.dtype)
+            pad[: t.size(0)] = t
+            padded.append(pad)
+        else:
+            padded.append(t.clone())
+
+    call_idx = [0]
+
+    def _side_effect(output_list, input_tensor):
+        if call_idx[0] % 2 == 0:
+            for i, s in enumerate(sizes):
+                output_list[i].copy_(s)
+        else:
+            for i, p in enumerate(padded):
+                output_list[i].copy_(p.detach())
+        call_idx[0] += 1
+
+    return _side_effect
+
+
+class TestVariableSizeGather:
+    """
+    Test variable dim-0 gathering using mocked ``dist`` calls to simulate
+    multi-rank scenarios without launching multiple processes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    # -- all_gather_no_grad: variable sizes ---------------------------------
+
+    def test_no_grad_variable_sizes(self):
+        """3 ranks with sizes [4, 6, 2] → output has 12 rows, correct values."""
+        from unittest.mock import patch
+
+        t0 = torch.arange(8).reshape(4, 2).float()
+        t1 = torch.arange(12).reshape(6, 2).float() + 100
+        t2 = torch.arange(4).reshape(2, 2).float() + 200
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1, t2])
+
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_no_grad(t0)
+
+        assert out.shape == (12, 2)
+        expected = torch.cat([t0, t1, t2], dim=0)
+        assert torch.equal(out, expected)
+
+    def test_no_grad_equal_sizes(self):
+        """3 ranks, equal sizes [4, 4, 4] → fast path, correct output."""
+        from unittest.mock import patch
+
+        t0 = torch.arange(8).reshape(4, 2).float()
+        t1 = torch.arange(8).reshape(4, 2).float() + 100
+        t2 = torch.arange(8).reshape(4, 2).float() + 200
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1, t2])
+
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_no_grad(t0)
+
+        assert out.shape == (12, 2)
+        expected = torch.cat([t0, t1, t2], dim=0)
+        assert torch.equal(out, expected)
+
+    def test_no_grad_1d_targets(self):
+        """1D tensors (targets) with variable sizes."""
+        from unittest.mock import patch
+
+        t0 = torch.tensor([0, 1, 1])
+        t1 = torch.tensor([0, 0, 1, 1, 0])
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1])
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_no_grad(t0)
+
+        assert out.shape == (8,)
+        expected = torch.cat([t0, t1])
+        assert torch.equal(out, expected)
+
+    def test_no_grad_zero_rows_one_rank(self):
+        """One rank contributes 0 rows — no crash, output is other rank's data."""
+        from unittest.mock import patch
+
+        t0 = torch.zeros(0, 3).float()
+        t1 = torch.randn(5, 3)
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1])
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_no_grad(t0)
+
+        assert out.shape == (5, 3)
+        assert torch.equal(out, t1)
+
+    # -- all_gather_with_grad: variable sizes -------------------------------
+
+    def test_with_grad_variable_sizes(self):
+        """3 ranks, variable sizes, gradient flows only to local rank."""
+        from unittest.mock import patch
+
+        t0 = torch.randn(4, 2, requires_grad=True)
+        t1 = torch.randn(6, 2)
+        t2 = torch.randn(2, 2)
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1, t2])
+
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_with_grad(t0)
+
+        assert out.shape == (12, 2)
+        out.sum().backward()
+        assert t0.grad is not None
+        assert t0.grad.shape == (4, 2)
+
+    def test_with_grad_equal_sizes(self):
+        """3 ranks, equal sizes, fast path preserves gradient."""
+        from unittest.mock import patch
+
+        t0 = torch.randn(4, 2, requires_grad=True)
+        t1 = torch.randn(4, 2)
+        t2 = torch.randn(4, 2)
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1, t2])
+
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_with_grad(t0)
+
+        assert out.shape == (12, 2)
+        out.sum().backward()
+        assert t0.grad is not None
+        assert t0.grad.shape == (4, 2)
+
+    def test_with_grad_zero_rows_local_rank(self):
+        """Local rank has 0 rows — backward succeeds with empty gradient."""
+        from unittest.mock import patch
+
+        t0 = torch.zeros(0, 3, requires_grad=True)
+        t1 = torch.randn(5, 3)
+        local_rank = 0
+        mock = _make_gather_mock([t0, t1])
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            out = all_gather_with_grad(t0)
+
+        assert out.shape == (5, 3)
+        out.sum().backward()
+        assert t0.grad is not None
+        assert t0.grad.shape == (0, 3)
