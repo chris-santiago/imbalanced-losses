@@ -24,8 +24,8 @@ from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_gr
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, gather_distributed=False)
 
 # In your training step (each GPU):
-logits_global  = all_gather_with_grad(logits)    # [world*N, C], grad flows
-targets_global = all_gather_no_grad(targets)     # [world*N],    no grad
+logits_global  = all_gather_with_grad(logits)    # [sum(N_i), C], grad flows
+targets_global = all_gather_no_grad(targets)     # [sum(N_i)],    no grad
 loss = loss_fn(logits_global, targets_global)
 loss.backward()
 ```

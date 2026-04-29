@@ -28,6 +28,23 @@ gathered[rank] = tensor   # restores gradient connection
 
 This matches DDP semantics: each worker's optimizer step uses gradients from the local model parameters only, but the loss is computed globally.
 
+## Variable batch sizes across ranks
+
+By default, `dist.all_gather` requires every rank to contribute a tensor with exactly the same shape. This breaks when ranks have different batch sizes — for example, the last batch of an epoch when the dataset size is not evenly divisible by the number of GPUs, or when using variable-length data without padding.
+
+Both gather helpers handle this automatically using a **pad-to-max-then-trim** strategy:
+
+1. Each rank broadcasts its local dim-0 size in a cheap scalar collective.
+2. Each rank pads its tensor with zeros to the maximum size across all ranks.
+3. `dist.all_gather` runs on the padded tensors (now equal shape).
+4. Each gathered slice is trimmed back to its true length before concatenation.
+
+Gradient flow is unaffected: the local rank's slice is still replaced with the original (unpadded) tensor, which carries the autograd graph.
+
+When all ranks contribute the same number of rows, an **equal-size fast path** detects this and skips padding and trimming entirely — no overhead compared to the previous behavior.
+
+This means `drop_last=True` in `DistributedSampler` is no longer required for correctness, though it remains a useful optimization to minimize wasted computation from padding.
+
 ## All-gather is a no-op for world_size == 1
 
 Both `all_gather_with_grad` and `all_gather_no_grad` check `world_size` and return the input unchanged when running on a single GPU. There is no overhead in single-GPU training.
