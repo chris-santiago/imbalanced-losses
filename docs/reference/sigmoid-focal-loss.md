@@ -13,7 +13,7 @@ Binary / multi-label focal loss operating on raw logits with a sigmoid activatio
 from imbalanced_losses import SigmoidFocalLoss
 import torch
 
-loss_fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+loss_fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0)
 logits  = torch.randn(32, 1)
 targets = torch.randint(0, 2, (32, 1)).float()
 
@@ -27,5 +27,5 @@ loss.backward()
 |---|---|---|
 | `alpha` | `0.25` | Weights positives; set to `-1` to disable |
 | `gamma` | `2.0` | Higher = more focus on hard examples; `0` = vanilla BCE |
-| `reduction` | `"none"` | `"mean"` averages over elements; `"sum"` for total |
+| `reduction` | `"mean"` | `"mean"` averages over elements; `"sum"` for total; `"none"` returns per-element tensor |
 | `gather_distributed` | `None` | Auto-detects DDP; set `False` to opt out |

@@ -49,7 +49,7 @@ class SigmoidFocalLoss(nn.Module):
     gamma : float
         Exponent of the modulating factor (1 - p_t). Default: 2.
     reduction : str
-        'none' | 'mean' | 'sum'. Default: 'none'.
+        'none' | 'mean' | 'sum'. Default: 'mean'.
     gather_distributed : bool or None, optional
         Whether to all-gather inputs and targets across DDP workers before
         computing the loss.  ``None`` (default) auto-detects: gathers when
@@ -61,7 +61,7 @@ class SigmoidFocalLoss(nn.Module):
         self,
         alpha: float = 0.25,
         gamma: float = 2.0,
-        reduction: str = "none",
+        reduction: str = "mean",
         gather_distributed: bool | None = None,
     ):
         super().__init__()
