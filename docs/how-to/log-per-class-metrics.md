@@ -72,4 +72,4 @@ return loss
 
 ## See also
 
-`examples/per_class_metrics_demo.py` — runnable script demonstrating `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern.
+[`examples/per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py) — runnable script demonstrating `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern.
