@@ -227,5 +227,5 @@ loss_fn = LossWarmupWrapper(
 
 ## See also
 
-- `examples/compare_demo.py` — side-by-side AUCPR for warmup-only, AP-only (no warmup), and warmup+blend+AP so you can see the effect of each phase
-- `examples/toy_demo.py` — minimal end-to-end binary training loop using `LossWarmupWrapper` with per-epoch loss and AUCPR output
+- [`examples/compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py) — side-by-side AUCPR for warmup-only, AP-only (no warmup), and warmup+blend+AP so you can see the effect of each phase
+- [`examples/toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py) — minimal end-to-end binary training loop using `LossWarmupWrapper` with per-epoch loss and AUCPR output
