@@ -269,3 +269,4 @@ often the simpler choice with comparable results.
 - [Configure Warmup and Blending](../how-to/configure-warmup.md) — tune warmup/blend schedules
 - [Log Per-Class Metrics](../how-to/log-per-class-metrics.md) — monitor per-class AP without a second forward pass
 - [Migrate from BCE / CrossEntropyLoss](../how-to/migrate-from-cross-entropy.md) — drop-in migration checklist
+- `examples/binary_imbalance_demo.py` — sweep positive rates 25 % → 0.5 % to see where `SmoothAPLoss` gains are largest

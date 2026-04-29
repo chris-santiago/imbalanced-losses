@@ -211,3 +211,4 @@ You trained the same model architecture with three different loss strategies and
 - [Use Ranking Losses](../how-to/use-ranking-losses.md) — queue sizing, temperature, binary vs. multi-class
 - [Configure Warmup and Blending](../how-to/configure-warmup.md) — tuning the phase schedule
 - [Train with DDP](../how-to/train-with-ddp.md) — multi-GPU setup
+- `examples/binary_imbalance_demo.py` — sweeps positive rates from 25 % down to 0.5 % to show where `SmoothAPLoss` earns its largest gains
