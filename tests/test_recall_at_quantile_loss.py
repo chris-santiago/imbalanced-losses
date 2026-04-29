@@ -639,3 +639,115 @@ class TestRecallAtQuantileLossReturnPerClass:
         assert loss.item() == 0.0
         assert valid.sum().item() == 0
         assert per_class.isnan().all()
+
+
+# ---------------------------------------------------------------------------
+# max_pool_size
+# ---------------------------------------------------------------------------
+
+
+class TestMaxPoolSize:
+    C = 4
+    Q = 0.3   # quantile safely above positive rate for C=4 balanced classes
+
+    def test_init_valid(self):
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=0, max_pool_size=64)
+        assert fn.max_pool_size == 64
+
+    def test_init_invalid(self):
+        with pytest.raises(ValueError):
+            RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                 queue_size=0, max_pool_size=0)
+        with pytest.raises(ValueError):
+            RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                 queue_size=0, max_pool_size=-1)
+
+    def test_none_is_noop(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(32, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (32,))
+        fn_none = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                       queue_size=0, max_pool_size=None)
+        fn_base = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                       queue_size=0)
+        assert torch.allclose(fn_none(logits, targets), fn_base(logits, targets))
+
+    def test_no_subsample_when_pool_small(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(16, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (16,))
+        fn_cap  = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                       queue_size=0, max_pool_size=64)
+        fn_base = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                       queue_size=0)
+        assert torch.allclose(fn_cap(logits, targets), fn_base(logits, targets))
+
+    def test_subsamples_large_pool(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(256, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (256,))
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=0, max_pool_size=32)
+        loss = fn(logits, targets)
+        assert loss.item() >= 0.0
+        assert loss.item() <= 1.0
+        loss.backward()
+        assert logits.grad is not None
+
+    def test_stratified_preserves_rare_class(self):
+        torch.manual_seed(0)
+        n = 1000
+        logits  = torch.randn(n, self.C, requires_grad=True)
+        targets = torch.zeros(n, dtype=torch.long)
+        targets[0] = 3
+        targets[1] = 3
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=0, max_pool_size=128,
+                                  reduction="none")
+        loss = fn(logits, targets)
+        assert not loss[3].isnan(), "rare class 3 was lost to subsampling"
+
+    def test_gradient_flows(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(200, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (200,))
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=0, max_pool_size=32)
+        fn(logits, targets).backward()
+        assert logits.grad is not None
+        assert logits.grad.abs().sum() > 0
+
+    def test_queue_unaffected(self):
+        B = 40
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=200, max_pool_size=16)
+        logits  = torch.randn(B, self.C)
+        targets = torch.randint(0, self.C, (B,))
+        fn(logits, targets)
+        fn(logits, targets)
+        assert int(fn._q_ptr.item()) == (2 * B) % 200
+
+    def test_warning_emitted_once(self):
+        import warnings as _warnings
+        fn = RecallAtQuantileLoss(num_classes=self.C, quantile=self.Q,
+                                  queue_size=0, max_pool_size=16)
+        logits  = torch.randn(100, self.C)
+        targets = torch.randint(0, self.C, (100,))
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            fn(logits, targets)
+            fn(logits, targets)
+        recall_warns = [x for x in w if "RecallAtQuantileLoss" in str(x.message)]
+        assert len(recall_warns) == 1
+
+    def test_binary_mode(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(200, 1, requires_grad=True)
+        targets = torch.randint(0, 2, (200,))
+        fn = RecallAtQuantileLoss(num_classes=1, quantile=0.5,
+                                  queue_size=0, max_pool_size=32)
+        loss = fn(logits, targets)
+        assert 0.0 <= loss.item() <= 1.0
+        loss.backward()
+        assert logits.grad is not None

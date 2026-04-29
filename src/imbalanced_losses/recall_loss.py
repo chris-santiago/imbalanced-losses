@@ -33,6 +33,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
+from imbalanced_losses._sampling import subsample_pool
 
 
 class RecallAtQuantileLoss(nn.Module):
@@ -94,6 +95,16 @@ class RecallAtQuantileLoss(nn.Module):
         conservative default — the threshold never undershoots the true
         cutoff. One of ('linear', 'lower', 'higher', 'nearest', 'midpoint').
         Default: 'higher'.
+    max_pool_size : int or None, optional
+        Maximum number of rows in the ranking pool (live batch + queue after
+        ignore_index filtering).  When the pool exceeds this value, stratified
+        random subsampling caps it at ``max_pool_size`` rows. At least one row
+        per observed target class is guaranteed before filling the remaining
+        budget uniformly.  ``None`` (default) disables the cap.
+
+        Use this for seq2seq tasks with very large flattened pool sizes.
+        Recommended: 2048–4096.  Subsampling also introduces noise into the
+        quantile threshold estimate, so use the largest value your GPU allows.
 
     Examples
     --------
@@ -130,6 +141,7 @@ class RecallAtQuantileLoss(nn.Module):
         update_queue_in_eval: bool = False,
         gather_distributed: bool | None = None,
         quantile_interpolation: str = "higher",
+        max_pool_size: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -148,6 +160,8 @@ class RecallAtQuantileLoss(nn.Module):
                 f"quantile_interpolation must be one of {self._VALID_INTERPOLATIONS}, "
                 f"got '{quantile_interpolation}'"
             )
+        if max_pool_size is not None and max_pool_size <= 0:
+            raise ValueError(f"max_pool_size must be positive, got {max_pool_size}")
 
         self.num_classes = num_classes
         self.quantile = float(quantile)
@@ -159,6 +173,8 @@ class RecallAtQuantileLoss(nn.Module):
         self.gather_distributed = gather_distributed
         self._gather_resolved: bool | None = None
         self.quantile_interpolation = quantile_interpolation
+        self.max_pool_size = max_pool_size
+        self._subsample_warned = False
 
         if queue_size > 0:
             # Unfilled slots carry ignore_index targets and are stripped naturally.
@@ -391,6 +407,19 @@ class RecallAtQuantileLoss(nn.Module):
 
         valid_rows = all_targets != self.ignore_index
         all_logits, all_targets = all_logits[valid_rows], all_targets[valid_rows]
+
+        if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
+            if not self._subsample_warned:
+                warnings.warn(
+                    f"RecallAtQuantileLoss: pool size {all_logits.size(0)} exceeds "
+                    f"max_pool_size={self.max_pool_size}; applying stratified "
+                    f"subsampling. Loss is now a stochastic approximation. "
+                    f"(This warning is shown once per instance.)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._subsample_warned = True
+            all_logits, all_targets = subsample_pool(all_logits, all_targets, self.max_pool_size)
 
         if all_logits.size(0) == 0:
             out = logits.sum() * 0.0

@@ -52,14 +52,26 @@ Flatten to `[N, C]` / `[N]` before passing:
 
 ```python
 B, T, C = 4, 128, 10
-logits  = torch.randn(B, T, C).view(-1, C)   # [B*T, C]
+loss_fn = SmoothAPLoss(num_classes=C, queue_size=1024, max_pool_size=4096)
+logits  = torch.randn(B, T, C).view(-1, C)    # [B*T, C]
 targets = torch.randint(0, C, (B, T)).view(-1) # [B*T]
 loss = loss_fn(logits, targets)
 ```
 
+Without `max_pool_size`, a batch of 30 sequences × 512 tokens produces a pool of 15 360 rows. `SmoothAPLoss` builds a `[|P|, M]` pairwise matrix per class and retains the autograd graph across all classes simultaneously — peak memory is O(M²) and easily OOMs on GPU.
+
+`max_pool_size` caps the pool with stratified random subsampling: at least one row per observed class is guaranteed before the remaining budget is filled uniformly. The queue is unaffected — it continues to accumulate the original full batch.
+
+| Setting | Effect |
+|---|---|
+| `max_pool_size=None` (default) | No cap; full pool used |
+| `max_pool_size=4096` | Pool capped at 4 096 rows; stochastic approximation |
+
+**Choosing a value:** Use the largest `max_pool_size` your GPU memory allows. 2048–4096 is a reasonable starting point for most seq2seq tasks. A one-time `UserWarning` is emitted the first time subsampling is triggered.
+
 ### Queue size guidance
 
-The queue accumulates past batches to give the soft-rank estimator more context. At very low positive rates (e.g. 0.5%), a `queue_size` of at least 512–1024 gives stable AP estimates. The total pool `M = batch_size + queue_size` should stay ≤ ~4096; the implementation is O(|P| × M) where |P| is the positive count, but at higher positive rates this approaches O(M²).
+The queue accumulates past batches to give the soft-rank estimator more context. At very low positive rates (e.g. 0.5%), a `queue_size` of at least 512–1024 gives stable AP estimates. For seq2seq, use `max_pool_size` to control the effective pool size rather than relying solely on `queue_size`.
 
 ---
 

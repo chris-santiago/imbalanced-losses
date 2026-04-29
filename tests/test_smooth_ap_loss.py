@@ -648,3 +648,105 @@ class TestSmoothAPLossReturnPerClass:
         assert loss.item() == 0.0
         assert valid.sum().item() == 0
         assert per_class.isnan().all()
+
+
+# ---------------------------------------------------------------------------
+# max_pool_size
+# ---------------------------------------------------------------------------
+
+
+class TestMaxPoolSize:
+    C = 4
+
+    def test_init_valid(self):
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=64)
+        assert fn.max_pool_size == 64
+
+    def test_init_invalid(self):
+        with pytest.raises(ValueError):
+            SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=0)
+        with pytest.raises(ValueError):
+            SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=-1)
+
+    def test_none_is_noop(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(32, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (32,))
+        fn_none = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=None)
+        fn_base = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        assert torch.allclose(fn_none(logits, targets), fn_base(logits, targets))
+
+    def test_no_subsample_when_pool_small(self):
+        """Pool=16, cap=64 — loss must match uncapped exactly."""
+        torch.manual_seed(0)
+        logits  = torch.randn(16, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (16,))
+        fn_cap  = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=64)
+        fn_base = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        assert torch.allclose(fn_cap(logits, targets), fn_base(logits, targets))
+
+    def test_subsamples_large_pool(self):
+        """Pool=256, cap=32 — loss is finite and in [0, 1], grads flow."""
+        torch.manual_seed(0)
+        logits  = torch.randn(256, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (256,))
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=32)
+        loss = fn(logits, targets)
+        assert loss.item() >= 0.0
+        assert loss.item() <= 1.0
+        loss.backward()
+        assert logits.grad is not None
+
+    def test_stratified_preserves_rare_class(self):
+        """Class 3 has 2 positives in 1000 rows; it must not become nan after cap=128."""
+        torch.manual_seed(0)
+        n = 1000
+        logits  = torch.randn(n, self.C, requires_grad=True)
+        targets = torch.zeros(n, dtype=torch.long)
+        targets[0] = 3
+        targets[1] = 3
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=128,
+                          reduction="none")
+        loss = fn(logits, targets)
+        assert not loss[3].isnan(), "rare class 3 was lost to subsampling"
+
+    def test_gradient_flows(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(200, self.C, requires_grad=True)
+        targets = torch.randint(0, self.C, (200,))
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=32)
+        fn(logits, targets).backward()
+        assert logits.grad is not None
+        assert logits.grad.abs().sum() > 0
+
+    def test_queue_unaffected(self):
+        """_q_ptr must advance by batch_size, not by max_pool_size."""
+        B = 40
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=200, max_pool_size=16)
+        logits  = torch.randn(B, self.C)
+        targets = torch.randint(0, self.C, (B,))
+        fn(logits, targets)
+        fn(logits, targets)
+        assert int(fn._q_ptr.item()) == (2 * B) % 200
+
+    def test_warning_emitted_once(self):
+        import warnings as _warnings
+        fn = SmoothAPLoss(num_classes=self.C, queue_size=0, max_pool_size=16)
+        logits  = torch.randn(100, self.C)
+        targets = torch.randint(0, self.C, (100,))
+        with _warnings.catch_warnings(record=True) as w:
+            _warnings.simplefilter("always")
+            fn(logits, targets)
+            fn(logits, targets)
+        smoothap_warns = [x for x in w if "SmoothAPLoss" in str(x.message)]
+        assert len(smoothap_warns) == 1
+
+    def test_binary_mode(self):
+        torch.manual_seed(0)
+        logits  = torch.randn(200, 1, requires_grad=True)
+        targets = torch.randint(0, 2, (200,))
+        fn = SmoothAPLoss(num_classes=1, queue_size=0, max_pool_size=32)
+        loss = fn(logits, targets)
+        assert 0.0 <= loss.item() <= 1.0
+        loss.backward()
+        assert logits.grad is not None
