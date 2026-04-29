@@ -20,6 +20,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
+from imbalanced_losses._sampling import subsample_pool
 
 
 class SmoothAPLoss(nn.Module):
@@ -66,10 +67,26 @@ class SmoothAPLoss(nn.Module):
         True to allow queue updates during validation. Default: False.
     gather_distributed : bool or None, optional
         Whether to all-gather logits and targets across DDP workers before
-        computing the loss. ``None`` (default) auto-detects: gathers when
-        ``torch.distributed`` is initialized with world_size > 1. Set
+        computing the loss.  ``None`` (default) auto-detects: gathers when
+        ``torch.distributed`` is initialized with world_size > 1.  Set
         ``False`` to explicitly disable. Resolved once on first forward call,
         so safe to construct before ``dist.init_process_group``. Default: None.
+    max_pool_size : int or None, optional
+        Maximum number of rows in the ranking pool (live batch + queue after
+        ignore_index filtering).  When the pool exceeds this value, stratified
+        random subsampling is applied: at least one row per observed target
+        class is guaranteed before filling the remaining budget uniformly.
+        ``None`` (default) disables the cap.
+
+        Use this for seq2seq tasks where flattened inputs produce very large
+        pools. The pairwise matrix in ``_compute_smooth_ap`` is ``[P, M]``
+        where ``M`` is the pool size — at M=15 000 the gradient memory is
+        O(M^2) and easily OOMs.  Recommended: 2048–4096 for seq2seq.
+
+        .. note::
+            Subsampling is a stochastic approximation — the loss value will
+            vary across steps even for the same batch.  Use the largest value
+            your GPU allows for the most stable gradient estimates.
 
     Examples
     --------
@@ -103,6 +120,7 @@ class SmoothAPLoss(nn.Module):
         ignore_index: int = -100,
         update_queue_in_eval: bool = False,
         gather_distributed: bool | None = None,
+        max_pool_size: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -114,6 +132,8 @@ class SmoothAPLoss(nn.Module):
             raise ValueError(f"temperature must be positive, got {temperature}")
         if reduction not in ("mean", "sum", "none"):
             raise ValueError(f"invalid reduction '{reduction}'")
+        if max_pool_size is not None and max_pool_size <= 0:
+            raise ValueError(f"max_pool_size must be positive, got {max_pool_size}")
 
         self.num_classes = num_classes
         self.queue_size = queue_size
@@ -122,7 +142,9 @@ class SmoothAPLoss(nn.Module):
         self.ignore_index = ignore_index
         self.update_queue_in_eval = update_queue_in_eval
         self.gather_distributed = gather_distributed
+        self.max_pool_size = max_pool_size
         self._gather_resolved: bool | None = None
+        self._subsample_warned = False
 
         if queue_size > 0:
             # Unfilled slots carry ignore_index targets and are stripped naturally.
@@ -385,6 +407,19 @@ class SmoothAPLoss(nn.Module):
 
         valid = all_targets != self.ignore_index
         all_logits, all_targets = all_logits[valid], all_targets[valid]
+
+        if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
+            if not self._subsample_warned:
+                warnings.warn(
+                    f"SmoothAPLoss: pool size {all_logits.size(0)} exceeds "
+                    f"max_pool_size={self.max_pool_size}; applying stratified "
+                    f"subsampling. Loss is now a stochastic approximation. "
+                    f"(This warning is shown once per instance.)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._subsample_warned = True
+            all_logits, all_targets = subsample_pool(all_logits, all_targets, self.max_pool_size)
 
         if all_logits.size(0) == 0:
             out = logits.sum() * 0.0

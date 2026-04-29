@@ -78,6 +78,18 @@ This loss directly approximates Average Precision using a sigmoid-based soft ran
 
 If `batch_size + queue_size` is too small to accumulate enough positives, the soft AP estimate is highly variable and training can oscillate. At a 0.5% positive rate, you need M ≈ 2000–4000 to reliably see 10–20 positives per step. If M is limited by memory, consider `RecallAtQuantileLoss`, which does not require counting positives globally.
 
+**Pool too large for memory (seq2seq)**
+
+After flattening a seq2seq batch from `[B, T, C]` to `[B*T, C]`, the pool size M = B × T can be very large (e.g. 30 × 512 = 15 360). The pairwise matrix `[|P|, M]` in the soft rank computation, retained for all C classes simultaneously in the autograd graph, causes O(M²) peak memory and will OOM even with `queue_size=0` and a reduced batch size.
+
+Use `max_pool_size` to cap the pool with stratified random subsampling:
+
+```python
+loss_fn = SmoothAPLoss(num_classes=C, queue_size=1024, max_pool_size=4096)
+```
+
+The queue accumulates the original full batch (unaffected by the cap). A one-time `UserWarning` fires when subsampling first triggers. Because the subsampled pool is a random subset, the loss value varies across steps for identical inputs — this is expected and analogous to dropout noise.
+
 **Temperature too low in early training**
 
 When model scores are near-uniform (random initialization), all pairwise score differences are close to zero. At low temperature τ, $\sigma(\Delta s / \tau)$ saturates near 0.5 everywhere — soft ranks are all approximately $M/2$ and the loss is approximately 0.5 regardless of the model's output. Gradients nearly vanish. This is why cold-starting with focal loss via `LossWarmupWrapper` is recommended: it shapes the score space before AP loss is activated.
