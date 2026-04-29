@@ -1,6 +1,6 @@
 [project]
 name = "imbalanced-losses"
-version = "0.2.3"
+version = "0.2.4"
 description = """
 imbalanced-losses is a PyTorch library of training losses for class-imbalanced classification — including Focal Loss, Smooth-AP, and Recall-at-Quantile — with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
 """
