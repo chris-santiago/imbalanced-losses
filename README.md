@@ -13,7 +13,9 @@
 **Design points:**
 - Circular memory queue stabilizes gradient estimates across small batches — critical at low positive rates (e.g. 0.5%)
 - Compatible with PyTorch Lightning via `on_train_epoch_start` / `on_train_batch_start` hooks
-- `toy_demo.py` demonstrates the full warmup→blend→AP pipeline on a highly imbalanced binary classification task using sklearn's `make_classification`
+- `max_pool_size` caps the pairwise matrix for seq2seq / large-pool settings without reducing batch size
+- Variable dim-0 DDP all-gather — no `drop_last=True` required; unequal last-batch sizes across ranks are handled automatically
+- Six runnable example scripts covering binary, multiclass, focal, per-class logging, and warmup workflows
 
 ## Losses
 
@@ -73,7 +75,7 @@ AP ≈ (1/|P|) · Σ_{i∈P}  ŝ_i^+ / ŝ_i
 loss = 1 − AP
 ```
 
-**Complexity:** O(|P|×M) where |P| is the number of positives and M = batch + queue size. At a 0.5% positive rate this is ~200× cheaper than O(M²). Keep M ≤ ~4096.
+**Complexity:** O(|P|×M) where |P| is the number of positives and M = batch + queue size. At a 0.5% positive rate this is ~200× cheaper than O(M²). Use `max_pool_size` to cap M for seq2seq or other large-pool settings without reducing batch size.
 
 ### `RecallAtQuantileLoss` — Recall at Quantile
 
@@ -104,7 +106,9 @@ Gradient flows only through positive scores, pushing them above the cutoff. Usef
 - **Multi-class** — one-vs-rest per class using `logits[:, c]`
 - **Binary** — set `num_classes=1` with targets in `{0, 1}`
 - **Seq2seq** — flatten `[B, T, C]` → `[B*T, C]` upstream before passing
+- **Pool size cap** — `max_pool_size` applies minimum-quota subsampling after the gather+queue merge, bounding pairwise matrix memory for large M (e.g. seq2seq with long sequences)
 - **Padding** — `ignore_index` rows are excluded from ranking and the positive set
+- **Eval queue freeze** — `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue
 - **Reductions** — `'mean'` (default), `'sum'`, or `'none'` (per-class tensor; degenerate classes are `nan`)
 - **Per-class logging** — `return_per_class=True` returns `(loss, per_class, valid_mask)` without a second forward pass
 
@@ -196,6 +200,7 @@ loss_fn.reset_queue()
 | `ignore_index` | `-100` | Target value for padding positions |
 | `update_queue_in_eval` | `False` | Allow queue updates during `model.eval()` |
 | `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
+| `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss only)* `torch.quantile` interpolation method |
 
@@ -272,12 +277,16 @@ class MyModel(pl.LightningModule):
 |---|---|---|
 | `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)` |
 | `main_loss` | required | Loss used after warmup; must accept `(logits, targets, **kwargs)` |
-| `warmup_epochs` | required | Epochs to use `warmup_loss`; `0` to skip warmup entirely |
-| `temp_start` | required | Temperature at phase switch |
-| `temp_end` | required | Temperature after `temp_decay_steps` steps |
-| `temp_decay_steps` | required | Steps over which to decay temperature |
+| `warmup_epochs` | `0` | Epochs to use `warmup_loss`; `0` skips warmup entirely |
+| `temp_start` | `0.05` | Temperature at phase switch |
+| `temp_end` | `0.005` | Temperature after `temp_decay_steps` steps |
+| `temp_decay_steps` | `10_000` | Steps over which to decay temperature |
 | `blend_epochs` | `0` | Epochs to linearly ramp from warmup to main loss; `0` = hard switch |
+| `warmup_steps` | `None` | Step-based warmup (mutually exclusive with `warmup_epochs > 0`) |
+| `blend_steps` | `None` | Step-based blend (requires `warmup_steps`; mutually exclusive with `blend_epochs > 0`) |
+| `final_main_weight` | `1.0` | Main loss weight after blend completes; `< 1.0` keeps a permanent warmup/main mix |
 | `reset_queue_each_epoch` | `False` | Call `main_loss.reset_queue()` at the start of each main-phase epoch |
+| `gather_distributed` | `None` | Forwarded to `main_loss.gather_distributed` if the attribute exists |
 
 ### Properties / methods
 
@@ -302,10 +311,12 @@ In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `
 
 | Function | Description |
 |---|---|
-| `all_gather_with_grad(tensor)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** so autograd works correctly |
-| `all_gather_no_grad(tensor)` | Gathers tensors without gradient tracking; use for integer targets/labels |
+| `all_gather_with_grad(tensor)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** so autograd works correctly. Variable dim-0 sizes across ranks are supported. |
+| `all_gather_no_grad(tensor)` | Gathers tensors without gradient tracking; use for integer targets/labels. Variable dim-0 sizes across ranks are supported. |
 
 `all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached — matching standard DDP semantics where each worker optimizes its own parameters via all-reduced gradients.
+
+**Variable batch sizes:** Both helpers handle unequal dim-0 sizes across ranks (e.g. the last batch without `drop_last=True`). Tensors are zero-padded to the maximum size for the collective, then trimmed before concatenation. An equal-size fast path skips the overhead when all ranks contribute the same number of rows.
 
 **Queue synchronization:** Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same global-batch data. No extra synchronization of the memory queue is needed.
 
@@ -318,8 +329,8 @@ from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_gr
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
 
 # Inside training_step on each GPU:
-logits_global  = all_gather_with_grad(logits)   # [world_size * N, C] — grad flows
-targets_global = all_gather_no_grad(targets)    # [world_size * N]    — no grad
+logits_global  = all_gather_with_grad(logits)   # [sum(N_i), C] — grad flows for local rank
+targets_global = all_gather_no_grad(targets)    # [sum(N_i)]    — no grad
 loss = loss_fn(logits_global, targets_global)
 loss.backward()
 ```
@@ -354,7 +365,7 @@ uv sync --extra demo
 # or: pip install scikit-learn
 ```
 
-### `toy_demo.py` — single-run trace
+### [`toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py) — single-run trace
 
 Trains one model (warmup → blend → AP) and prints epoch-by-epoch phase, main_weight, temperature, loss, and AUCPR.
 
@@ -364,7 +375,7 @@ python examples/toy_demo.py --blend-epochs 0   # hard switch (no blend)
 python examples/toy_demo.py --pos-rate 0.05    # easier problem
 ```
 
-### `focal_demo.py` — BCE vs focal loss comparison
+### [`focal_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/focal_demo.py) — BCE vs focal loss comparison
 
 Trains four models on the same imbalanced data and prints per-epoch AUCPR:
 
@@ -381,7 +392,7 @@ python examples/focal_demo.py --pos-rate 0.02   # easier problem
 python examples/focal_demo.py --gamma 5 --alpha 0.5
 ```
 
-### `compare_demo.py` — side-by-side comparison
+### [`compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py) — side-by-side comparison
 
 Trains three models on the same data and seed and prints a per-epoch AUCPR table:
 
@@ -398,6 +409,32 @@ python examples/compare_demo.py --warmup-epochs 5 --blend-epochs 3
 ```
 
 Key flags (both scripts): `--pos-rate`, `--warmup-epochs`, `--blend-epochs`, `--total-epochs`, `--batch-size`, `--queue-size`, `--temp-start`, `--temp-end`, `--lr`, `--seed`.
+
+### [`binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py) — positive-rate sweep
+
+Sweeps positive rates from 25% down to 0.5% and compares `SmoothAPLoss`, `BCEWithLogitsLoss`, and `SigmoidFocalLoss`. Shows where SmoothAP's ranking advantage over BCE becomes meaningful.
+
+```bash
+python examples/binary_imbalance_demo.py --sweep          # summary table across all rates
+python examples/binary_imbalance_demo.py --positive-rate 0.005  # per-epoch curve at 0.5%
+```
+
+### [`multiclass_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/multiclass_demo.py) — CE vs Focal vs SmoothAP (multiclass)
+
+Trains three models on the same imbalanced multiclass data and prints a per-epoch macro-AP table: `CrossEntropyLoss`, `SoftmaxFocalLoss`, and `SmoothAPLoss` with warmup.
+
+```bash
+python examples/multiclass_demo.py
+python examples/multiclass_demo.py --n-classes 8 --pos-rate 0.05
+```
+
+### [`per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py) — per-class AP logging
+
+Demonstrates `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern for degenerate classes.
+
+```bash
+python examples/per_class_metrics_demo.py
+```
 
 ## Tests
 
