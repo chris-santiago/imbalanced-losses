@@ -436,39 +436,3 @@ class LossWarmupWrapper(nn.Module):
             return self.main_loss(logits, targets, **kwargs)
         return (1 - w) * self.warmup_loss(logits, targets) + w * self.main_loss(logits, targets)
 
-
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import torch
-    import torch.nn as nn
-
-    from imbalanced_losses.ap_loss import SmoothAPLoss
-
-    torch.manual_seed(0)
-    C, B = 4, 16
-    logits = torch.randn(B, C, requires_grad=True)
-    targets = torch.randint(0, C, (B,))
-
-    wrapper = LossWarmupWrapper(
-        warmup_loss=nn.CrossEntropyLoss(),
-        main_loss=SmoothAPLoss(num_classes=C, queue_size=64),
-        warmup_epochs=2,
-        temp_start=0.5,
-        temp_end=0.01,
-        temp_decay_steps=100,
-    )
-
-    for epoch in range(4):
-        wrapper.on_train_epoch_start(epoch)
-        for step in range(3):
-            global_step = epoch * 3 + step
-            wrapper.on_train_batch_start(global_step)
-            with torch.no_grad():
-                loss = wrapper(logits, targets)
-            t = wrapper.current_temperature
-            print(
-                f"epoch={epoch} step={global_step:3d}  "
-                f"in_warmup={wrapper.in_warmup}  "
-                f"temp={f'{t:.5f}' if t is not None else 'N/A'}  "
-                f"loss={loss.item():.4f}"
-            )

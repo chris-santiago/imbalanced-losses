@@ -31,12 +31,11 @@ import warnings
 from typing import Literal
 
 import torch
-import torch.nn as nn
-from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
-from imbalanced_losses._sampling import subsample_pool
+
+from imbalanced_losses._base import _QueuedRankingLoss
 
 
-class RecallAtQuantileLoss(nn.Module):
+class RecallAtQuantileLoss(_QueuedRankingLoss):
     """
     Differentiable Recall-at-Quantile loss with an optional memory queue.
 
@@ -50,6 +49,9 @@ class RecallAtQuantileLoss(nn.Module):
 
     Multi-class: one-vs-rest per class using logits[:, c], then reduce.
     Binary:      logits[:, 0] with targets in {0, 1}.
+
+    Inherits queue management, DDP gather, ignore-index filtering,
+    subsampling, and reduction logic from ``_QueuedRankingLoss``.
 
     Parameters
     ----------
@@ -147,158 +149,79 @@ class RecallAtQuantileLoss(nn.Module):
         quantile_interpolation: str = "higher",
         max_pool_size: int | None = None,
     ) -> None:
-        super().__init__()
-
-        if num_classes <= 0:
-            raise ValueError(f"num_classes must be positive, got {num_classes}")
         if not (0.0 < quantile < 1.0):
             raise ValueError(f"quantile must be in (0, 1), got {quantile}")
-        if queue_size < 0:
-            raise ValueError(f"queue_size must be >= 0, got {queue_size}")
-        if temperature <= 0:
-            raise ValueError(f"temperature must be positive, got {temperature}")
-        if reduction not in ("mean", "sum", "none"):
-            raise ValueError(f"invalid reduction '{reduction}'")
         if quantile_interpolation not in self._VALID_INTERPOLATIONS:
             raise ValueError(
                 f"quantile_interpolation must be one of {self._VALID_INTERPOLATIONS}, "
                 f"got '{quantile_interpolation}'"
             )
-        if max_pool_size is not None and max_pool_size <= 0:
-            raise ValueError(f"max_pool_size must be positive, got {max_pool_size}")
 
-        self.num_classes = num_classes
+        super().__init__(
+            num_classes=num_classes,
+            queue_size=queue_size,
+            temperature=temperature,
+            reduction=reduction,
+            ignore_index=ignore_index,
+            update_queue_in_eval=update_queue_in_eval,
+            gather_distributed=gather_distributed,
+            max_pool_size=max_pool_size,
+        )
+
         self.quantile = float(quantile)
-        self.queue_size = queue_size
-        self.temperature = float(temperature)
-        self.reduction = reduction
-        self.ignore_index = ignore_index
-        self.update_queue_in_eval = update_queue_in_eval
-        self.gather_distributed = gather_distributed
-        self._gather_resolved: bool | None = None
         self.quantile_interpolation = quantile_interpolation
-        self.max_pool_size = max_pool_size
-        self._subsample_warned = False
 
-        if queue_size > 0:
-            # Unfilled slots carry ignore_index targets and are stripped naturally.
-            self.register_buffer("_q_logits", torch.zeros(queue_size, num_classes))
-            self.register_buffer(
-                "_q_targets", torch.full((queue_size,), ignore_index, dtype=torch.long)
-            )
-            self.register_buffer("_q_ptr", torch.zeros(1, dtype=torch.long))
+    # ------------------------------------------------------------------
+    # Backward-compatible access to queue internals
+    # ------------------------------------------------------------------
+    # Tests and external code may access _q_logits, _q_targets, _q_ptr
+    # directly on the loss instance. These properties delegate to the
+    # nested _MemoryQueue submodule.
+
+    @property
+    def _q_logits(self):
+        return self._queue._q_logits
+
+    @_q_logits.setter
+    def _q_logits(self, value):
+        self._queue._q_logits = value
+
+    @property
+    def _q_targets(self):
+        return self._queue._q_targets
+
+    @_q_targets.setter
+    def _q_targets(self, value):
+        self._queue._q_targets = value
+
+    @property
+    def _q_ptr(self):
+        return self._queue._q_ptr
+
+    @_q_ptr.setter
+    def _q_ptr(self, value):
+        self._queue._q_ptr = value
+
+    # ------------------------------------------------------------------
+    # Backward-compatible queue methods
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _enqueue(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
-        """
-        Write a detached batch into the circular buffer.
-
-        Parameters
-        ----------
-        logits : torch.Tensor, shape [N, C]
-        targets : torch.Tensor, shape [N]
-
-        Notes
-        -----
-        If N >= queue_size the buffer is replaced wholesale with the last
-        queue_size rows and the pointer is reset to 0.
-        """
-        if self.queue_size == 0:
-            return
-
-        n = logits.size(0)
-
-        if n >= self.queue_size:
-            self._q_logits.copy_(logits.detach()[-self.queue_size :])
-            self._q_targets.copy_(targets.detach()[-self.queue_size :])
-            self._q_ptr.zero_()
-            return
-
-        ptr = int(self._q_ptr)
-        end = ptr + n
-
-        if end <= self.queue_size:
-            self._q_logits[ptr:end] = logits.detach()
-            self._q_targets[ptr:end] = targets.detach()
-        else:
-            first, second = self.queue_size - ptr, n - (self.queue_size - ptr)
-            self._q_logits[ptr:] = logits.detach()[:first]
-            self._q_targets[ptr:] = targets.detach()[:first]
-            self._q_logits[:second] = logits.detach()[first:]
-            self._q_targets[:second] = targets.detach()[first:]
-
-        self._q_ptr.fill_((ptr + n) % self.queue_size)
+        """Delegate to the internal ``_MemoryQueue``."""
+        self._queue.enqueue(logits, targets)
 
     def _merge_with_queue(
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Concatenate the live batch with current queue contents.
+        """Delegate to the internal ``_MemoryQueue``."""
+        return self._queue.merge(logits, targets)
 
-        Parameters
-        ----------
-        logits : torch.Tensor, shape [N, C]
-        targets : torch.Tensor, shape [N]
-
-        Returns
-        -------
-        all_logits : torch.Tensor, shape [N + Q, C]
-        all_targets : torch.Tensor, shape [N + Q]
-        """
-        if self.queue_size == 0:
-            return logits, targets
-        q_logits = self._q_logits.to(device=logits.device, dtype=logits.dtype)
-        q_targets = self._q_targets.to(device=targets.device)
-        return torch.cat([logits, q_logits], dim=0), torch.cat(
-            [targets, q_targets], dim=0
-        )
-
-    @torch.no_grad()
-    def reset_queue(self) -> None:
-        """
-        Clear the circular buffer.
-
-        Resets all stored logits to zero, targets to ignore_index, and
-        the write pointer to 0.
-        """
-        if self.queue_size > 0:
-            self._q_logits.zero_()
-            self._q_targets.fill_(self.ignore_index)
-            self._q_ptr.zero_()
-
-    def _should_gather(self) -> bool:
-        """
-        Return True if logits/targets should be all-gathered before this forward.
-
-        Resolved once on first call and cached. Safe to call before
-        ``dist.init_process_group`` — will simply return False until dist
-        is initialized.
-
-        Returns
-        -------
-        bool
-        """
-        if self._gather_resolved is None:
-            import torch.distributed as dist
-            self._gather_resolved = (
-                self.gather_distributed is not False
-                and dist.is_available()
-                and dist.is_initialized()
-                and dist.get_world_size() > 1
-            )
-        return self._gather_resolved
-
-    def _should_update_queue(self) -> bool:
-        """
-        Return True if the queue should be updated on this forward pass.
-
-        Returns
-        -------
-        bool
-        """
-        return self.queue_size > 0 and (self.training or self.update_queue_in_eval)
+    # ------------------------------------------------------------------
+    # Core algorithm
+    # ------------------------------------------------------------------
 
     def _soft_recall_at_quantile(
         self,
@@ -343,124 +266,66 @@ class RecallAtQuantileLoss(nn.Module):
         soft_above = torch.sigmoid((scores[is_pos] - theta) / self.temperature)
         return soft_above.mean(), True
 
-    def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        return_per_class: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # ------------------------------------------------------------------
+    # Subclass validation hook
+    # ------------------------------------------------------------------
+
+    def _validate_filtered_targets(self, targets: torch.Tensor) -> None:
         """
-        Compute the Recall-at-Quantile loss.
+        Validate target range after ignore-index filtering.
 
-        Parameters
-        ----------
-        logits : torch.Tensor, shape [N, C]
-            Raw class scores. Flatten seq2seq inputs upstream:
-                logits  = logits.view(-1, C)
-                targets = targets.view(-1)
-        targets : torch.Tensor, shape [N]
-            Integer class labels in [0, C). ignore_index positions are
-            excluded from the threshold and recall computation.
-        return_per_class : bool, optional
-            If True, also return per-class losses and a validity mask.
-            Default: False.
-
-        Returns
-        -------
-        loss : torch.Tensor
-            Scalar (reduction 'mean'/'sum') or shape [C] (reduction 'none').
-            Classes with no positives are nan when reduction='none'.
-        per_class_loss : torch.Tensor, shape [C]
-            Per-class loss; nan for classes with no positives.
-            Only returned when return_per_class=True.
-        valid_classes : torch.Tensor, shape [C], dtype=bool
-            True for classes with at least one positive in the pool.
-            Only returned when return_per_class=True.
-
-        Raises
-        ------
-        ValueError
-            If logits or targets have unexpected shapes, or targets contain
-            class ids outside [0, num_classes).
-
-        Examples
-        --------
-        Per-class logging in a Lightning training_step:
-
-        >>> loss, per_class, valid = loss_fn(logits, targets, return_per_class=True)
-        >>> for c in valid.nonzero(as_tuple=True)[0].tolist():
-        ...     self.log(f"train/recall_loss_class_{c}", per_class[c])
-        >>> return loss
+        In multi-class mode (num_classes > 1), checks that all targets
+        are in [0, num_classes) and raises ValueError if any are out of
+        range.
         """
-        if targets.ndim == 2 and targets.size(1) == 1:
-            targets = targets.squeeze(1)
-        if logits.ndim != 2 or logits.size(1) != self.num_classes:
-            raise ValueError(
-                f"Expected logits [N, {self.num_classes}], got {tuple(logits.shape)}"
-            )
-        if targets.ndim != 1 or targets.size(0) != logits.size(0):
-            raise ValueError(
-                f"targets must be [N] matching logits, got {tuple(targets.shape)}"
-            )
-
-        if self._should_gather():
-            logits  = all_gather_with_grad(logits)
-            targets = all_gather_no_grad(targets)
-
-        all_logits, all_targets = self._merge_with_queue(logits, targets)
-
-        valid_rows = all_targets != self.ignore_index
-        all_logits, all_targets = all_logits[valid_rows], all_targets[valid_rows]
-
-        if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
-            if not self._subsample_warned:
-                warnings.warn(
-                    f"RecallAtQuantileLoss: pool size {all_logits.size(0)} exceeds "
-                    f"max_pool_size={self.max_pool_size}; applying "
-                    f"minimum-quota subsampling. Loss is now a stochastic approximation. "
-                    f"(This warning is shown once per instance.)",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                self._subsample_warned = True
-            all_logits, all_targets = subsample_pool(all_logits, all_targets, self.max_pool_size)
-
-        if all_logits.size(0) == 0:
-            out = logits.sum() * 0.0
-            if self.reduction == "none":
-                out = out.expand(self.num_classes)
-            if return_per_class:
-                return (
-                    out,
-                    logits.new_full((self.num_classes,), float("nan")),
-                    torch.zeros(
-                        self.num_classes, dtype=torch.bool, device=logits.device
-                    ),
-                )
-            return out
-
-        # Validate target range (cheap, catches real bugs early).
         if self.num_classes > 1:
-            bad = all_targets[(all_targets < 0) | (all_targets >= self.num_classes)]
+            bad = targets[(targets < 0) | (targets >= self.num_classes)]
             if bad.numel() > 0:
                 raise ValueError(
                     f"targets contain class ids outside [0, {self.num_classes}); "
                     f"examples: {bad[:8].tolist()}"
                 )
 
-        # --- compute per-class recall and validity -----------------------
+    # ------------------------------------------------------------------
+    # Per-class dispatch (required by _QueuedRankingLoss)
+    # ------------------------------------------------------------------
+
+    def _compute_per_class(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute 1 - recall for each class via one-vs-rest decomposition.
+
+        Parameters
+        ----------
+        logits : torch.Tensor, shape [M, C]
+            Pooled logits (live batch + queue, ignore-index rows removed,
+            subsampling applied).
+        targets : torch.Tensor, shape [M]
+            Corresponding integer targets.
+
+        Returns
+        -------
+        loss_vec : torch.Tensor, shape [C]
+            Per-class loss values (1 - soft_recall).
+        valid_vec : torch.Tensor, shape [C], dtype=bool
+            True for classes with at least one positive in the pool.
+        """
         if self.num_classes == 1:
-            bad = all_targets[(all_targets != 0) & (all_targets != 1)]
+            # Binary mode: warn on out-of-range targets
+            bad = targets[(targets != 0) & (targets != 1)]
             if bad.numel() > 0:
                 warnings.warn(
                     f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
                     f"but found values: {bad[:8].tolist()}. "
                     "Non-zero values are treated as positive.",
                     UserWarning,
-                    stacklevel=2,
+                    stacklevel=4,
                 )
             recall, is_valid = self._soft_recall_at_quantile(
-                all_logits[:, 0], all_targets.bool()
+                logits[:, 0], targets.bool()
             )
             loss_vals = [1.0 - recall]
             valid_mask = [is_valid]
@@ -468,111 +333,11 @@ class RecallAtQuantileLoss(nn.Module):
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 recall, is_valid = self._soft_recall_at_quantile(
-                    all_logits[:, c], all_targets == c
+                    logits[:, c], targets == c
                 )
                 loss_vals.append(1.0 - recall)
                 valid_mask.append(is_valid)
 
-        loss_vec = torch.stack(loss_vals)  # [C] or [1]
-        valid_vec = torch.tensor(valid_mask, device=logits.device)  # [C] or [1]
-
-        if self._should_update_queue():
-            self._enqueue(logits, targets)
-
-        # --- reduction ---------------------------------------------------
-        if self.reduction == "none":
-            out = loss_vec.masked_fill(~valid_vec, float("nan"))
-        else:
-            valid_losses = loss_vec[valid_vec]
-            if valid_losses.numel() == 0:
-                out = logits.sum() * 0.0
-            elif self.reduction == "sum":
-                out = valid_losses.sum()
-            else:
-                out = valid_losses.mean()
-
-        if return_per_class:
-            per_class = loss_vec.masked_fill(~valid_vec, float("nan"))
-            return out, per_class, valid_vec
-        return out
-
-
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    C, B = 4, 64
-
-    # For perfect/worst we need the threshold to fall between negatives and
-    # positives.  Positives are 1/C = 25% of scores, so quantile > 0.25.
-    SANITY_Q = 0.30
-
-    targets_p = torch.arange(B) % C  # balanced: 16 per class
-
-    # --- perfect ---------------------------------------------------------
-    logits_p = torch.full((B, C), -10.0)
-    for i, t in enumerate(targets_p):
-        logits_p[i, t] = 10.0
-    logits_p = logits_p.requires_grad_(True)
-    fn_perfect = RecallAtQuantileLoss(num_classes=C, quantile=SANITY_Q, queue_size=0)
-    loss_p = fn_perfect(logits_p, targets_p)
-    loss_p.backward()
-    print(f"[perfect] loss={loss_p.item():.4f}  (expected ≈ 0.0)")
-
-    # --- worst -----------------------------------------------------------
-    logits_w = torch.full((B, C), 10.0)
-    for i, t in enumerate(targets_p):
-        logits_w[i, t] = -10.0
-    logits_w = logits_w.requires_grad_(True)
-    fn_worst = RecallAtQuantileLoss(num_classes=C, quantile=SANITY_Q, queue_size=0)
-    loss_w = fn_worst(logits_w, targets_p)
-    loss_w.backward()
-    print(f"[worst]   loss={loss_w.item():.4f}  (expected ≈ 1.0)")
-
-    # --- random with queue -----------------------------------------------
-    fn = RecallAtQuantileLoss(num_classes=C, quantile=0.005, queue_size=256)
-    logits_r = torch.randn(B, C, requires_grad=True)
-    targets_r = torch.randint(0, C, (B,))
-    targets_r[:4] = -100
-    loss_r = fn(logits_r, targets_r)
-    loss_r.backward()
-    print(f"[random]  loss={loss_r.item():.4f}  grad_norm={logits_r.grad.norm():.4f}")
-
-    # --- reduction='none' ------------------------------------------------
-    fn_none = RecallAtQuantileLoss(
-        num_classes=C, quantile=SANITY_Q, queue_size=0, reduction="none"
-    )
-    per_class = fn_none(
-        torch.randn(B, C, requires_grad=True), torch.randint(0, C, (B,))
-    )
-    print(f"[none]    per-class: {[f'{v:.4f}' for v in per_class.tolist()]}")
-
-    # --- eval: queue should not update -----------------------------------
-    fn_eval = RecallAtQuantileLoss(num_classes=C, quantile=SANITY_Q, queue_size=64)
-    fn_eval.eval()
-    ptr_before = int(fn_eval._q_ptr)
-    fn_eval(torch.randn(B, C), torch.randint(0, C, (B,)))
-    ptr_after = int(fn_eval._q_ptr)
-    assert ptr_before == ptr_after, "queue should not update during eval"
-    print(f"[eval]    queue ptr unchanged={ptr_after == ptr_before}  (expected True)")
-
-    # --- binary ----------------------------------------------------------
-    fn_bin = RecallAtQuantileLoss(num_classes=1, quantile=SANITY_Q, queue_size=64)
-    logits_b = torch.randn(B, 1, requires_grad=True)
-    targets_b = torch.randint(0, 2, (B,))
-    targets_b[0] = -100
-    loss_b = fn_bin(logits_b, targets_b)
-    loss_b.backward()
-    print(f"[binary]  loss={loss_b.item():.4f}  grad_norm={logits_b.grad.norm():.4f}")
-
-    # --- batch larger than queue -----------------------------------------
-    fn_small_q = RecallAtQuantileLoss(num_classes=C, quantile=SANITY_Q, queue_size=8)
-    fn_small_q(torch.randn(32, C), torch.randint(0, C, (32,)))
-    print(f"[big batch] queue ptr={int(fn_small_q._q_ptr)}  (expected 0, wrapped)")
-
-    # --- quantile_interpolation='higher' (default) -----------------------
-    fn_interp = RecallAtQuantileLoss(
-        num_classes=C, quantile=SANITY_Q, queue_size=0, quantile_interpolation="higher"
-    )
-    loss_i = fn_interp(torch.randn(B, C, requires_grad=True), torch.randint(0, C, (B,)))
-    loss_i.backward()
-    print(f"[interp]  loss={loss_i.item():.4f}  (higher interpolation)")
+        loss_vec = torch.stack(loss_vals)
+        valid_vec = torch.tensor(valid_mask, device=logits.device)
+        return loss_vec, valid_vec

@@ -16,8 +16,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
+from imbalanced_losses._base import _resolve_gather
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
@@ -77,12 +77,7 @@ class SigmoidFocalLoss(nn.Module):
 
     def _should_gather(self) -> bool:
         if self._gather_resolved is None:
-            self._gather_resolved = (
-                self.gather_distributed is not False
-                and dist.is_available()
-                and dist.is_initialized()
-                and dist.get_world_size() > 1
-            )
+            self._gather_resolved = _resolve_gather(self.gather_distributed)
         return self._gather_resolved
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -197,12 +192,7 @@ class SoftmaxFocalLoss(nn.Module):
 
     def _should_gather(self) -> bool:
         if self._gather_resolved is None:
-            self._gather_resolved = (
-                self.gather_distributed is not False
-                and dist.is_available()
-                and dist.is_initialized()
-                and dist.get_world_size() > 1
-            )
+            self._gather_resolved = _resolve_gather(self.gather_distributed)
         return self._gather_resolved
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
