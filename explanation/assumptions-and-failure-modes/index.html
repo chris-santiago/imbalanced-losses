@@ -1,0 +1,2092 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="PyTorch losses for class-imbalanced classification — Focal Loss, Smooth-AP, Recall-at-Quantile, with DDP all-gather support.">
+      
+      
+        <meta name="author" content="Chris Santiago">
+      
+      
+        <link rel="canonical" href="https://chris-santiago.github.io/imbalanced-losses/explanation/assumptions-and-failure-modes/">
+      
+      
+        <link rel="prev" href="../ddp-all-gather/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Assumptions and Failure Modes - imbalanced-losses</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#assumptions-and-failure-modes" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="imbalanced-losses" class="md-header__button md-logo" aria-label="imbalanced-losses" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            imbalanced-losses
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Assumptions and Failure Modes
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/chris-santiago/imbalanced-losses" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    chris-santiago/imbalanced-losses
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../tutorials/" class="md-tabs__link">
+          
+  
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../how-to/" class="md-tabs__link">
+          
+  
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../" class="md-tabs__link">
+          
+  
+  
+  Explanation
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="imbalanced-losses" class="md-nav__button md-logo" aria-label="imbalanced-losses" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    imbalanced-losses
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/chris-santiago/imbalanced-losses" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    chris-santiago/imbalanced-losses
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tutorials
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Tutorials
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tutorials
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/multiclass-classification/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Multiclass Classification
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    How-To Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    How-To Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    How-To Guides
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/use-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Use Focal Loss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/use-ranking-losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Use Ranking Losses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/configure-warmup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configure Warmup and Blending
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/train-with-ddp/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Train with DDP
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/log-per-class-metrics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Log Per-Class Metrics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/migrate-from-cross-entropy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrate from BCE / CrossEntropyLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/sigmoid-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SigmoidFocalLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/softmax-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SoftmaxFocalLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/smooth-ap-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmoothAPLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/recall-at-quantile-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    RecallAtQuantileLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/loss-warmup-wrapper/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LossWarmupWrapper
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/distributed/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Distributed Utilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Explanation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Explanation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Explanation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../why-imbalanced-losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Why Imbalanced Losses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../memory-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Queue Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../temperature-soft-ranking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Temperature and Soft Ranking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ddp-all-gather/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    DDP All-Gather and Gradients
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Assumptions and Failure Modes
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Assumptions and Failure Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#universal-assumptions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Universal assumptions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Universal assumptions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#label-quality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Label quality
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sufficient-model-capacity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sufficient model capacity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#score-distribution-stability-within-the-queue-window" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Score distribution stability within the queue window
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#focal-loss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Focal Loss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Focal Loss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#smoothaploss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SmoothAPLoss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SmoothAPLoss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recallatquantileloss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RecallAtQuantileLoss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="RecallAtQuantileLoss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#losswarmupwrapper" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LossWarmupWrapper
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="LossWarmupWrapper">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#diagnostic-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Diagnostic summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#universal-assumptions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Universal assumptions
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Universal assumptions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#label-quality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Label quality
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#sufficient-model-capacity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sufficient model capacity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#score-distribution-stability-within-the-queue-window" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Score distribution stability within the queue window
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#focal-loss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Focal Loss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Focal Loss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#smoothaploss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SmoothAPLoss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="SmoothAPLoss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recallatquantileloss" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        RecallAtQuantileLoss
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="RecallAtQuantileLoss">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#losswarmupwrapper" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        LossWarmupWrapper
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="LossWarmupWrapper">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#when-it-works_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it works
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#when-it-breaks-down_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When it breaks down
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#diagnostic-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Diagnostic summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href="../.." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Explanation
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="assumptions-and-failure-modes">Assumptions and Failure Modes<a class="headerlink" href="#assumptions-and-failure-modes" title="Permanent link">&para;</a></h1>
+<p>This page answers the question: <em>"Is my problem a good fit for these losses?"</em></p>
+<p>Each loss makes implicit and explicit assumptions about the data, the model, and the training regime. When those assumptions hold, the loss functions as intended. When they break, the loss produces misleading gradients, degenerate solutions, or silent failures.</p>
+<hr />
+<h2 id="universal-assumptions">Universal assumptions<a class="headerlink" href="#universal-assumptions" title="Permanent link">&para;</a></h2>
+<p>All losses in this library share these baseline requirements. Violations affect every loss, not just one.</p>
+<h3 id="label-quality">Label quality<a class="headerlink" href="#label-quality" title="Permanent link">&para;</a></h3>
+<p>All losses assume that positive labels are correct. Focal loss and ranking losses amplify the influence of hard examples — but a hard example is indistinguishable from a mislabeled one. Label noise in the positive class is especially dangerous: a mislabeled negative scored low will be treated as a hard positive and receive full gradient weight.</p>
+<p><strong>Rule of thumb:</strong> Positive-class label error rates above ~5% tend to degrade focal loss; ranking losses are even more sensitive because a single mislabeled positive shifts the rank estimate for the entire pool.</p>
+<h3 id="sufficient-model-capacity">Sufficient model capacity<a class="headerlink" href="#sufficient-model-capacity" title="Permanent link">&para;</a></h3>
+<p>Losses cannot compensate for a model that cannot discriminate between classes. If the feature space does not separate positives from negatives, no loss function fixes that. These losses are designed to better <em>direct</em> the gradient signal, not to <em>create</em> signal where none exists.</p>
+<h3 id="score-distribution-stability-within-the-queue-window">Score distribution stability within the queue window<a class="headerlink" href="#score-distribution-stability-within-the-queue-window" title="Permanent link">&para;</a></h3>
+<p>The memory queue assumes the model's score distribution changes slowly relative to the queue rotation period (<code>queue_size / batch_size</code> steps). If the distribution shifts dramatically within that window — due to curriculum learning, staged unfreezing, or learning rate spikes — stale queue entries become misleading. Reset the queue manually after any such event.</p>
+<hr />
+<h2 id="focal-loss">Focal Loss<a class="headerlink" href="#focal-loss" title="Permanent link">&para;</a></h2>
+<p><code>SigmoidFocalLoss</code> and <code>SoftmaxFocalLoss</code> are modified cross-entropy losses. They inherit CE's theoretical framework and fail in the same ways CE fails, plus some additional failure modes specific to the focal modifier.</p>
+<h3 id="when-it-works">When it works<a class="headerlink" href="#when-it-works" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Moderate to severe imbalance: the original RetinaNet paper (Lin et al., ICCV 2017) used 1:1000 foreground-to-background ratios. Focal loss was specifically designed for this regime.</li>
+<li>Easy examples dominate gradient noise: the <span class="arithmatex">\((1 - p_t)^\gamma\)</span> modifier is most valuable when the majority class is easy and the minority class is hard.</li>
+<li>You need a drop-in CE replacement with no queue or infrastructure changes.</li>
+<li>Mild imbalance where tuning <code>alpha</code> alone is insufficient.</li>
+</ul>
+<h3 id="when-it-breaks-down">When it breaks down<a class="headerlink" href="#when-it-breaks-down" title="Permanent link">&para;</a></h3>
+<p><strong>Extreme imbalance (&lt; 0.01% positive rate)</strong></p>
+<p>At very low positive rates, even after down-weighting easy negatives, the absolute number of positive gradient contributions per batch is near zero. Focal loss re-weights contributions but does not create positives that aren't there. You still need enough positives per batch to learn. At 0.01% with batch size 64, expect &lt; 1 positive per batch.</p>
+<p><strong>Label noise amplified by high gamma</strong></p>
+<p>As <span class="arithmatex">\(\gamma\)</span> increases, down-weighting of correctly-classified easy examples becomes more aggressive. A mislabeled negative (true negative, labeled positive) that the model correctly assigns a low score to is treated as a hard positive and receives a large gradient weight. Empirically, <span class="arithmatex">\(\gamma &gt; 3\)</span> tends to increase sensitivity to label noise. Lin et al. found <span class="arithmatex">\(\gamma = 2\)</span> optimal across a range of detection benchmarks; values above 3 showed diminishing returns and increasing instability.</p>
+<p><strong>Optimizing for a ranking metric</strong></p>
+<p>Focal loss minimizes a weighted log-loss, which is a proxy for calibrated probability estimation. It does <em>not</em> directly optimize Average Precision, AUROC, or recall at a threshold. A model trained with focal loss may have better AP than one trained with CE — but this is an indirect effect, not a guarantee. If your evaluation metric is AP or recall@k, <code>SmoothAPLoss</code> or <code>RecallAtQuantileLoss</code> will generally outperform focal loss at comparable imbalance levels.</p>
+<p><strong>Calibration is required downstream</strong></p>
+<p>Focal loss distorts the predicted probability distribution. The down-weighting of easy examples pushes the model toward underconfident predictions on the majority class and overconfident predictions on hard examples. Do not use focal loss output probabilities as calibrated estimates without a calibration step (Platt scaling, isotonic regression, etc.).</p>
+<p><strong>alpha/gamma interaction with severely imbalanced multi-class</strong></p>
+<p><code>SoftmaxFocalLoss</code> with per-class <code>alpha</code> can produce unstable training when rare classes have very few samples. The model can "ignore" a rare class by assigning its alpha weight to a region of parameter space that is rarely visited — effectively the rare class receives no gradient updates across many batches. If a class appears fewer than once per ~20 batches, consider either oversampling or switching to <code>SmoothAPLoss</code>.</p>
+<hr />
+<h2 id="smoothaploss">SmoothAPLoss<a class="headerlink" href="#smoothaploss" title="Permanent link">&para;</a></h2>
+<p>This loss directly approximates Average Precision using a sigmoid-based soft rank estimator (Brown et al., ECCV 2020). The approximation is theoretically sound, but its quality depends on pool size, temperature, and positive rate.</p>
+<h3 id="when-it-works_1">When it works<a class="headerlink" href="#when-it-works_1" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Direct optimization of AUCPR / Average Precision is the goal.</li>
+<li>Positive rate is in the range 0.1%–20%. Below this range, the queue must be large enough to accumulate sufficient positives; above this range, focal loss is likely competitive with much lower overhead.</li>
+<li>The pool (batch + queue) reliably contains ≥ 10–20 positives. This is the practical threshold for stable AP estimation. With 10 positives, the AP estimate has high variance but usable gradient signal; with &lt; 5, the estimate is essentially noise.</li>
+<li>Score ranges across the pool are comparable — no extreme outliers that compress all other soft ranks to near 0 or 1.</li>
+</ul>
+<h3 id="when-it-breaks-down_1">When it breaks down<a class="headerlink" href="#when-it-breaks-down_1" title="Permanent link">&para;</a></h3>
+<p><strong>Pool too small for the positive rate</strong></p>
+<p>If <code>batch_size + queue_size</code> is too small to accumulate enough positives, the soft AP estimate is highly variable and training can oscillate. At a 0.5% positive rate, you need M ≈ 2000–4000 to reliably see 10–20 positives per step. If M is limited by memory, consider <code>RecallAtQuantileLoss</code>, which does not require counting positives globally.</p>
+<p><strong>Pool too large for memory (seq2seq)</strong></p>
+<p>After flattening a seq2seq batch from <code>[B, T, C]</code> to <code>[B*T, C]</code>, the pool size M = B × T can be very large (e.g. 30 × 512 = 15 360). The pairwise matrix <code>[|P|, M]</code> in the soft rank computation, retained for all C classes simultaneously in the autograd graph, causes O(M²) peak memory and will OOM even with <code>queue_size=0</code> and a reduced batch size.</p>
+<p>Use <code>max_pool_size</code> to cap the pool with minimum-quota subsampling:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">loss_fn</span> <span class="o">=</span> <span class="n">SmoothAPLoss</span><span class="p">(</span><span class="n">num_classes</span><span class="o">=</span><span class="n">C</span><span class="p">,</span> <span class="n">queue_size</span><span class="o">=</span><span class="mi">1024</span><span class="p">,</span> <span class="n">max_pool_size</span><span class="o">=</span><span class="mi">4096</span><span class="p">)</span>
+</code></pre></div>
+<p>The queue accumulates the original full batch (unaffected by the cap). A one-time <code>UserWarning</code> fires when subsampling first triggers. Because the subsampled pool is a random subset, the loss value varies across steps for identical inputs — this is expected and analogous to dropout noise.</p>
+<p><strong>Sizing <code>max_pool_size</code> with a dominant background class:</strong> the subsampler gives every observed class an equal quota (<code>max_pool_size // (2 × n_classes)</code>), not a proportional one. A dominant class (e.g. 99% background) and a rare class get the same reserved count, so rare classes are over-represented in the subsampled pool. The effective positive count per class is <code>|P_c| ≈ max_pool_size // (2 × n_classes)</code> — much higher than <code>max_pool_size × positive_rate</code> would suggest. Size from the target <code>|P_c|</code>, not from memory alone: <code>max_pool_size ≈ target_|P_c| × 2 × n_classes</code>.</p>
+<p><strong>Temperature too low in early training</strong></p>
+<p>When model scores are near-uniform (random initialization), all pairwise score differences are close to zero. At low temperature τ, <span class="arithmatex">\(\sigma(\Delta s / \tau)\)</span> saturates near 0.5 everywhere — soft ranks are all approximately <span class="arithmatex">\(M/2\)</span> and the loss is approximately 0.5 regardless of the model's output. Gradients nearly vanish. This is why cold-starting with focal loss via <code>LossWarmupWrapper</code> is recommended: it shapes the score space before AP loss is activated.</p>
+<p><strong>Temperature too low for gradient variance</strong></p>
+<p>Even in mid-training, very low τ (&lt; 0.005) can produce gradients that are highly sensitive to small score perturbations. When a positive score crosses a negative score, the soft rank changes sharply, producing large gradient spikes. In practice this can manifest as sudden loss spikes or training instability. Use the geometric decay schedule in <code>LossWarmupWrapper</code> to approach low temperatures gradually.</p>
+<p><strong>All positives or all negatives in the pool</strong></p>
+<p>AP is undefined when the pool contains no positives or only positives. The loss returns 0.0 for empty pools (no positives) and marks the class as invalid (NaN for <code>reduction='none'</code>). This is correct behavior, but if your batches systematically produce degenerate pools — e.g., a class so rare that even with a full queue it never appears — the loss never trains that class. Monitor per-class positive rates and ensure queue size is sufficient.</p>
+<p><strong>Queue staleness after distribution shift</strong></p>
+<p>Queue entries are detached and treated as a fixed reference distribution for the current step. This is valid when the model's score distribution evolves slowly. After events that shift the distribution abruptly — phase switches, checkpoint loading, learning rate resets — the queue contains entries that misrepresent the current model's output range. The soft ranks computed against a stale queue are biased. Reset the queue after any such event.</p>
+<p><strong>Multi-modal score distributions</strong></p>
+<p>The soft rank formula sums sigmoid comparisons uniformly across the pool. If the score distribution is bimodal (e.g., two well-separated clusters of negatives), positives caught between the modes receive a very different rank signal than positives in the upper cluster. This is not a failure mode per se, but it means the loss is sensitive to the overall score distribution shape. Monitoring the raw score histogram during training is helpful.</p>
+<p><strong>Theoretical note on the Brown et al. approximation</strong></p>
+<p>The ECCV 2020 paper demonstrated that the sigmoid soft rank converges to the true AP as τ → 0, and that directly optimizing this surrogate outperforms post-hoc tuning of cross-entropy on standard retrieval benchmarks. However, the paper evaluated on retrieval tasks (where the pool is the entire gallery set) rather than classification with a small batch + queue. In the small-pool regime, the approximation quality is lower and the variance of the gradient estimator is higher than in the original paper's setting.</p>
+<hr />
+<h2 id="recallatquantileloss">RecallAtQuantileLoss<a class="headerlink" href="#recallatquantileloss" title="Permanent link">&para;</a></h2>
+<p>This loss optimizes recall above a score threshold set at the q-th quantile of the pooled score distribution. It is an original design (not from published literature), motivated by fixed-capacity review settings.</p>
+<h3 id="when-it-works_2">When it works<a class="headerlink" href="#when-it-works_2" title="Permanent link">&para;</a></h3>
+<ul>
+<li>You operate at a fixed precision point: only the top q-fraction of flagged items will be reviewed.</li>
+<li>Quantile q &gt; positive class fraction: this ensures the threshold θ typically falls in the negative score region under a well-trained model. If q = 0.01 and your positive rate is 2%, the threshold must be in the negative region for recall to be maximized — this is the natural operating regime.</li>
+<li>The pool is large enough to estimate the quantile reliably. At q = 0.005, you need at least 1/0.005 = 200 pooled samples for the quantile estimate to correspond to at least one sample. In practice, 5–10× more samples (1000–2000) give a stable estimate.</li>
+<li>Positive scores are dispersed above the threshold: gradients flow from positives that score below θ, pushing them above it. If all positives already score well above θ, the loss is near zero and training stalls (correctly — the objective is already met).</li>
+</ul>
+<h3 id="when-it-breaks-down_2">When it breaks down<a class="headerlink" href="#when-it-breaks-down_2" title="Permanent link">&para;</a></h3>
+<p><strong>Quantile &lt; positive class fraction</strong></p>
+<p>If q &lt; positive_rate, then under a perfect model (all positives score above all negatives), the quantile threshold falls inside the positive score range. Positives above θ contribute zero gradient (they are already above the threshold), but positives below θ receive push-up gradients toward a threshold that is already inside the positive cluster. The loss can converge to a state where ~q fraction of positives are above threshold and the rest are not — a partial solution that is locally stable.</p>
+<p><strong>Stop-gradient on the threshold</strong></p>
+<p>The quantile threshold θ is computed with <code>detach()</code> — no gradient flows through it. This is intentional: allowing gradients through θ would incentivize the model to push <em>all</em> scores below the threshold (to lower the threshold and trivially satisfy the objective). However, the stop-gradient means the loss has no signal if <em>all</em> positives already score above θ at a given step. In that case the per-positive sigmoids are all near 1.0, the loss is near 0.0, and gradients vanish — even if the threshold is poorly positioned. This is correct when recall is actually high, but it means the loss cannot push θ lower.</p>
+<p><strong>Threshold instability at score distribution boundaries</strong></p>
+<p>If the score distribution has a gap or discontinuity at the quantile, the threshold can jump between steps. Since the threshold is recomputed fresh each forward pass from the current pool, a score jump of even a small amount can cause θ to shift by a large amount if the distribution is sparse near the q-th percentile. This produces inconsistent gradient signals across consecutive steps. Adding queue entries stabilizes this by densifying the distribution.</p>
+<p><strong>Pool too small for the target quantile</strong></p>
+<p>Unlike <code>SmoothAPLoss</code>, <code>RecallAtQuantileLoss</code> requires enough samples to estimate a specific percentile. At q = 0.005 with a pool of 100, the quantile is determined by the single lowest-scoring sample in the top 0.5% — just one data point. This estimate is highly variable. The queue size should be set so that <code>(batch_size + queue_size) * q ≥ 10</code> for a stable threshold estimate.</p>
+<p><strong>Sensitivity to score scale</strong></p>
+<p>The gradient magnitude of the per-positive sigmoid <span class="arithmatex">\(\sigma((s_i - \theta) / \tau)\)</span> depends on <span class="arithmatex">\((s_i - \theta) / \tau\)</span>. If the model's scores have large scale (e.g., logits in the range ±50 rather than ±5), the gradient is nearly zero for all positives not in an infinitesimally thin band around θ. This produces a very sparse and spiky gradient signal. Normalize logits or adjust τ to match the expected score scale.</p>
+<hr />
+<h2 id="losswarmupwrapper">LossWarmupWrapper<a class="headerlink" href="#losswarmupwrapper" title="Permanent link">&para;</a></h2>
+<p>This utility is not a loss itself but manages the transition from a warmup loss to the main ranking loss. Its failure modes are training dynamics failures, not mathematical ones.</p>
+<h3 id="when-it-works_3">When it works<a class="headerlink" href="#when-it-works_3" title="Permanent link">&para;</a></h3>
+<ul>
+<li>The model starts from random initialization or a weakly-supervised checkpoint where scores are near-uniform.</li>
+<li>The warmup loss (CE/BCE) produces a meaningful score ordering before the AP phase begins.</li>
+<li>The blend and temperature schedules are appropriate for the total training budget.</li>
+</ul>
+<h3 id="when-it-breaks-down_3">When it breaks down<a class="headerlink" href="#when-it-breaks-down_3" title="Permanent link">&para;</a></h3>
+<p><strong>Warmup phase too short</strong></p>
+<p>If the model hasn't developed a meaningful score ordering by the end of warmup, the AP loss starts from effectively random scores — the same cold-start problem it was designed to avoid. Scores near-uniform at the start of AP phase produce near-zero gradients (see temperature discussion above). Rule of thumb: warmup until the model achieves at least moderate AP (&gt; 0.3 on a mid-difficulty task) before switching.</p>
+<p><strong>Warmup phase too long</strong></p>
+<p>Prolonged BCE warmup can cause the model to overfit to a calibrated-probability objective. The model learns to predict the exact positive rate rather than to <em>rank</em> positives above negatives. When the AP loss is then activated, the score distribution may be well-calibrated but not discriminative — positives and negatives are separated only modestly. This can be detected by monitoring AUCPR during warmup: if it plateaus early, the warmup phase can be shortened.</p>
+<p><strong>Using with a pretrained model</strong></p>
+<p>If the model is initialized from a pretrained checkpoint that already produces meaningful scores, the warmup phase may be unnecessary and can even harm training by pulling the model away from a good initialization toward a worse one. In this case, consider skipping the warmup phase entirely (<code>warmup_epochs=0</code>) or using a very short warmup (1–2 epochs) with a high learning rate decay.</p>
+<p><strong>Temperature decay too fast</strong></p>
+<p>If <code>temp_end / temp_start</code> is too small or <code>temp_decay_steps</code> is too short, the temperature reaches the minimum before the model has refined the ranking. Low temperature with poorly separated scores produces large, noisy gradients. Schedule the decay to reach <code>temp_end</code> no earlier than ~50–75% of the main training phase.</p>
+<p><strong>Queue poisoning at the phase switch</strong></p>
+<p><code>LossWarmupWrapper</code> automatically resets the queue at the phase switch. However, if you manually bypass the wrapper (e.g., by directly calling <code>main_loss.forward()</code> during warmup), the queue accumulates warmup-era logits that are not reset. Always use the wrapper's <code>forward()</code> method to ensure correct queue management.</p>
+<hr />
+<h2 id="diagnostic-summary">Diagnostic summary<a class="headerlink" href="#diagnostic-summary" title="Permanent link">&para;</a></h2>
+<p>The table below maps common failure symptoms to root causes and remedies.</p>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Most likely cause</th>
+<th>Remedy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss stays near 0.5 from the start</td>
+<td>Temperature too low for uniform scores</td>
+<td>Use <code>LossWarmupWrapper</code>; start with high temperature</td>
+</tr>
+<tr>
+<td>Loss oscillates wildly</td>
+<td>Temperature too low for current score scale</td>
+<td>Increase temperature; check score range</td>
+</tr>
+<tr>
+<td>Rare class never improves</td>
+<td>Pool contains zero positives for that class</td>
+<td>Increase queue size; check per-class positive rate</td>
+</tr>
+<tr>
+<td>AP loss worse than CE</td>
+<td>Cold start: scores too uniform when AP phase begins</td>
+<td>Lengthen warmup; use <code>LossWarmupWrapper</code></td>
+</tr>
+<tr>
+<td>RecallAtQuantile stalls</td>
+<td>All positives already above threshold</td>
+<td>Normal convergence; also verify quantile setting</td>
+</tr>
+<tr>
+<td>RecallAtQuantile unstable threshold</td>
+<td>Pool too sparse near quantile</td>
+<td>Increase queue size; check <code>(M * q) ≥ 10</code></td>
+</tr>
+<tr>
+<td>Focal loss noisy despite tuning</td>
+<td>High label noise in positive class</td>
+<td>Reduce γ; inspect label quality</td>
+</tr>
+<tr>
+<td>DDP: loss diverges across workers</td>
+<td>Missing all-gather</td>
+<td>Set <code>gather_distributed=True</code> or use auto-detect</td>
+</tr>
+<tr>
+<td>Training spike after phase switch</td>
+<td>Queue poisoning from warmup logits</td>
+<td>Verify <code>LossWarmupWrapper</code> handles the switch; check queue reset</td>
+</tr>
+<tr>
+<td>Loss near zero but metrics poor</td>
+<td>Score scale mismatch with temperature</td>
+<td>Normalize logits or scale τ to match score range</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.path", "toc.follow", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
