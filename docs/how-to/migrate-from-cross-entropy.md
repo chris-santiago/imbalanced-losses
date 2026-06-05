@@ -78,7 +78,7 @@ loss_fn = SoftmaxFocalLoss(alpha=alpha, gamma=2.0)
 
 ---
 
-## BCE / CE → SmoothAPLoss or RecallAtQuantileLoss
+## BCE / CE → SmoothAPLoss, RecallAtQuantileLoss, or PAUCAtBudgetLoss
 
 Ranking losses require a warm start because their gradients are nearly zero when the model is
 random. **Do not** switch cold — wrap with `LossWarmupWrapper` to run BCE or CE for the first
@@ -210,6 +210,7 @@ Use this to decide how far to migrate:
 | Moderate imbalance, retinaNet-style detection | `SoftmaxFocalLoss(alpha=..., gamma=2.0)` |
 | High imbalance (> 50:1), optimize macro-AP | `SmoothAPLoss` with warmup |
 | High imbalance, optimize top-k recall | `RecallAtQuantileLoss` with warmup |
+| Fixed false-alarm budget / operating-point band | `PAUCAtBudgetLoss` with warmup |
 | Per-class monitoring needed | Any ranking loss with `return_per_class=True` |
 
 See [Assumptions and Failure Modes](../explanation/assumptions-and-failure-modes.md) for when

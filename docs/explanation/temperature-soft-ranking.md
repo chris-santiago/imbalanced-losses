@@ -51,6 +51,29 @@ soft_recall = mean_{i∈P} σ((s_i - θ) / τ)
 High τ: gradients flow from positives that are far below the threshold (soft push).
 Low τ: gradients flow mainly from positives right at the boundary (hard push, can be unstable when positives jump across θ).
 
+## Temperature in PAUCAtBudgetLoss
+
+`PAUCAtBudgetLoss` uses a **scale-aware** temperature rather than a fixed raw-logit value. The effective temperature is:
+
+```
+tau_eff = temperature * scale
+```
+
+where `scale` is a detached (stop-gradient) robust dispersion of the iid negatives — the IQR of their scores by default (`tau_scale="iqr"`), or the band width `t_alpha - t_beta` (`tau_scale="band"`). Because `scale` is in the same units as the model's logits, `tau_eff` adapts automatically as the score distribution expands or contracts during training.
+
+The `temperature` parameter in `PAUCAtBudgetLoss` is therefore **dimensionless** (default `0.1`), unlike the raw-logit `temperature=0.01` of `SmoothAPLoss` and `RecallAtQuantileLoss`. A temperature of `0.1` means the sigmoid kernel is tuned to a transition region of `0.1 × IQR` in score space — if the IQR is 2.0, the effective tau is 0.2. As training progresses and the IQR widens to 5.0, tau_eff automatically becomes 0.5, maintaining the same relative sharpness in FPR units.
+
+This design prevents a common failure mode in long training runs: a fixed small temperature that worked at initialization becomes too sharp as score scale inflates, saturating the soft kernels and producing nearly zero gradients.
+
+**Choosing `tau_scale`:**
+
+| Setting | Effect | Pair with |
+|---|---|---|
+| `"iqr"` (default) | Stable bulk statistic; ignores the band specifically | Small `temperature` (0.05–0.2) |
+| `"band"` | Sized to the operating region `t_alpha − t_beta` | `temperature` near 1.0 |
+
+Use `"iqr"` for most cases. Switch to `"band"` when the band is very wide and you want the kernel tuned to the band's own scale rather than the full score distribution.
+
 ## Practical temperature ranges
 
 | Setting | Recommended τ |

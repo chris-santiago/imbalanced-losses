@@ -132,9 +132,66 @@ loss_fn = RecallAtQuantileLoss(
 
 ---
 
+## PAUCAtBudgetLoss
+
+### Optimize pAUC around a 50 bps operating point
+
+```python
+from imbalanced_losses import PAUCAtBudgetLoss
+
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+logits  = torch.randn(256, 4)
+targets = torch.randint(0, 4, (256,))
+loss = loss_fn(logits, targets)
+loss.backward()
+```
+
+**Confirm:** `loss` is a scalar in `[0, 1]`.
+
+### Binary classification
+
+Set `num_classes=1` and pass targets in `{0, 1}`:
+
+```python
+loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0025, beta=0.0075, queue_size=1024)
+logits  = torch.randn(256, 1)
+targets = torch.randint(0, 2, (256,))
+loss = loss_fn(logits, targets)
+loss.backward()
+```
+
+### Choose a surrogate
+
+The default `"trapezoid"` surrogate integrates soft-TPR over `n_knots` FPR knots within the band. Gradient flows through positives only. Use `"pairwise"` when the band is wide or the FPR boundaries are volatile — it compares positives against the negatives that land inside the band, so band negatives also carry gradient:
+
+```python
+# Narrow band (default): trapezoid with 2 knots is accurate
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, surrogate="trapezoid", n_knots=2)
+
+# Wide or volatile band: pairwise is more robust
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.001, beta=0.05, surrogate="pairwise")
+```
+
+### Check band health with diagnostics
+
+Pass `return_diagnostics=True` to get per-class statistics alongside the loss. Use `band_neg_count` to confirm the band is populated, and `grad_pos_count` to confirm positives are contributing gradients:
+
+```python
+loss, stats = loss_fn(logits, targets, return_diagnostics=True)
+# stats keys: t_alpha, t_beta, tau_eff, band_neg_count, pauc_var, grad_pos_count (all [C] tensors)
+print(stats["band_neg_count"])  # iid negatives landing in the FPR band
+print(stats["grad_pos_count"])  # live positives carrying gradient (rank-local)
+```
+
+If `band_neg_count` is near zero, the band is too narrow for the current pool size — increase `queue_size` or widen the band. If `grad_pos_count` is near 1, gradient signal is weak — increase the effective batch (DDP all-gather or larger `queue_size`).
+
+The pooled iid-negative count should substantially exceed `1/alpha`. At `alpha=0.0025` that means well above 400 pooled iid negatives; `queue_size=1024` with a batch of 256 gives 1280, which is comfortable.
+
+---
+
 ## Queue behavior during validation
 
-By default, both `SmoothAPLoss` and `RecallAtQuantileLoss` freeze the queue when the model is in eval mode (`model.eval()`). This prevents validation-phase logits from contaminating training-phase queue contents:
+By default, `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` all freeze the queue when the model is in eval mode (`model.eval()`). This prevents validation-phase logits from contaminating training-phase queue contents:
 
 | Mode | `update_queue_in_eval` | Queue behavior |
 |------|----------------------|----------------|

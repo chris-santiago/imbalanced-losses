@@ -25,6 +25,8 @@ Average Precision (AP) and Recall at a threshold are ranking metrics: they depen
 
 `RecallAtQuantileLoss` targets a different operating point: it asks "what fraction of positives score in the top q% of all scores?" This is natural for alert/detection settings where only a fixed number of alerts can be reviewed.
 
+`PAUCAtBudgetLoss` sits between these two: it optimizes a normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point (e.g. FPR ≈ 0.005). Where `SmoothAPLoss` integrates across the full curve and `RecallAtQuantileLoss` pins a single threshold, `PAUCAtBudgetLoss` optimizes a *band* of the ROC. This is the right choice when the business constraint is a fixed false-alarm budget and you want the model to be robust across a small neighborhood of that operating point, not just at one exact score cutoff.
+
 ## When to use each loss
 
 | Situation | Recommended loss |
@@ -34,6 +36,7 @@ Average Precision (AP) and Recall at a threshold are ranking metrics: they depen
 | Multiclass with rare classes | `SoftmaxFocalLoss` with `alpha` |
 | Detection with many background anchors | `SoftmaxFocalLoss` with `mean_positive` |
 | Optimizing AUCPR directly | `SmoothAPLoss` |
+| Fixed false-alarm budget / band around an operating point | `PAUCAtBudgetLoss` |
 | Fixed operating point (top N% flagged) | `RecallAtQuantileLoss` |
 | Early unstable gradients from ranking loss | `LossWarmupWrapper` with warmup on CE/BCE |
 
@@ -45,6 +48,6 @@ Each loss makes assumptions about the data, the model, and the training regime. 
 
 **Focal loss** is fast (O(N)), requires no queue, and is a drop-in replacement. It does not directly optimize AP.
 
-**Ranking losses** directly optimize the metric of interest but require a minimum pool size to produce stable rank estimates. At very low positive rates (< 1%), without a memory queue the loss degenerates because a single batch may contain zero positives. The queue solves this; the core computation is O(|P| × M) where |P| is the positive count and M is the pool size.
+**Ranking losses** directly optimize the metric of interest but require a minimum pool size to produce stable rank estimates. At very low positive rates (< 1%), without a memory queue the loss degenerates because a single batch may contain zero positives. The queue solves this; the core computation is O(|P| × M) where |P| is the positive count and M is the pool size. `PAUCAtBudgetLoss` additionally requires the pooled iid-negative count to substantially exceed `1/alpha` for the band-edge quantiles to be unbiased — the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` guideline.
 
 **LossWarmupWrapper** adds complexity but addresses the cold-start problem: ranking loss gradients are uninformative when model scores are near-uniform. BCE warmup first trains the model into a reasonable score space before switching.

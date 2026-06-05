@@ -1,6 +1,6 @@
 # imbalanced-losses
 
-**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification — including Focal Loss, Smooth-AP, and Recall-at-Quantile — with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification — including Focal Loss, Smooth-AP, Recall-at-Quantile, and Partial-AUC at Budget — with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
 
 **What's in it:**
 
@@ -8,6 +8,7 @@
 - **`SoftmaxFocalLoss`** — Multiclass focal loss with softmax. Supports `mean_positive` reduction (RetinaNet convention: normalize by positive count), per-class `alpha` weighting, label smoothing, and arbitrary spatial/sequence input shapes.
 - **`SmoothAPLoss`** — Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(|P|×M) where |P| is the positive count and M = batch + queue size. Supports multi-class, binary, and seq2seq settings.
 - **`RecallAtQuantileLoss`** — Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
+- **`PAUCAtBudgetLoss`** — Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point (e.g. FPR ≈ 0.005). Useful when the business constraint is a fixed false-alarm budget (fraud, screening, alerting).
 - **`LossWarmupWrapper`** — Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
 
 **Design points:**
@@ -89,6 +90,30 @@ loss = 1 − soft_recall
 
 Gradient flows only through positive scores, pushing them above the cutoff. Useful for alert/detection settings (e.g. `quantile=0.005` = top 50 bps).
 
+### `PAUCAtBudgetLoss` — Partial AUC at Budget
+
+Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point, rather than the full curve or a single threshold. The band edges are estimated as score quantiles of the iid negatives (stop-gradient), so `beta` tracks population FPR even as score scale changes. Loss = `1 - pAUC`.
+
+```
+t_alpha = quantile(iid_neg_scores, 1 - alpha)   [detached — no grad]
+t_beta  = quantile(iid_neg_scores, 1 - beta)    [detached — no grad]  (t_beta <= t_alpha)
+pAUC    = normalized AUC of soft-TPR over the band [alpha, beta]
+loss    = 1 − pAUC
+```
+
+`PAUCAtBudgetLoss` sits between `SmoothAPLoss` (whole PR/ROC curve) and `RecallAtQuantileLoss` (single threshold): it optimizes a *band* of the ROC. Reach for it when the business constraint is a fixed false-alarm budget.
+
+```python
+from imbalanced_losses import PAUCAtBudgetLoss
+
+# Optimize pAUC around a 50 bps operating point
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+logits  = torch.randn(256, 4)
+targets = torch.randint(0, 4, (256,))
+loss = loss_fn(logits, targets)
+loss.backward()
+```
+
 ## Features
 
 **All losses** support DDP all-gather via `gather_distributed` (auto-detected by default).
@@ -101,7 +126,7 @@ Gradient flows only through positive scores, pushing them above the cutoff. Usef
 - `alpha` — scalar (sigmoid) or per-class tensor (softmax) class reweighting
 - `label_smoothing` (softmax only) — forwarded directly to `F.cross_entropy`
 
-**Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`):
+**Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`, `PAUCAtBudgetLoss`):
 - **Memory queue** — circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
 - **Multi-class** — one-vs-rest per class using `logits[:, c]`
 - **Binary** — set `num_classes=1` with targets in `{0, 1}`
@@ -142,6 +167,7 @@ uv sync --extra demo
 ```python
 from imbalanced_losses import SmoothAPLoss
 from imbalanced_losses import RecallAtQuantileLoss
+from imbalanced_losses import PAUCAtBudgetLoss
 
 # Multi-class AP loss
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, temperature=0.01)
@@ -152,6 +178,13 @@ loss.backward()
 
 # Recall at top-0.5%
 loss_fn = RecallAtQuantileLoss(num_classes=4, quantile=0.005, queue_size=1024)
+loss = loss_fn(logits, targets)
+loss.backward()
+
+# Partial AUC around a 50 bps operating point
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+logits  = torch.randn(256, 4)
+targets = torch.randint(0, 4, (256,))
 loss = loss_fn(logits, targets)
 loss.backward()
 
@@ -203,10 +236,15 @@ loss_fn.reset_queue()
 | `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss only)* `torch.quantile` interpolation method |
+| `alpha` | `0.0025` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1` |
+| `beta` | `0.0075` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; brackets the operating point |
+| `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives — for wide/volatile bands |
+| `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
+| `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
 
-**Temperature guidance:** `0.005–0.05` is the practical range. Lower values approximate the true discontinuous rank more closely but produce harder gradients.
+**Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 
-**Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate.
+**Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate. For `PAUCAtBudgetLoss`, the pooled iid-negative count should substantially exceed `1/alpha` for the tail quantile to be unbiased; check the `band_neg_count` diagnostic.
 
 ## `LossWarmupWrapper` — BCE/CE warmup + loss blending + geometric temperature decay
 
@@ -305,7 +343,7 @@ All losses support DDP via built-in all-gather, but globally-correct computation
 
 ### Why this matters
 
-In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `SmoothAPLoss` and the quantile threshold in `RecallAtQuantileLoss` become noisy or biased when computed on a shard. For `SoftmaxFocalLoss` with `mean_positive` reduction, the positive count in the denominator is similarly unreliable when positives are rare and unevenly distributed across ranks. Gathering logits and targets across all workers before passing them to the loss fixes this for all three cases.
+In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `SmoothAPLoss`, the quantile threshold in `RecallAtQuantileLoss`, and the band-edge quantiles in `PAUCAtBudgetLoss` all become noisy or biased when computed on a shard. For `SoftmaxFocalLoss` with `mean_positive` reduction, the positive count in the denominator is similarly unreliable when positives are rare and unevenly distributed across ranks. Gathering logits and targets across all workers before passing them to the loss fixes this for all cases. `PAUCAtBudgetLoss` additionally all-gathers the `iid_mask` so that the global iid-negative pool anchors the band-edge thresholds.
 
 ### Helpers
 

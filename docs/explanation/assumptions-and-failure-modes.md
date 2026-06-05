@@ -153,6 +153,41 @@ The gradient magnitude of the per-positive sigmoid $\sigma((s_i - \theta) / \tau
 
 ---
 
+## PAUCAtBudgetLoss
+
+This loss optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` anchored to the iid-negative score distribution. Like `RecallAtQuantileLoss`, it uses stop-gradient thresholds; unlike it, the thresholds define a *band* in FPR space rather than a single percentile.
+
+### When it works
+
+- Your evaluation metric is partial AUC over a specific FPR range (e.g. pAUC in [0, 0.01] for screening).
+- The band `[alpha, beta]` is narrow enough to track a meaningful operating point but wide enough to contain a stable estimate.
+- The pooled iid-negative count substantially exceeds `1/alpha`. At `alpha=0.0025` (50 bps center), you need well above 400 pooled iid negatives. `queue_size=1024` with a batch of 256 comfortably satisfies this.
+- The model's score distribution is reasonably spread — a degenerate constant-output model produces near-zero iid-negative IQR, which causes the loss to skip the affected class.
+
+### When it breaks down
+
+**Pool too small for the target FPR (tail-quantile bias)**
+
+The band edges `t_alpha` and `t_beta` are quantiles of the iid-negative pool. When the pool is small relative to `1/alpha`, the top-`alpha` tail is estimated from very few samples and is biased toward the maximum negative score. This is the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` rule — here you need pooled iid negatives >> `1/alpha`. Check `stats["band_neg_count"]` from `return_diagnostics=True`; if it is near zero, the band is starved.
+
+**Degenerate iid-negative score dispersion**
+
+If a class's iid-negative scores are nearly constant (IQR ≈ 0), the scale-aware temperature `tau_eff = temperature * scale` collapses to near zero, which saturates the soft kernels. The loss detects this, marks that class invalid, and emits a one-time warning. Classes skipped this way contribute `nan` under `reduction="none"` and are excluded from `"mean"` aggregation.
+
+**iid assumption violated without `iid_mask`**
+
+The band edges are estimated from scores labeled as iid negatives. By default (`iid_mask=None`) every negative is treated as iid. If the caller densifies negatives by class (e.g. hard-negative mining), the injected negatives shift the empirical FPR distribution and `beta` no longer corresponds to population FPR. Pass `iid_mask` to identify the genuinely iid subset in that case.
+
+**Gradient starvation from a narrow band with few positives**
+
+If `grad_pos_count` (from diagnostics) sits near 1, very few positives carry gradient per forward pass. The loss value is correct but its variance is high. Remedies: increase effective batch size via DDP all-gather, widen the band slightly, or increase `queue_size`.
+
+**Temperature mismatch**
+
+`PAUCAtBudgetLoss` uses a dimensionless `temperature` (default `0.1`) multiplied by a robust scale of the iid negatives (`tau_eff = temperature * scale`). This is intentionally different from the raw-logit `temperature=0.01` of the other ranking losses. Do not reuse a temperature value tuned for `SmoothAPLoss` or `RecallAtQuantileLoss` directly — the units differ.
+
+---
+
 ## LossWarmupWrapper
 
 This utility is not a loss itself but manages the transition from a warmup loss to the main ranking loss. Its failure modes are training dynamics failures, not mathematical ones.
@@ -199,6 +234,9 @@ The table below maps common failure symptoms to root causes and remedies.
 | AP loss worse than CE | Cold start: scores too uniform when AP phase begins | Lengthen warmup; use `LossWarmupWrapper` |
 | RecallAtQuantile stalls | All positives already above threshold | Normal convergence; also verify quantile setting |
 | RecallAtQuantile unstable threshold | Pool too sparse near quantile | Increase queue size; check `(M * q) ≥ 10` |
+| PAUCAtBudget band empty (`band_neg_count` ≈ 0) | Pool too small relative to `1/alpha` | Increase `queue_size`; check pooled iid negatives >> `1/alpha` |
+| PAUCAtBudget class skipped (degenerate dispersion) | iid-negative scores nearly constant | Model may be outputting uniform scores; check score range and warmup |
+| PAUCAtBudget gradient weak (`grad_pos_count` ≈ 1) | Few positives in effective pool | Increase batch size, use DDP all-gather, or widen the band |
 | Focal loss noisy despite tuning | High label noise in positive class | Reduce γ; inspect label quality |
 | DDP: loss diverges across workers | Missing all-gather | Set `gather_distributed=True` or use auto-detect |
 | Training spike after phase switch | Queue poisoning from warmup logits | Verify `LossWarmupWrapper` handles the switch; check queue reset |

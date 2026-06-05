@@ -85,6 +85,7 @@ nav:
     - SoftmaxFocalLoss: reference/softmax-focal-loss.md
     - SmoothAPLoss: reference/smooth-ap-loss.md
     - RecallAtQuantileLoss: reference/recall-at-quantile-loss.md
+    - PAUCAtBudgetLoss: reference/pauc-at-budget-loss.md
     - LossWarmupWrapper: reference/loss-warmup-wrapper.md
     - Distributed Utilities: reference/distributed.md
   - Explanation:

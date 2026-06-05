@@ -10,6 +10,8 @@ Ranking losses do not decompose. `SmoothAPLoss` estimates the rank of each posit
 
 `RecallAtQuantileLoss` has the same issue: the quantile threshold is estimated from the local score distribution, which is a biased sample of the global distribution when positives and negatives are unevenly distributed.
 
+`PAUCAtBudgetLoss` has the same shard-bias issue: the band-edge quantiles `t_alpha` and `t_beta` are computed from the local iid-negative scores, which are a biased sample of the global iid-negative pool on a single shard. It also all-gathers the `iid_mask` alongside logits and targets so that the global iid-negative pool anchors the thresholds rather than a shard-local estimate.
+
 `SoftmaxFocalLoss` with `mean_positive` reduction is also affected: if positives happen to land on one GPU, the local positive count is much larger than the global average, inflating the loss normalization.
 
 ## The all-gather solution

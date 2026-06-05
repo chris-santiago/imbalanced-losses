@@ -10,6 +10,7 @@ Full documentation for every public class and function in `imbalanced_losses`.
 | [`SoftmaxFocalLoss`](softmax-focal-loss.md) | `imbalanced_losses` | Multiclass focal loss with softmax |
 | [`SmoothAPLoss`](smooth-ap-loss.md) | `imbalanced_losses` | Differentiable Average Precision loss |
 | [`RecallAtQuantileLoss`](recall-at-quantile-loss.md) | `imbalanced_losses` | Differentiable Recall-at-Quantile loss |
+| [`PAUCAtBudgetLoss`](pauc-at-budget-loss.md) | `imbalanced_losses` | Differentiable partial-AUC over an FPR band |
 
 ## Utilities
 

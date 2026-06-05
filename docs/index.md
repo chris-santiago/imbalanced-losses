@@ -1,6 +1,6 @@
 # imbalanced-losses
 
-**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification. It provides Focal Loss, Smooth Average Precision (Smooth-AP), and Recall-at-Quantile, all with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification. It provides Focal Loss, Smooth Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget, all with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
 
 ## When to use it
 
@@ -35,6 +35,7 @@ uv sync
 | `SoftmaxFocalLoss` | Mutually-exclusive multiclass (softmax couples all class logits); drop-in for `CrossEntropyLoss` |
 | `SmoothAPLoss` | Directly optimizes Average Precision |
 | `RecallAtQuantileLoss` | Optimizes recall above a fixed score threshold |
+| `PAUCAtBudgetLoss` | Optimizes partial AUC over an FPR band around a target operating point |
 | `LossWarmupWrapper` | Warmup on CE/BCE, then blend/anneal into a ranking loss |
 
 ## Which loss should I use?
@@ -46,6 +47,7 @@ uv sync
 | Mutually-exclusive multiclass, mild-to-moderate imbalance | `SoftmaxFocalLoss` |
 | Multiclass with tail classes below ~1–2% of data | `SmoothAPLoss` |
 | Need a hard recall guarantee at a fixed score threshold | `RecallAtQuantileLoss` |
+| Optimize recall at a fixed false-alarm budget / operating point (e.g. fraud at 50 bps) | `PAUCAtBudgetLoss` |
 
 For a deeper breakdown, see [Why Imbalanced Losses?](explanation/why-imbalanced-losses.md).
 Before deploying, read [Assumptions and Failure Modes](explanation/assumptions-and-failure-modes.md).
