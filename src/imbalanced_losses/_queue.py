@@ -49,6 +49,27 @@ class _MemoryQueue(nn.Module):
             self.register_buffer("_q_logits",  torch.zeros(queue_size, num_classes))
             self.register_buffer("_q_targets", torch.full((queue_size,), ignore_index, dtype=torch.long))
             self.register_buffer("_q_ptr",     torch.zeros(1, dtype=torch.long))
+            # Unfilled slots default to True (treated as iid) so legacy
+            # checkpoints/rows with no recorded flag are treated as iid.
+            self.register_buffer("_q_iid",     torch.ones(queue_size, dtype=torch.bool))
+
+    # ------------------------------------------------------------------
+    # Checkpoint compatibility
+    # ------------------------------------------------------------------
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # When loading a checkpoint saved before _q_iid was introduced, inject
+        # an all-True default so the missing key never triggers a strict-mode
+        # error and the buffer is initialized to the correct semantic default.
+        if self.queue_size > 0:
+            iid_key = prefix + "_q_iid"
+            if iid_key not in state_dict:
+                state_dict[iid_key] = torch.ones(self.queue_size, dtype=torch.bool)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -64,7 +85,12 @@ class _MemoryQueue(nn.Module):
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def enqueue(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
+    def enqueue(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        is_iid: torch.Tensor | None = None,
+    ) -> None:
         """
         Write a detached batch into the circular buffer.
 
@@ -74,6 +100,11 @@ class _MemoryQueue(nn.Module):
             Live-batch logits to store (detached internally).
         targets : torch.Tensor, shape [N]
             Corresponding integer targets.
+        is_iid : torch.Tensor, shape [N], dtype=bool, optional
+            Per-row flag indicating whether the row is an iid sample
+            eligible for FPR threshold estimation.  When ``None``, the
+            whole batch is treated as iid (all True).  Stored detached,
+            consistent with logits/targets handling.
 
         Notes
         -----
@@ -86,9 +117,16 @@ class _MemoryQueue(nn.Module):
 
         n = logits.size(0)
 
+        # Materialise is_iid once; default to all-True when not provided.
+        if is_iid is None:
+            iid = logits.new_ones(n, dtype=torch.bool)
+        else:
+            iid = is_iid.detach()
+
         if n >= self.queue_size:
             self._q_logits.copy_(logits.detach()[-self.queue_size:])
             self._q_targets.copy_(targets.detach()[-self.queue_size:])
+            self._q_iid.copy_(iid[-self.queue_size:])
             self._q_ptr.zero_()
             return
 
@@ -98,13 +136,16 @@ class _MemoryQueue(nn.Module):
         if end <= self.queue_size:
             self._q_logits[ptr:end]  = logits.detach()
             self._q_targets[ptr:end] = targets.detach()
+            self._q_iid[ptr:end]     = iid
         else:
             first  = self.queue_size - ptr
             second = n - first
             self._q_logits[ptr:]     = logits.detach()[:first]
             self._q_targets[ptr:]    = targets.detach()[:first]
+            self._q_iid[ptr:]        = iid[:first]
             self._q_logits[:second]  = logits.detach()[first:]
             self._q_targets[:second] = targets.detach()[first:]
+            self._q_iid[:second]     = iid[first:]
 
         self._q_ptr.fill_((ptr + n) % self.queue_size)
 
@@ -112,7 +153,9 @@ class _MemoryQueue(nn.Module):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        is_iid: torch.Tensor | None = None,
+        return_iid: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Concatenate the live batch with the current queue contents.
 
@@ -120,6 +163,18 @@ class _MemoryQueue(nn.Module):
         ----------
         logits : torch.Tensor, shape [N, C]
         targets : torch.Tensor, shape [N]
+        is_iid : torch.Tensor, shape [N], dtype=bool, optional
+            Per-row iid flag for the live batch.  When ``None``, the live
+            batch is treated as all-iid.  Only consulted when
+            ``return_iid=True``.
+        return_iid : bool, optional
+            When ``False`` (default), return the 2-tuple
+            ``(all_logits, all_targets)`` exactly as before this extension
+            (backward compatible).  When ``True``, return the 3-tuple
+            ``(all_logits, all_targets, all_is_iid)`` where ``all_is_iid``
+            has the live-batch flags (or all-True if ``is_iid=None``)
+            prepended to the stored ``_q_iid``, aligned row-for-row with
+            the returned logits/targets.
 
         Returns
         -------
@@ -128,16 +183,42 @@ class _MemoryQueue(nn.Module):
             device/dtype). Q = queue_size; unfilled slots have
             ignore_index targets and are filtered downstream.
         all_targets : torch.Tensor, shape [N + Q]
+        all_is_iid : torch.Tensor, shape [N + Q], dtype=bool
+            Only present when ``return_iid=True``.
 
         Notes
         -----
         When ``queue_size == 0`` the inputs are returned unchanged (no copy).
+        For ``return_iid=True`` with ``queue_size == 0``, the synthesized
+        live iid tensor (or the supplied ``is_iid``) is returned as the
+        third element.
         """
         if self.queue_size == 0:
-            return logits, targets
+            if not return_iid:
+                return logits, targets
+            live_iid = (
+                torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
+                if is_iid is None
+                else is_iid
+            )
+            return logits, targets, live_iid
+
         q_logits  = self._q_logits.to(device=logits.device, dtype=logits.dtype)
         q_targets = self._q_targets.to(device=targets.device)
-        return torch.cat([logits, q_logits], dim=0), torch.cat([targets, q_targets], dim=0)
+        all_logits  = torch.cat([logits, q_logits], dim=0)
+        all_targets = torch.cat([targets, q_targets], dim=0)
+
+        if not return_iid:
+            return all_logits, all_targets
+
+        live_iid = (
+            torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
+            if is_iid is None
+            else is_iid
+        )
+        q_iid = self._q_iid.to(device=logits.device)
+        all_is_iid = torch.cat([live_iid, q_iid], dim=0)
+        return all_logits, all_targets, all_is_iid
 
     @torch.no_grad()
     def reset(self) -> None:
@@ -145,10 +226,11 @@ class _MemoryQueue(nn.Module):
         Clear the circular buffer.
 
         Resets all stored logits to zero, all stored targets to
-        ignore_index, and the write pointer to 0. Typically called
-        between training and evaluation epochs.
+        ignore_index, all stored iid flags to True, and the write pointer
+        to 0.  Typically called between training and evaluation epochs.
         """
         if self.queue_size > 0:
             self._q_logits.zero_()
             self._q_targets.fill_(self.ignore_index)
+            self._q_iid.fill_(True)
             self._q_ptr.zero_()
