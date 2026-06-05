@@ -51,7 +51,7 @@ trapezoid (or band-restricted pairwise) surrogate.
 from __future__ import annotations
 
 import warnings
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 
@@ -326,7 +326,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_pos: torch.Tensor,
         is_neg: torch.Tensor,
         is_iid: torch.Tensor,
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, bool, dict[str, Any]]:
         """
         Compute normalized partial AUC over ``[alpha, beta]`` for one class.
 
@@ -351,6 +351,14 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         valid : bool
             False if there are no positives, no iid negatives, or (pairwise)
             no band negatives. Invalid classes are excluded from reduction.
+        diag : dict
+            Diagnostic scalars for this class (all detached) when
+            ``self._want_diag`` is True. Keys: ``t_alpha``, ``t_beta``,
+            ``tau_eff``, ``band_neg_count``, ``pauc_var``. Returns an empty
+            dict ``{}`` for invalid/degenerate classes or when
+            ``self._want_diag`` is False; the caller (``_compute_per_class``)
+            tolerates empty dicts via ``if diag:`` and leaves ``self._last_diag``
+            at its nan/0 sentinel default for those classes.
 
         Notes
         -----
@@ -363,7 +371,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         n_pos = int(is_pos.sum())
         n_iid_neg = int(iid_neg.sum())
         if n_pos == 0 or n_iid_neg == 0:
-            return scores.new_zeros(()), False
+            return scores.new_zeros(()), False, {}
 
         neg = scores[iid_neg].detach()
         t_alpha, t_beta, tau_eff = self._band_thresholds_and_scale(neg)
@@ -379,26 +387,229 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 neg, 1.0 - f_k, interpolation=self.quantile_interpolation
             )  # [n_knots], detached
             p = scores[is_pos]  # gradient flows here
-            # [n_pos, n_knots] -> mean over positives -> [n_knots]
-            tpr = torch.sigmoid(
+            # [n_pos, n_knots]; each row is the contribution vector for one positive.
+            contrib_mat = torch.sigmoid(
                 (p.unsqueeze(1) - t_k.unsqueeze(0)) / tau_eff
-            ).mean(dim=0)
+            )
+            # [n_knots] -- mean over positives.
+            tpr = contrib_mat.mean(dim=0)
             # Composite trapezoid on a uniform grid, normalized to [alpha, beta].
             pauc = (
                 0.5 * tpr[0] + tpr[1:-1].sum() + 0.5 * tpr[-1]
             ) / (self.n_knots - 1)
-            return pauc, True
+            if not self._want_diag:
+                return pauc, True, {}
+            # Per-positive pAUC contribution: apply the same trapezoid weights
+            # per row so that mean(v_i) == pauc.
+            with torch.no_grad():
+                weights = contrib_mat.new_ones(self.n_knots)
+                weights[0] = 0.5
+                weights[-1] = 0.5
+                # [n_pos]
+                v = (contrib_mat.detach() * weights.unsqueeze(0)).sum(dim=1) / (self.n_knots - 1)
+                pauc_var = v.var(unbiased=False)
+            # band_neg_count: iid negatives in the band [t_beta, t_alpha].
+            band_neg_count = int(((neg >= t_beta) & (neg <= t_alpha)).sum())
+            diag = {
+                "t_alpha": t_alpha.detach(),
+                "t_beta": t_beta.detach(),
+                "tau_eff": tau_eff.detach(),
+                "band_neg_count": band_neg_count,
+                "pauc_var": pauc_var.detach(),
+            }
+            return pauc, True, diag
 
         # surrogate == "pairwise": band negatives from the GRADIENT POOL.
         band = is_neg & (scores >= t_beta) & (scores <= t_alpha)
         if int(band.sum()) == 0:
-            return scores.new_zeros(()), False
+            return scores.new_zeros(()), False, {}
         p = scores[is_pos]
         b = scores[band]  # band negatives carry gradient (intended)
-        pauc = torch.sigmoid(
+        # [n_pos, n_band]; each row is the per-positive contribution vector.
+        contrib_mat = torch.sigmoid(
             (p.unsqueeze(1) - b.unsqueeze(0)) / tau_eff
-        ).mean()
-        return pauc, True
+        )
+        pauc = contrib_mat.mean()
+        if not self._want_diag:
+            return pauc, True, {}
+        # Per-positive contribution: mean over band negatives for each positive.
+        with torch.no_grad():
+            v = contrib_mat.detach().mean(dim=1)  # [n_pos]
+            pauc_var = v.var(unbiased=False)
+        # band_neg_count counts IID negatives in the band (consistent with
+        # trapezoid), since the diagnostic semantics are population-level FPR.
+        band_neg_count = int(((neg >= t_beta) & (neg <= t_alpha)).sum())
+        diag = {
+            "t_alpha": t_alpha.detach(),
+            "t_beta": t_beta.detach(),
+            "tau_eff": tau_eff.detach(),
+            "band_neg_count": band_neg_count,
+            "pauc_var": pauc_var.detach(),
+        }
+        return pauc, True, diag
+
+    # ------------------------------------------------------------------
+    # Diagnostics-aware forward override
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        iid_mask: torch.Tensor | None = None,
+        return_per_class: bool = False,
+        return_diagnostics: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, dict]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]
+    ):
+        """
+        Compute the pAUC loss, optionally returning per-class diagnostics.
+
+        Parameters
+        ----------
+        logits : torch.Tensor, shape [N, C]
+            Raw (un-normalised) class scores.
+        targets : torch.Tensor, shape [N]
+            Integer class labels.  Positions equal to ``ignore_index``
+            are excluded.
+        iid_mask : torch.Tensor, shape [N], dtype=bool, optional
+            Per-row iid-eligibility flag.  ``None`` treats all rows as iid.
+        return_per_class : bool, optional
+            If True, also return per-class losses and a validity mask.
+        return_diagnostics : bool, optional
+            If True, also return a ``stats`` dict with per-class diagnostic
+            tensors of shape ``[C]``.  Invalid or degenerate classes yield
+            ``nan`` for float fields and ``0`` for count fields.
+
+            Keys: ``t_alpha``, ``t_beta``, ``tau_eff``, ``band_neg_count``,
+            ``pauc_var``, ``grad_pos_count``.
+
+            ``grad_pos_count`` is rank-local (computed from the live pre-gather
+            batch); under DDP the true gradient-carrying positive population is
+            the sum across all ranks.
+
+            When ``False`` (default), behavior is bit-identical to the
+            base-class forward.
+
+        Returns
+        -------
+        loss : torch.Tensor
+            Scalar or shape ``[C]`` (``reduction='none'``).
+        per_class_loss : torch.Tensor, shape [C]
+            Only when ``return_per_class=True``.
+        valid_classes : torch.Tensor, shape [C], dtype=bool
+            Only when ``return_per_class=True``.
+        stats : dict[str, Tensor[C]]
+            Only when ``return_diagnostics=True``.  Order in the tuple
+            is ``(loss, per_class, valid, stats)`` or ``(loss, stats)``
+            depending on ``return_per_class``.
+
+        Notes
+        -----
+        ``self._last_diag`` is transient per-call internal state; it is
+        reset at the top of every forward call.  Statefulness here is a
+        deliberate tradeoff to avoid changing the shared ``_QueuedRankingLoss``
+        base-class contract (which cannot accept extra return values from
+        ``_compute_per_class``).
+        """
+        # --- squeeze [N,1] targets early so grad_pos_count sees the right shape --
+        if targets.ndim == 2 and targets.size(1) == 1:
+            targets = targets.squeeze(1)
+
+        # --- reset transient diagnostic state before every call ----------------
+        # Always reset so _compute_per_class (called by super().forward) can
+        # safely write to self._last_diag regardless of return_diagnostics.
+        # Sentinel structure: float fields default to nan, count fields to 0.
+        # The empty-pool early-return path in the base class skips
+        # _compute_per_class, so _last_diag stays at this nan/0 default,
+        # which is exactly the right diagnostic output for an empty pool.
+        _nan = float("nan")
+        self._last_diag: list[dict] = [
+            {
+                "t_alpha": _nan,
+                "t_beta": _nan,
+                "tau_eff": _nan,
+                "band_neg_count": 0,
+                "pauc_var": _nan,
+            }
+            for _ in range(self.num_classes)
+        ]
+
+        # --- grad_pos_count: live-batch positives per class (after ignore_index) -
+        # Computed here because _compute_per_class sees the merged pool and
+        # cannot distinguish live rows from queue rows.
+        # Gate all diagnostic tensor ops in _compute_pauc behind this flag.
+        # Must be set BEFORE super().forward() calls _compute_per_class.
+        self._want_diag = bool(return_diagnostics)
+
+        if not return_diagnostics:
+            # Fast path: no diagnostics needed — bit-identical to base forward.
+            return super().forward(
+                logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+            )
+
+        valid_mask = targets != self.ignore_index
+        filtered_targets = targets[valid_mask]
+        grad_pos_count = logits.new_zeros(self.num_classes, dtype=torch.long)
+        if self.num_classes == 1:
+            grad_pos_count[0] = int(filtered_targets.bool().sum())
+        else:
+            for c in range(self.num_classes):
+                grad_pos_count[c] = int((filtered_targets == c).sum())
+
+        # --- delegate to base forward (runs _compute_per_class as side effect) --
+        base_out = super().forward(
+            logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+        )
+
+        # --- assemble stats dict from _last_diag --------------------------------
+        dev = logits.device
+        dtype = logits.dtype
+
+        def _scalar_or_nan(val, is_nan_sentinel):
+            """Return a float tensor from val, or nan if is_nan_sentinel."""
+            if is_nan_sentinel:
+                return torch.tensor(float("nan"), device=dev, dtype=dtype)
+            if isinstance(val, torch.Tensor):
+                return val.to(device=dev, dtype=dtype)
+            return torch.tensor(float(val), device=dev, dtype=dtype)
+
+        t_alpha_vals, t_beta_vals, tau_eff_vals = [], [], []
+        band_neg_counts, pauc_var_vals = [], []
+
+        for c in range(self.num_classes):
+            d = self._last_diag[c]
+            is_invalid = isinstance(d.get("t_alpha"), float) and (
+                d["t_alpha"] != d["t_alpha"]  # nan check
+            )
+            t_alpha_vals.append(_scalar_or_nan(d["t_alpha"], is_invalid))
+            t_beta_vals.append(_scalar_or_nan(d["t_beta"], is_invalid))
+            tau_eff_vals.append(_scalar_or_nan(d["tau_eff"], is_invalid))
+            band_neg_counts.append(
+                torch.tensor(0 if is_invalid else d["band_neg_count"],
+                             device=dev, dtype=torch.long)
+            )
+            pauc_var_vals.append(_scalar_or_nan(d["pauc_var"], is_invalid))
+
+        stats: dict[str, torch.Tensor] = {
+            "t_alpha":        torch.stack(t_alpha_vals),
+            "t_beta":         torch.stack(t_beta_vals),
+            "tau_eff":        torch.stack(tau_eff_vals),
+            "band_neg_count": torch.stack(band_neg_counts),
+            "pauc_var":       torch.stack(pauc_var_vals),
+            "grad_pos_count": grad_pos_count.to(device=dev),
+        }
+
+        # --- build return value -------------------------------------------------
+        if return_per_class:
+            # base_out is (loss, per_class, valid)
+            loss, per_class, valid = base_out
+            return loss, per_class, valid, stats
+        else:
+            return base_out, stats
 
     # ------------------------------------------------------------------
     # Per-class dispatch (required by _QueuedRankingLoss)
@@ -443,20 +654,24 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                     stacklevel=4,
                 )
             is_pos = targets.bool()
-            pauc, is_valid = self._compute_pauc(
+            pauc, is_valid, diag = self._compute_pauc(
                 logits[:, 0], is_pos, ~is_pos, is_iid
             )
             loss_vals = [1.0 - pauc]
             valid_mask = [is_valid]
+            if diag:
+                self._last_diag[0] = diag
         else:
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 is_pos = targets == c
-                pauc, is_valid = self._compute_pauc(
+                pauc, is_valid, diag = self._compute_pauc(
                     logits[:, c], is_pos, ~is_pos, is_iid
                 )
                 loss_vals.append(1.0 - pauc)
                 valid_mask.append(is_valid)
+                if diag:
+                    self._last_diag[c] = diag
 
         loss_vec = torch.stack(loss_vals)
         valid_vec = torch.tensor(valid_mask, device=logits.device)
