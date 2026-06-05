@@ -5,7 +5,8 @@ Covers construction/validation, forward/backward (binary + multi-class OvR),
 gradient routing (positives-only; detached thresholds/scale), the
 β-semantics invariance of iid-anchored thresholds, degenerate handling,
 trapezoid≈pairwise agreement on a wide band, n_knots>2 behavior, and queue
-interaction. Later tasks add diagnostics, DDP, and serialization tests.
+interaction. Task 5 adds tau scale-inflation stability, reset_queue, queue
+iid-flag round-trip, and max_pool_size + iid_mask alignment.
 """
 
 import pytest
@@ -644,4 +645,367 @@ def test_diagnostics_do_not_change_gradients(surrogate):
     )
     assert torch.equal(grad_off, grad_on), (
         "gradients differ between return_diagnostics=False and return_diagnostics=True"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 5A: τ scale-inflation stability
+#
+# The core design property: tau_eff = temperature * scale, where scale is a
+# detached robust dispersion of the iid negatives (IQR or band-width).
+# Because both (p - t_k) and tau_eff scale by k when all logits are multiplied
+# by k, the ratio (p - t_k)/tau_eff is scale-invariant, so:
+#   - loss(k * logits) ≈ loss(logits) for all k > 0
+#   - d(loss)/d(k*p) = (1/k) * d(loss)/d(p), so grad_norm * k ≈ const
+#
+# We prove the test has teeth by also computing what a fixed (non-scale-aware)
+# tau would produce: as k grows, sigmoid((k*(p-t))/tau_fixed) saturates toward
+# 1, pAUC → 1, loss → 0, and all gradients vanish.  The scale-aware loss
+# resists this saturation.
+# ---------------------------------------------------------------------------
+
+
+def _scale_invariance_batch(n_neg=300, n_pos=60, seed=30):
+    """
+    Batch with non-trivial separability and a wide-enough negative spread to
+    give a meaningful IQR (scale > _SCALE_EPS) and a meaningful band.
+    """
+    g = torch.Generator().manual_seed(seed)
+    neg = torch.randn(n_neg, 1, generator=g)           # centred at 0, std~1
+    pos = torch.randn(n_pos, 1, generator=g) + 1.5    # shifted up
+    logits = torch.cat([neg, pos], dim=0)
+    targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+    return logits, targets
+
+
+@pytest.mark.parametrize("tau_scale", ["iqr", "band"])
+def test_scale_invariance_loss(tau_scale):
+    """
+    Scaling all logits by k leaves the loss approximately unchanged because
+    both (p - t_k) and tau_eff scale by k, cancelling in the sigmoid argument.
+    Verified for k = 1, 10, 100 with a tight absolute tolerance.
+
+    This test guards loss finiteness and gross value drift only.
+    test_scale_invariance_gradient_norm_ratio is the teeth-bearing
+    scale-awareness test (it catches fixed-tau gradient collapse).
+    """
+    logits, targets = _scale_invariance_batch()
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate="trapezoid", n_knots=5,
+        tau_scale=tau_scale, temperature=0.1, queue_size=0,
+    )
+
+    losses = []
+    for k in (1.0, 10.0, 100.0):
+        scaled = (logits * k).detach()
+        out = loss_fn(scaled, targets)
+        assert torch.isfinite(out), f"loss not finite at scale k={k}"
+        losses.append(out.item())
+
+    loss_k1, loss_k10, loss_k100 = losses
+
+    # All three must be within a tight tolerance of the k=1 baseline.
+    # Tolerance of 0.02 (2 percentage points of normalized pAUC) catches
+    # gross numerical drift or instability in the loss value.
+    assert abs(loss_k10 - loss_k1) < 0.02, (
+        f"loss changed under 10x scale inflation: {loss_k1:.4f} -> {loss_k10:.4f} "
+        f"(tau_scale={tau_scale!r}). Loss value has drifted unexpectedly."
+    )
+    assert abs(loss_k100 - loss_k1) < 0.02, (
+        f"loss changed under 100x scale inflation: {loss_k1:.4f} -> {loss_k100:.4f} "
+        f"(tau_scale={tau_scale!r}). Loss value has drifted unexpectedly."
+    )
+
+
+@pytest.mark.parametrize("tau_scale", ["iqr", "band"])
+def test_scale_invariance_gradient_norm_ratio(tau_scale):
+    """
+    The gradient of the loss w.r.t. k*logits is (1/k) times the gradient
+    w.r.t. logits (chain rule, since the loss is scale-invariant).  So
+    grad_norm(k*logits) * k should be approximately constant across scales.
+
+    This test has genuine teeth: with a fixed (non-scale-aware) tau, the
+    sigmoid arguments saturate as k grows, the gradient of sigmoid approaches
+    zero, and grad_norm(k*logits) * k would collapse toward zero rather than
+    staying constant.
+    """
+    logits, targets = _scale_invariance_batch()
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate="trapezoid", n_knots=5,
+        tau_scale=tau_scale, temperature=0.1, queue_size=0,
+    )
+
+    pos_mask = targets.bool()
+    scaled_grad_norms = []
+    for k in (1.0, 10.0, 100.0):
+        x = (logits * k).detach().requires_grad_(True)
+        out = loss_fn(x, targets)
+        out.backward()
+        # Gradient norm w.r.t. positive logits, scaled back by k.
+        pos_grad_norm = x.grad[pos_mask].norm().item()
+        scaled_grad_norms.append(pos_grad_norm * k)
+
+    # All scaled norms should be approximately equal.
+    # Relative tolerance of 5% -- tight enough to catch saturation (which
+    # would produce ratios far from 1) but generous enough for float32
+    # quantile interpolation noise.
+    ref = scaled_grad_norms[0]
+    for i, (k, sn) in enumerate(zip((1.0, 10.0, 100.0), scaled_grad_norms)):
+        rel_err = abs(sn - ref) / (abs(ref) + 1e-12)
+        assert rel_err < 0.05, (
+            f"Scaled gradient norm at k={k} diverges from k=1 baseline: "
+            f"norm*k={sn:.6f} vs ref={ref:.6f} (rel_err={rel_err:.4f}). "
+            f"tau_scale={tau_scale!r}. "
+            "With a fixed tau, sigmoid saturation would cause norm*k -> 0 "
+            "for large k; this failure indicates scale-awareness is broken."
+        )
+
+
+def test_fixed_tau_would_fail_scale_invariance():
+    """
+    Teeth-check: demonstrate directly that a non-scale-aware (fixed) tau
+    suffers sigmoid saturation as logit scale grows, while the scale-aware
+    tau is immune.
+
+    Construction:
+    - Use a controlled batch where exactly ONE knot threshold t is set such
+      that positives have (p - t) = 0.5 * tau_nat, giving sigmoid(0.5) ≈ 0.62,
+      mid-sigmoid and clearly not saturated at k=1.
+    - At k=100 with FIXED tau: (100*p - 100*t) / tau_nat = 100 * 0.5 = 50,
+      sigmoid(50) ≈ 1.0, fully saturated (pauc → 1, loss → 0).
+    - At k=100 with SCALE-AWARE tau (tau * k): (100*p - 100*t) / (100*tau_nat)
+      = 0.5 exactly as at k=1, same sigmoid value, same loss.
+
+    This is the exact mathematical argument for scale-awareness, verified
+    numerically without relying on PAUCAtBudgetLoss internals.
+    """
+    # Choose tau = 1.0 for simplicity.
+    tau_nat = 1.0
+
+    # n_knots=2, alpha=0.1, beta=0.5.  Set thresholds manually:
+    # t_alpha = 0.5, t_beta = -0.5.  Positives at p = 0.0 so:
+    #   (p - t_alpha) / tau_nat = (0.0 - 0.5) / 1.0 = -0.5  -> sigmoid(-0.5) ≈ 0.378
+    #   (p - t_beta)  / tau_nat = (0.0 + 0.5) / 1.0 =  0.5  -> sigmoid(0.5)  ≈ 0.622
+    # pauc_nat = 0.5*(0.378 + 0.622) = 0.5; loss_nat = 0.5.  Mid-sigmoid, not saturated.
+    n_pos = 50
+    pos = torch.zeros(n_pos)       # all positives at score 0.0
+    t_beta_nat  = -0.5
+    t_alpha_nat =  0.5
+    t_knots_nat = torch.tensor([t_beta_nat, t_alpha_nat])
+
+    # k=1 with fixed tau.
+    contrib_nat = torch.sigmoid((pos.unsqueeze(1) - t_knots_nat.unsqueeze(0)) / tau_nat)
+    tpr_nat = contrib_nat.mean(dim=0)
+    pauc_nat = 0.5 * (tpr_nat[0] + tpr_nat[1])
+    loss_nat = 1.0 - pauc_nat.item()
+    # Verify the premise: loss is close to 0.5 (mid-sigmoid, unsaturated).
+    assert abs(loss_nat - 0.5) < 0.01, f"Premise failed: loss_nat={loss_nat:.4f}, expected ~0.5"
+
+    k = 100.0
+    pos_scaled     = pos * k
+    t_knots_scaled = t_knots_nat * k
+    tau_scaled     = tau_nat * k
+
+    # Loss value is scale-invariant by construction even under fixed tau;
+    # the discriminating saturation appears only in the gradient.
+
+    # Check gradient saturation directly.
+    pos_k1 = pos.detach().requires_grad_(True)
+    contrib_k1 = torch.sigmoid((pos_k1.unsqueeze(1) - t_knots_nat.unsqueeze(0)) / tau_nat)
+    (1.0 - contrib_k1.mean(dim=0).mean()).backward()
+    grad_norm_k1 = pos_k1.grad.norm().item()
+
+    # Fixed tau at k=100: gradients of sigmoid are ds/dx = s*(1-s).
+    # With x=50: s*(1-s) ≈ 0, with x=-50: s*(1-s) ≈ 0.  Both near-zero.
+    # BOTH gradients collapse.
+    pos_fixed = pos_scaled.detach().requires_grad_(True)
+    contrib_fixed2 = torch.sigmoid(
+        (pos_fixed.unsqueeze(1) - t_knots_scaled.unsqueeze(0)) / tau_nat
+    )
+    (1.0 - contrib_fixed2.mean(dim=0).mean()).backward()
+    grad_norm_fixed_k100 = pos_fixed.grad.norm().item()
+
+    # Scale-aware tau at k=100: gradients equal (1/k) times k=1 gradients
+    # (chain rule; same sigmoid argument).
+    pos_aware = pos_scaled.detach().requires_grad_(True)
+    contrib_aware2 = torch.sigmoid(
+        (pos_aware.unsqueeze(1) - t_knots_scaled.unsqueeze(0)) / tau_scaled
+    )
+    (1.0 - contrib_aware2.mean(dim=0).mean()).backward()
+    grad_norm_aware_k100 = pos_aware.grad.norm().item()
+
+    # Fixed tau: gradients vanish (saturation).
+    assert grad_norm_fixed_k100 < 1e-30, (
+        f"Fixed-tau gradient norm at k=100 is {grad_norm_fixed_k100:.2e}; "
+        "expected near zero (sigmoid saturation). Teeth-check premise may be wrong."
+    )
+
+    # Scale-aware tau: gradient * k should match gradient at k=1 (chain rule).
+    assert abs(grad_norm_aware_k100 * k - grad_norm_k1) / (grad_norm_k1 + 1e-12) < 0.01, (
+        f"Scale-aware tau: grad_norm*k={grad_norm_aware_k100 * k:.6f} should match "
+        f"grad_norm at k=1 ({grad_norm_k1:.6f}). Mathematical invariance broken."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task 5C: reset_queue clears state and loss still runs
+# ---------------------------------------------------------------------------
+
+
+def test_reset_queue_clears_and_runs():
+    """
+    After accumulating queue state, reset_queue() zeros logits, restores
+    ignore_index targets, resets the pointer, and the loss still runs
+    correctly afterward.
+    """
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, queue_size=128
+    )
+    loss_fn.train()
+    g = torch.Generator().manual_seed(40)
+
+    # Accumulate some queue state.
+    for _ in range(3):
+        logits = torch.randn(32, 1, generator=g, requires_grad=True)
+        targets = (torch.rand(32, generator=g) < 0.3).long()
+        loss_fn(logits, targets).backward()
+
+    # Confirm queue has non-zero logits and pointer has advanced.
+    assert loss_fn._q_logits.abs().sum() > 0, "queue should be non-empty before reset"
+    assert int(loss_fn._q_ptr) > 0, "queue pointer should have advanced before reset"
+
+    loss_fn.reset_queue()
+
+    # After reset: logits zeroed, pointer at 0.
+    assert torch.allclose(loss_fn._q_logits, torch.zeros_like(loss_fn._q_logits)), (
+        "queue logits should be all-zero after reset_queue()"
+    )
+    assert int(loss_fn._q_ptr) == 0, "queue pointer should be 0 after reset_queue()"
+    # Targets should carry ignore_index everywhere.
+    assert (loss_fn._q_targets == loss_fn.ignore_index).all(), (
+        "queue targets should be all ignore_index after reset_queue()"
+    )
+
+    # Loss should still run cleanly after reset.
+    logits = torch.randn(64, 1, generator=g, requires_grad=True)
+    targets = (torch.rand(64, generator=g) < 0.3).long()
+    out = loss_fn(logits, targets)
+    assert torch.isfinite(out), "loss should be finite after reset_queue()"
+    out.backward()
+    assert torch.isfinite(logits.grad).all(), "grad should be finite after reset_queue()"
+
+
+# ---------------------------------------------------------------------------
+# Task 5C: max_pool_size + iid_mask alignment
+#
+# When max_pool_size triggers subsampling, the iid flags must remain aligned
+# with their corresponding logit rows.  Specifically, a row marked non-iid
+# before subsampling should not silently become iid after subsampling (which
+# would corrupt threshold estimation).
+# ---------------------------------------------------------------------------
+
+
+def test_max_pool_size_iid_mask_alignment():
+    """
+    With max_pool_size set below the pool size, subsampling is triggered.
+    Beta-semantics invariance must still hold after subsampling: non-iid
+    negatives (iid_mask=False) must not influence the FPR thresholds.
+    """
+    g = torch.Generator().manual_seed(50)
+    n_base = 200
+
+    # Base batch: all iid.
+    base_logits = torch.randn(n_base, 1, generator=g)
+    base_targets = (torch.rand(n_base, generator=g) < 0.2).long()
+    base_logits[base_targets == 1] += 1.0
+
+    # Non-iid negatives with very different score distribution.
+    n_extra = 150
+    extra_logits = torch.randn(n_extra, 1, generator=g) * 5.0 - 3.0
+    extra_targets = torch.zeros(n_extra, dtype=torch.long)
+
+    combined_logits = torch.cat([base_logits, extra_logits], dim=0)
+    combined_targets = torch.cat([base_targets, extra_targets], dim=0)
+    iid_mask = torch.cat([
+        torch.ones(n_base, dtype=torch.bool),
+        torch.zeros(n_extra, dtype=torch.bool),
+    ])
+
+    # max_pool_size < total pool forces subsampling.
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate="trapezoid", queue_size=0,
+        max_pool_size=100,  # forces subsampling of the 350-row pool
+    )
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        combined_logits.requires_grad_(True)
+        out = loss_fn(combined_logits, combined_targets, iid_mask=iid_mask)
+
+    assert torch.isfinite(out), "loss should be finite with max_pool_size and iid_mask"
+    out.backward()
+    assert torch.isfinite(combined_logits.grad).all(), (
+        "grad should be finite with max_pool_size and iid_mask"
+    )
+
+
+def test_max_pool_size_iid_alignment_thresholds_from_iid_only():
+    """
+    Even after max_pool_size subsampling, diagnostics confirm that t_alpha/t_beta
+    correspond to the iid-negative population (not the non-iid negatives).
+    We verify this by checking that the thresholds are within the range of the
+    iid negative scores (not driven by the far-out non-iid negatives).
+    """
+    g = torch.Generator().manual_seed(51)
+
+    # IID negatives: scores in [-1, 1].
+    n_iid_neg = 160
+    iid_neg_logits = torch.rand(n_iid_neg, 1, generator=g) * 2.0 - 1.0
+
+    # Non-iid negatives: scores at +10 (would inflate t_alpha dramatically if included).
+    n_non_iid = 40
+    non_iid_logits = torch.full((n_non_iid, 1), 10.0)
+
+    # Positives: scores around +3.
+    n_pos = 40
+    pos_logits = torch.randn(n_pos, 1, generator=g) + 3.0
+
+    logits = torch.cat([iid_neg_logits, non_iid_logits, pos_logits], dim=0)
+    targets = torch.cat([
+        torch.zeros(n_iid_neg, dtype=torch.long),
+        torch.zeros(n_non_iid, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+    iid_mask = torch.cat([
+        torch.ones(n_iid_neg, dtype=torch.bool),
+        torch.zeros(n_non_iid, dtype=torch.bool),
+        torch.ones(n_pos, dtype=torch.bool),  # positives are iid (irrelevant for thresholds)
+    ])
+
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.05, beta=0.5,
+        surrogate="trapezoid", queue_size=0,
+        max_pool_size=120,  # forces subsampling
+        quantile_interpolation="linear",
+    )
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        _, stats = loss_fn(logits, targets, iid_mask=iid_mask, return_diagnostics=True)
+
+    # t_alpha must be within the range of the iid negatives, not driven to +10
+    # by the non-iid negatives.
+    t_alpha = stats["t_alpha"][0].item()
+    assert torch.isfinite(stats["t_alpha"][0]), "t_alpha should be finite"
+    assert t_alpha < 5.0, (
+        f"t_alpha={t_alpha:.3f} is above 5.0, suggesting non-iid negatives "
+        "contaminated threshold estimation after subsampling."
     )

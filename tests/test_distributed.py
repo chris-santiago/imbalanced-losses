@@ -14,7 +14,7 @@ import torch.distributed as dist
 
 import torch.nn as nn
 
-from imbalanced_losses import RecallAtQuantileLoss, SmoothAPLoss
+from imbalanced_losses import PAUCAtBudgetLoss, RecallAtQuantileLoss, SmoothAPLoss
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 from imbalanced_losses.warmup_wrapper import LossWarmupWrapper
 
@@ -436,3 +436,269 @@ class TestVariableSizeGather:
         out.sum().backward()
         assert t0.grad is not None
         assert t0.grad.shape == (0, 3)
+
+
+# ---------------------------------------------------------------------------
+# Task 5B: PAUCAtBudgetLoss iid_mask DDP-gather
+#
+# Verify that under a mocked multi-rank process group, iid_mask is gathered
+# aligned with logits/targets and that FPR thresholds are driven only by the
+# gathered iid negatives (not non-iid rows from other ranks).
+#
+# Two paths tested:
+#  1. Equal-size fast path (both ranks have the same dim-0 size)
+#  2. Variable dim-0 path (unequal rows per rank)
+# ---------------------------------------------------------------------------
+
+
+def _make_pauc_gather_mock(
+    logits_ranks: list[torch.Tensor],
+    targets_ranks: list[torch.Tensor],
+    iid_ranks: list[torch.Tensor],
+):
+    """
+    Build a side_effect for dist.all_gather that handles six interleaved
+    calls per forward pass (2 calls per tensor: sizes then data):
+      1. sizes gather for logits (int64)
+      2. data gather for logits (padded float32)
+      3. sizes gather for targets (int64)
+      4. data gather for targets (padded int64)
+      5. sizes gather for iid_mask (int64; gathered as uint8)
+      6. data gather for iid_mask (padded uint8)
+
+    Both the equal-size fast path and the variable-size path make all 6 calls;
+    _gather_sizes is always called first regardless of whether ranks differ in
+    size.  The equal-size fast path skips padding in the data gather, but does
+    NOT skip the sizes gather.  The mock routes calls via:
+      group = call_idx // 2  (which tensor group: logits, targets, iid_mask)
+      phase = call_idx %  2  (0 = sizes call, 1 = data call)
+    """
+    world_size = len(logits_ranks)
+    all_tensors = [logits_ranks, targets_ranks, [m.to(torch.uint8) for m in iid_ranks]]
+
+    # Pre-compute sizes and padded tensors for each group.
+    groups = []
+    for tensors in all_tensors:
+        sizes = [torch.tensor([t.size(0)], dtype=torch.int64) for t in tensors]
+        max_rows = max(t.size(0) for t in tensors)
+        padded = []
+        for t in tensors:
+            if t.size(0) < max_rows:
+                pad = torch.zeros(max_rows, *t.shape[1:], dtype=t.dtype)
+                pad[: t.size(0)] = t
+                padded.append(pad)
+            else:
+                padded.append(t.clone())
+        groups.append((sizes, padded))
+
+    call_idx = [0]
+
+    def _side_effect(output_list, input_tensor):
+        # Determine which group this call belongs to by looking at the call index.
+        # Each group uses 2 calls: sizes then data.
+        group_idx = call_idx[0] // 2
+        is_sizes_call = (call_idx[0] % 2) == 0
+        sizes, padded = groups[group_idx % len(groups)]
+        if is_sizes_call:
+            for i, s in enumerate(sizes):
+                output_list[i].copy_(s)
+        else:
+            for i, p in enumerate(padded):
+                output_list[i].copy_(p.detach())
+        call_idx[0] += 1
+
+    return _side_effect
+
+
+class TestPAUCGatherDistributed:
+    """
+    Verify PAUCAtBudgetLoss gathers iid_mask alongside logits/targets and
+    that thresholds are driven by the globally gathered iid negatives only.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    def _build_rank_data(self, seed_base=100):
+        """
+        Two-rank setup:
+          Rank 0: 20 rows -- 4 positives (class 1), 16 iid negatives with
+                  scores in [-1, 1].
+          Rank 1: 20 rows -- 4 positives (class 1), 12 iid negatives in
+                  [-1, 1], and 4 NON-iid negatives at score +8 (which would
+                  inflate t_alpha to ~8 if erroneously included).
+        Concatenated global batch has 40 rows.
+        """
+        g = torch.Generator().manual_seed(seed_base)
+
+        # Rank 0: all iid.
+        r0_neg = torch.rand(16, 1, generator=g) * 2.0 - 1.0
+        r0_pos = torch.randn(4, 1, generator=g) + 3.0
+        r0_logits = torch.cat([r0_neg, r0_pos], dim=0)
+        r0_targets = torch.cat([
+            torch.zeros(16, dtype=torch.long),
+            torch.ones(4, dtype=torch.long),
+        ])
+        r0_iid = torch.ones(20, dtype=torch.bool)
+
+        # Rank 1: 12 iid negatives + 4 non-iid negatives at +8.
+        r1_iid_neg = torch.rand(12, 1, generator=g) * 2.0 - 1.0
+        r1_non_iid = torch.full((4, 1), 8.0)
+        r1_pos = torch.randn(4, 1, generator=g) + 3.0
+        r1_logits = torch.cat([r1_iid_neg, r1_non_iid, r1_pos], dim=0)
+        r1_targets = torch.cat([
+            torch.zeros(16, dtype=torch.long),
+            torch.ones(4, dtype=torch.long),
+        ])
+        r1_iid = torch.cat([
+            torch.ones(12, dtype=torch.bool),
+            torch.zeros(4, dtype=torch.bool),   # non-iid
+            torch.ones(4, dtype=torch.bool),
+        ])
+
+        return (r0_logits, r0_targets, r0_iid), (r1_logits, r1_targets, r1_iid)
+
+    def test_iid_mask_gathered_equal_size_path(self):
+        """
+        Equal-size fast path (both ranks have 20 rows): iid_mask is gathered
+        as uint8 and the resulting thresholds are within the iid-negative range
+        (not inflated by the non-iid negatives at +8 on rank 1).
+        """
+        from unittest.mock import patch
+
+        (r0_l, r0_t, r0_iid), (r1_l, r1_t, r1_iid) = self._build_rank_data()
+        assert r0_l.size(0) == r1_l.size(0), "both ranks must be equal size for this test"
+
+        local_rank = 0
+        mock = _make_pauc_gather_mock(
+            [r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid]
+        )
+
+        loss_fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.05, beta=0.5,
+            surrogate="trapezoid", queue_size=0,
+            gather_distributed=True,
+            quantile_interpolation="linear",
+        )
+        # Force gather resolution to True (normally cached on first real forward).
+        loss_fn._gather_resolved = True
+
+        r0_l_grad = r0_l.detach().requires_grad_(True)
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            loss, stats = loss_fn(r0_l_grad, r0_t, iid_mask=r0_iid, return_diagnostics=True)
+
+        assert torch.isfinite(loss), "loss should be finite after DDP gather"
+        loss.backward()
+        assert r0_l_grad.grad is not None, "gradient should flow to local-rank logits"
+        assert torch.isfinite(r0_l_grad.grad).all(), "gradient should be finite"
+
+        # t_alpha must not be near +8 (the non-iid score).  Since iid negatives
+        # are in [-1, 1], t_alpha = quantile(iid_neg, 1 - 0.05) should be < 2.
+        t_alpha = stats["t_alpha"][0].item()
+        assert torch.isfinite(stats["t_alpha"][0]), "t_alpha should be finite"
+        assert t_alpha < 3.0, (
+            f"t_alpha={t_alpha:.3f} is unexpectedly large; suggests non-iid negatives "
+            "at +8 contaminated threshold estimation after DDP gather."
+        )
+
+    def test_iid_mask_gathered_variable_size_path(self):
+        """
+        Variable dim-0 path (ranks have different row counts): iid_mask is
+        still gathered correctly and thresholds are not contaminated by
+        non-iid negatives.
+        """
+        from unittest.mock import patch
+
+        g = torch.Generator().manual_seed(200)
+
+        # Rank 0: 15 rows -- 3 positives, 12 iid negatives in [-1, 1].
+        r0_neg = torch.rand(12, 1, generator=g) * 2.0 - 1.0
+        r0_pos = torch.randn(3, 1, generator=g) + 3.0
+        r0_l = torch.cat([r0_neg, r0_pos], dim=0)   # [15, 1]
+        r0_t = torch.cat([torch.zeros(12, dtype=torch.long), torch.ones(3, dtype=torch.long)])
+        r0_iid = torch.ones(15, dtype=torch.bool)
+
+        # Rank 1: 25 rows -- 5 positives, 16 iid negatives in [-1, 1],
+        # 4 non-iid negatives at +8.
+        r1_iid_neg = torch.rand(16, 1, generator=g) * 2.0 - 1.0
+        r1_non_iid = torch.full((4, 1), 8.0)
+        r1_pos = torch.randn(5, 1, generator=g) + 3.0
+        r1_l = torch.cat([r1_iid_neg, r1_non_iid, r1_pos], dim=0)  # [25, 1]
+        r1_t = torch.cat([
+            torch.zeros(20, dtype=torch.long),
+            torch.ones(5, dtype=torch.long),
+        ])
+        r1_iid = torch.cat([
+            torch.ones(16, dtype=torch.bool),
+            torch.zeros(4, dtype=torch.bool),
+            torch.ones(5, dtype=torch.bool),
+        ])
+
+        assert r0_l.size(0) != r1_l.size(0), "ranks must have different sizes for this test"
+
+        local_rank = 0
+        mock = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+
+        loss_fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.05, beta=0.5,
+            surrogate="trapezoid", queue_size=0,
+            gather_distributed=True,
+            quantile_interpolation="linear",
+        )
+        loss_fn._gather_resolved = True
+
+        r0_l_grad = r0_l.detach().requires_grad_(True)
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            loss, stats = loss_fn(r0_l_grad, r0_t, iid_mask=r0_iid, return_diagnostics=True)
+
+        assert torch.isfinite(loss), "loss should be finite after variable-size DDP gather"
+        loss.backward()
+        assert r0_l_grad.grad is not None
+        assert torch.isfinite(r0_l_grad.grad).all()
+
+        # Thresholds must not be near +8.
+        t_alpha = stats["t_alpha"][0].item()
+        assert torch.isfinite(stats["t_alpha"][0])
+        assert t_alpha < 3.0, (
+            f"t_alpha={t_alpha:.3f} after variable-size gather; suggests non-iid "
+            "contamination of thresholds."
+        )
+
+    def test_pauc_auto_resolves_false_at_world_size_1(self):
+        """Auto-detect: world_size=1 → _gather_resolved becomes False after first forward."""
+        loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.1, beta=0.5, queue_size=0)
+        assert loss_fn._gather_resolved is None
+        logits = torch.randn(32, 1, requires_grad=True)
+        targets = torch.randint(0, 2, (32,))
+        loss_fn(logits, targets)
+        assert loss_fn._gather_resolved is False
+
+    def test_pauc_explicit_false_resolves_false(self):
+        """gather_distributed=False always resolves to False."""
+        loss_fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5, queue_size=0, gather_distributed=False
+        )
+        logits = torch.randn(32, 1, requires_grad=True)
+        targets = torch.randint(0, 2, (32,))
+        loss_fn(logits, targets)
+        assert loss_fn._gather_resolved is False
+
+    def test_pauc_output_matches_no_gather_at_world_size_1(self):
+        """Auto-gather at world_size=1 is identical to no-gather (same data)."""
+        torch.manual_seed(0)
+        logits = torch.randn(32, 1, requires_grad=True)
+        targets = torch.randint(0, 2, (32,))
+        fn_auto = PAUCAtBudgetLoss(num_classes=1, alpha=0.1, beta=0.5, queue_size=0)
+        fn_off = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5, queue_size=0, gather_distributed=False
+        )
+        assert torch.allclose(fn_auto(logits, targets), fn_off(logits, targets))
