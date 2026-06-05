@@ -359,34 +359,168 @@ def test_float64_forward_backward(surrogate):
 
 
 # ---------------------------------------------------------------------------
-# Tiny-tau stability: scale clamped to _SCALE_EPS
+# Degenerate-dispersion guard (Fix 1)
+#
+# Prior contract (before Fix 1): constant negatives -> scale clamped to
+# _SCALE_EPS, loss=1 computed, gradient finite but signal-free.
+#
+# New contract: constant negatives -> class INVALID (skipped), loss is
+# 0.0 under reduction='mean' with no valid classes (or nan under 'none'),
+# gradient is finite (zero), and a UserWarning is emitted exactly once.
 # ---------------------------------------------------------------------------
 
-def test_tiny_tau_scale_stability():
-    # When all iid-negative scores are equal, IQR = 0 and the scale clamps to
-    # _SCALE_EPS.  Gradients should vanish gracefully (finite, not NaN/Inf).
+def test_constant_negatives_class_invalid(recwarn):
+    """
+    Exactly-constant iid negatives produce near-zero dispersion.  Under Fix 1
+    the class is INVALID, loss reduces to 0.0 (mean over zero valid classes),
+    gradient is all-zero, and a UserWarning is emitted once.
+    """
+    import warnings as _warnings
     g = torch.Generator().manual_seed(11)
-    n = 300
-    # Positives with spread; negatives all identical (IQR = 0 -> scale = eps).
-    neg_score = 0.0
-    n_neg = int(n * 0.8)
-    n_pos = n - n_neg
-    neg_logits = torch.full((n_neg, 1), neg_score)
+    n_neg = 240
+    n_pos = 60
+    neg_logits = torch.full((n_neg, 1), 0.0)           # all identical
     pos_logits = torch.randn(n_pos, 1, generator=g) + 2.0
     logits = torch.cat([neg_logits, pos_logits], dim=0)
-    targets = torch.cat(
-        [torch.zeros(n_neg, dtype=torch.long), torch.ones(n_pos, dtype=torch.long)]
-    )
+    targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
     logits.requires_grad_(True)
+
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, tau_scale="iqr",
+        queue_size=0, reduction="mean",
+    )
+
+    # Capture the warning.
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        out = loss_fn(logits, targets)
+
+    # Loss must be finite (0.0 from mean over no valid classes).
+    assert torch.isfinite(out), f"loss not finite: {out.item()}"
+
+    out.backward()
+    # Gradient must be finite (all zero -- no valid class contributed).
+    assert torch.isfinite(logits.grad).all(), "grad not finite for constant negatives"
+
+    # Exactly one UserWarning must have been emitted.
+    user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+    assert len(user_warns) == 1, (
+        f"expected exactly 1 UserWarning for degenerate dispersion, got {len(user_warns)}"
+    )
+    assert "dispersion" in str(user_warns[0].message).lower(), (
+        "warning message should mention dispersion"
+    )
+
+
+def test_constant_negatives_warn_once():
+    """
+    The degenerate-dispersion warning fires only on the FIRST degenerate
+    forward pass, not on subsequent ones (mirrors _subsample_warned pattern).
+    """
+    import warnings as _warnings
+    n_neg, n_pos = 200, 50
+    neg_logits = torch.full((n_neg, 1), 0.0)
+    pos_logits = torch.ones(n_pos, 1)
+    logits = torch.cat([neg_logits, pos_logits], dim=0)
+    targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
 
     loss_fn = PAUCAtBudgetLoss(
         num_classes=1, alpha=0.1, beta=0.5, tau_scale="iqr", queue_size=0
     )
-    out = loss_fn(logits, targets)
-    assert torch.isfinite(out), "loss not finite when scale clamps to _SCALE_EPS"
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        for _ in range(3):
+            loss_fn(logits, targets)
+
+    user_warns = [w for w in caught if issubclass(w.category, UserWarning)]
+    assert len(user_warns) == 1, (
+        f"expected warn-once: got {len(user_warns)} warnings over 3 forward passes"
+    )
+
+
+def test_constant_negatives_reduction_none_is_nan():
+    """
+    Under reduction='none', a degenerate class yields nan (INVALID convention).
+    """
+    import warnings as _warnings
+    n_neg, n_pos = 200, 50
+    neg_logits = torch.full((n_neg, 1), 0.0)
+    pos_logits = torch.ones(n_pos, 1)
+    logits = torch.cat([neg_logits, pos_logits], dim=0)
+    targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, tau_scale="iqr",
+        queue_size=0, reduction="none",
+    )
+    with _warnings.catch_warnings(record=True):
+        _warnings.simplefilter("always")
+        out = loss_fn(logits, targets)
+
+    assert out.shape == (1,)
+    assert torch.isnan(out).all(), (
+        f"expected nan for invalid class under reduction='none', got {out}"
+    )
+
+
+def test_small_nonzero_dispersion_still_valid():
+    """
+    A SMALL but strictly nonzero dispersion (negatives spread over a tiny but
+    nonzero range) must NOT be invalidated.  The class is merely-biased but
+    should still produce a finite loss and finite gradient.  This guards
+    against an over-aggressive guard that would break legitimate small-batch
+    or narrow-score-range use.
+    """
+    import warnings as _warnings
+    g = torch.Generator().manual_seed(12)
+    n_neg = 200
+    n_pos = 50
+    # Negatives with a tiny but nonzero IQR (spread ~1e-6).
+    neg_logits = torch.randn(n_neg, 1, generator=g) * 1e-6
+    pos_logits = torch.randn(n_pos, 1, generator=g) + 2.0
+    logits = torch.cat([neg_logits, pos_logits], dim=0)
+    targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+    logits.requires_grad_(True)
+
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, tau_scale="iqr",
+        queue_size=0, reduction="mean",
+    )
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        out = loss_fn(logits, targets)
+
+    # Must be finite (not invalid).
+    assert torch.isfinite(out), (
+        f"small-but-nonzero dispersion should produce finite loss, got {out.item()}"
+    )
     out.backward()
     assert torch.isfinite(logits.grad).all(), (
-        "grad not finite when scale clamps to _SCALE_EPS"
+        "grad not finite for small-but-nonzero dispersion"
+    )
+
+    # No degenerate-dispersion warning expected (dispersion > _SCALE_EPS).
+    degen_warns = [
+        w for w in caught
+        if issubclass(w.category, UserWarning) and "dispersion" in str(w.message).lower()
+    ]
+    assert len(degen_warns) == 0, (
+        f"unexpected degenerate-dispersion warning for nonzero-dispersion case: "
+        f"{[str(w.message) for w in degen_warns]}"
     )
 
 

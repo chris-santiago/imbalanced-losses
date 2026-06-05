@@ -6,8 +6,14 @@ Optimizes the normalized partial AUC over a false-positive-rate band
 rather than the full AUC or a single-threshold recall.
 
 Band edges are estimated as score quantiles of the *iid negatives* only
-(stop-gradient), so they correspond to true population FPR regardless of any
-class-aware densification a caller applies upstream:
+(stop-gradient), so they **approximate** true population FPR.  The
+approximation is reliable when the pooled iid-negative count substantially
+exceeds ``1/alpha``; at small counts the tail quantile is biased toward the
+maximum.  Check the ``band_neg_count`` diagnostic (and ``queue_size``) as an
+empirical quality indicator.  Classes whose iid-negative scores show
+near-zero dispersion are automatically skipped (marked INVALID) because the
+sigmoid temperature cannot be calibrated; see the ``_degenerate_warned`` note
+in the class docstring.
 
     t_alpha = quantile(neg_iid, 1 - alpha)          [detached]
     t_beta  = quantile(neg_iid, 1 - beta)           [detached]   (t_beta <= t_alpha)
@@ -75,6 +81,19 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     Inherits queue management, DDP gather, ignore-index filtering, subsampling,
     and reduction logic from ``_QueuedRankingLoss``.
 
+    **Degenerate-dispersion guard:** if the robust dispersion of iid-negative
+    scores for a class is at or below ``_SCALE_EPS`` (all-equal scores, a
+    collapsed band with ``tau_scale='band'``, or too few iid negatives to
+    resolve the tail quantile), that class is marked INVALID and excluded from
+    reduction rather than silently computing with a near-zero temperature.  A
+    one-time ``UserWarning`` is emitted on the first such occurrence.  To avoid
+    degenerate classes, increase ``queue_size`` or ensure iid negatives cover a
+    meaningful score range.
+
+    The band-edge approximation of population FPR is reliable when the pooled
+    iid-negative count substantially exceeds ``1/alpha``.  Monitor
+    ``band_neg_count`` in diagnostics and set ``queue_size`` accordingly.
+
     Parameters
     ----------
     num_classes : int
@@ -94,6 +113,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         Number of equally-spaced FPR knots in ``[alpha, beta]`` for the
         trapezoid surrogate (knot 0 = alpha, knot n_knots-1 = beta). Must be
         >= 2. Ignored when ``surrogate='pairwise'``. Default: 2.
+
+        The default of 2 (trapezoid rule) is accurate for narrow bands where
+        TPR(FPR) is approximately linear over ``[alpha, beta]``; the
+        integration error scales as ``(beta - alpha)^3 * TPR''``.  For wide
+        bands where TPR curvature is non-negligible, ``n_knots >= 3`` is
+        recommended.
     tau_scale : {'iqr', 'band'}, optional
         Robust dispersion used to make the temperature scale-aware.
         ``'iqr'`` (default) uses ``IQR(neg_iid)`` -- a stable bulk statistic
@@ -224,6 +249,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         self.tau_scale = tau_scale
         self.quantile_interpolation = quantile_interpolation
 
+        # Warn once per instance when a class is skipped due to near-zero
+        # iid-negative dispersion (mirrors the _subsample_warned pattern).
+        self._degenerate_warned = False
+
     # ------------------------------------------------------------------
     # Backward-compatible access to queue internals
     # ------------------------------------------------------------------
@@ -280,7 +309,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         self, neg: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute detached band edges and the scale-aware temperature.
+        Compute detached band edges and the raw robust dispersion.
 
         Parameters
         ----------
@@ -294,9 +323,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         t_beta : torch.Tensor, scalar
             Upper-FPR band edge ``quantile(neg, 1 - beta)`` (detached);
             always ``t_beta <= t_alpha`` since ``alpha < beta``.
-        tau_eff : torch.Tensor, scalar
-            ``temperature * scale`` (detached), with ``scale`` floored at
-            ``_SCALE_EPS``.
+        scale : torch.Tensor, scalar
+            Raw (unclamped) robust dispersion of ``neg`` -- IQR or band
+            width depending on ``tau_scale``.  The caller must test this
+            against ``_SCALE_EPS`` before computing ``tau_eff``.
         """
         t_alpha = torch.quantile(
             neg, 1.0 - self.alpha, interpolation=self.quantile_interpolation
@@ -316,9 +346,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         else:  # "band"
             scale = t_alpha - t_beta
 
-        scale = scale.clamp_min(self._SCALE_EPS)
-        tau_eff = self.temperature * scale
-        return t_alpha, t_beta, tau_eff
+        return t_alpha, t_beta, scale
 
     def _compute_pauc(
         self,
@@ -349,8 +377,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             Normalized partial AUC estimate in [0, 1]. Zero (no gradient) for
             invalid classes.
         valid : bool
-            False if there are no positives, no iid negatives, or (pairwise)
-            no band negatives. Invalid classes are excluded from reduction.
+            False if there are no positives, no iid negatives, the iid-negative
+            dispersion is near-zero (degenerate), or (pairwise) no band negatives.
+            Invalid classes are excluded from reduction.
         diag : dict
             Diagnostic scalars for this class (all detached) when
             ``self._want_diag`` is True. Keys: ``t_alpha``, ``t_beta``,
@@ -374,7 +403,34 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             return scores.new_zeros(()), False, {}
 
         neg = scores[iid_neg].detach()
-        t_alpha, t_beta, tau_eff = self._band_thresholds_and_scale(neg)
+        t_alpha, t_beta, scale = self._band_thresholds_and_scale(neg)
+
+        # Degeneracy guard: if the robust dispersion is ~zero, the sigmoid
+        # temperature cannot be calibrated.  Mark as invalid rather than
+        # computing with tau_eff ≈ 1e-13 (which yields a signal-free loss=1
+        # or an exploding gradient).  Emit a one-time warning.
+        if scale <= self._SCALE_EPS:
+            if not self._degenerate_warned:
+                warnings.warn(
+                    f"{type(self).__name__}: iid-negative score dispersion is "
+                    f"near-zero (scale={scale.item():.2e} <= _SCALE_EPS={self._SCALE_EPS:.2e}) "
+                    f"for at least one class. This typically means all iid negatives "
+                    f"have equal (or near-equal) scores, or the FPR band "
+                    f"[{self.alpha}, {self.beta}] is too narrow relative to the "
+                    f"available iid-negative count (fewer than ~1/{self.alpha:.4g} iid "
+                    f"negatives are needed to resolve the tail quantile). "
+                    f"The affected class is skipped (marked INVALID). "
+                    f"To fix: increase queue_size or ensure iid negatives cover a "
+                    f"meaningful score range. "
+                    f"(This warning is shown once per instance.)",
+                    UserWarning,
+                    stacklevel=5,
+                )
+                self._degenerate_warned = True
+            return scores.new_zeros(()), False, {}
+
+        # Apply the div-by-zero floor only AFTER the degeneracy check passes.
+        tau_eff = self.temperature * scale.clamp_min(self._SCALE_EPS)
 
         if self.surrogate == "trapezoid":
             # FPR knots equally spaced over [alpha, beta]; threshold per knot.
