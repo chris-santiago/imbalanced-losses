@@ -1,0 +1,463 @@
+"""
+Partial-AUC-over-an-FPR-band loss with a memory queue.
+
+Optimizes the normalized partial AUC over a false-positive-rate band
+``[alpha, beta]`` that brackets a target operating point (e.g. FPR ~ 0.005),
+rather than the full AUC or a single-threshold recall.
+
+Band edges are estimated as score quantiles of the *iid negatives* only
+(stop-gradient), so they correspond to true population FPR regardless of any
+class-aware densification a caller applies upstream:
+
+    t_alpha = quantile(neg_iid, 1 - alpha)          [detached]
+    t_beta  = quantile(neg_iid, 1 - beta)           [detached]   (t_beta <= t_alpha)
+
+The sigmoid temperature is scale-aware: ``tau_eff = temperature * scale`` where
+``scale`` is a detached robust dispersion of the iid negatives (IQR by default,
+or the band width ``t_alpha - t_beta``). This keeps the kernel sharpness
+constant in FPR units as the model's score scale drifts during training.
+
+Two surrogates:
+
+* ``surrogate="trapezoid"`` (default) -- normalized pAUC by composite trapezoid
+  over ``n_knots`` equally-spaced FPR knots in ``[alpha, beta]``:
+
+      TPR_k = mean_{i in P} sigmoid((s_i - t_k) / tau_eff)
+      pauc  = trapezoid(TPR_k) over the uniform FPR grid
+      loss  = 1 - pauc
+
+  Gradient flows only through positive scores; negatives enter solely via the
+  detached thresholds/scale. Cost is O(|P| x n_knots).
+
+* ``surrogate="pairwise"`` -- band-restricted Smooth-pAUC. Band negatives
+  (``t_beta <= s <= t_alpha``) are taken from the gradient pool:
+
+      pauc = mean_{i in P, j in band} sigmoid((s_i - s_j) / tau_eff)
+      loss = 1 - pauc
+
+  Band negatives carry gradient (intended). Cost is O(|P| x |band|). Intended
+  for wide/volatile bands where band-negatives are plentiful.
+
+Multi-class: one-vs-rest per class, same convention as SmoothAPLoss.
+Binary:      num_classes=1, logits [N, 1], targets 0/1.
+Seq2seq:     flatten to [N, C] / [N] upstream.
+Padding:     ignore_index=-100 rows are dropped before threshold estimation.
+
+Note: This is an original loss design, not from a published paper. It combines
+iid-anchored stop-gradient FPR-band thresholds with a scale-aware soft-TPR
+trapezoid (or band-restricted pairwise) surrogate.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Literal
+
+import torch
+
+from imbalanced_losses._base import _QueuedRankingLoss
+
+
+class PAUCAtBudgetLoss(_QueuedRankingLoss):
+    """
+    Differentiable partial-AUC-over-an-FPR-band loss with an optional memory queue.
+
+    For each class, FPR-band edges ``t_alpha``/``t_beta`` are estimated from the
+    pooled *iid negatives* (stop-gradient) as score quantiles, a scale-aware
+    sigmoid temperature ``tau_eff`` is derived from a detached robust dispersion
+    of those negatives, and the normalized partial AUC over ``[alpha, beta]`` is
+    optimized via a trapezoid (default) or band-restricted pairwise surrogate.
+    Loss is ``1 - pauc``.
+
+    Multi-class: one-vs-rest per class using logits[:, c], then reduce.
+    Binary:      logits[:, 0] with targets in {0, 1}.
+
+    Inherits queue management, DDP gather, ignore-index filtering, subsampling,
+    and reduction logic from ``_QueuedRankingLoss``.
+
+    Parameters
+    ----------
+    num_classes : int
+        Number of output classes. Use 1 for binary mode.
+    alpha : float, optional
+        Lower FPR band edge. Must satisfy ``0 <= alpha < beta <= 1``.
+        Default: 0.0025.
+    beta : float, optional
+        Upper FPR band edge. Must satisfy ``0 <= alpha < beta <= 1``.
+        Default: 0.0075.
+    surrogate : {'trapezoid', 'pairwise'}, optional
+        pAUC estimator. ``'trapezoid'`` (default) integrates soft-TPR over
+        ``n_knots`` FPR knots; gradient flows through positives only.
+        ``'pairwise'`` compares positives against band negatives drawn from the
+        gradient pool (band negatives carry gradient). Default: 'trapezoid'.
+    n_knots : int, optional
+        Number of equally-spaced FPR knots in ``[alpha, beta]`` for the
+        trapezoid surrogate (knot 0 = alpha, knot n_knots-1 = beta). Must be
+        >= 2. Ignored when ``surrogate='pairwise'``. Default: 2.
+    tau_scale : {'iqr', 'band'}, optional
+        Robust dispersion used to make the temperature scale-aware.
+        ``'iqr'`` (default) uses ``IQR(neg_iid)`` -- a stable bulk statistic
+        (pair with small ``temperature``, e.g. 0.1). ``'band'`` uses
+        ``t_alpha - t_beta`` -- sized directly to the operating region (pair
+        with ``temperature`` near 1.0; recommended for wide/volatile bands).
+        Default: 'iqr'.
+    queue_size : int, optional
+        Circular buffer size (rows). Larger queues stabilise the quantile-based
+        band edges -- at low FPR you need many negatives for a meaningful tail
+        quantile. Set to 0 to disable. Default: 1024.
+
+        **DDP note:** when ``gather_distributed=True``, the all-gather runs
+        *before* the enqueue, so each rank stores global-batch rows. The
+        effective pool per forward pass is already
+        ``global_batch_size + queue_size``.
+    temperature : float, optional
+        Dimensionless multiplier on ``tau_eff = temperature * scale``. Larger
+        values give smoother gradients but bias soft-TPR toward 0.5; smaller
+        values approximate true TPR but risk sigmoid saturation. Default: 0.1.
+    reduction : {'mean', 'sum', 'none'}, optional
+        How to aggregate per-class losses.
+        - 'mean': scalar average over valid classes.
+        - 'sum':  scalar sum over valid classes.
+        - 'none': tensor of shape [C]; invalid classes are nan.
+        Default: 'mean'.
+    ignore_index : int, optional
+        Target value marking padded positions. Excluded from threshold
+        estimation and the positive set. Default: -100.
+    update_queue_in_eval : bool, optional
+        If False (default), the queue is frozen during eval mode. Default: False.
+    gather_distributed : bool or None, optional
+        Whether to all-gather logits, targets, and the iid mask across DDP
+        workers before computing the loss. ``None`` (default) auto-detects:
+        gathers when ``torch.distributed`` is initialized with world_size > 1.
+        Set ``False`` to explicitly disable. Resolved once on first forward
+        call. Default: None.
+    quantile_interpolation : str, optional
+        Interpolation method passed to torch.quantile for the band edges.
+        'higher' is the conservative default. One of ('linear', 'lower',
+        'higher', 'nearest', 'midpoint'). Default: 'higher'.
+    max_pool_size : int or None, optional
+        Maximum number of rows in the ranking pool (live batch + queue after
+        ignore_index filtering). When exceeded, minimum-quota subsampling caps
+        it. See ``RecallAtQuantileLoss`` for details. ``None`` (default)
+        disables the cap.
+
+    Examples
+    --------
+    >>> loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075)
+    >>> logits  = torch.randn(256, 4)
+    >>> targets = torch.randint(0, 4, (256,))
+    >>> loss = loss_fn(logits, targets)
+    >>> loss.backward()
+
+    Notes
+    -----
+    The iid-negative band edges depend only on rows flagged
+    ``iid_mask=True``; appending non-iid negatives (caller-side densification)
+    does not shift ``t_alpha``/``t_beta``. ``iid_mask=None`` treats all rows as
+    iid (the common case when negatives are never densified by class).
+
+    Trapezoid cost is O(|P| x n_knots); pairwise cost is O(|P| x |band|).
+    No O(M^2) path.
+    """
+
+    _VALID_INTERPOLATIONS = ("linear", "lower", "higher", "nearest", "midpoint")
+    _VALID_SURROGATES = ("trapezoid", "pairwise")
+    _VALID_TAU_SCALES = ("iqr", "band")
+
+    # Floor on the detached dispersion to avoid div-by-zero when all iid
+    # negative scores are (near) equal.
+    _SCALE_EPS = 1e-12
+
+    def __init__(
+        self,
+        num_classes: int,
+        alpha: float = 0.0025,
+        beta: float = 0.0075,
+        surrogate: Literal["trapezoid", "pairwise"] = "trapezoid",
+        n_knots: int = 2,
+        tau_scale: Literal["iqr", "band"] = "iqr",
+        queue_size: int = 1024,
+        temperature: float = 0.1,
+        reduction: Literal["mean", "sum", "none"] = "mean",
+        ignore_index: int = -100,
+        update_queue_in_eval: bool = False,
+        gather_distributed: bool | None = None,
+        quantile_interpolation: str = "higher",
+        max_pool_size: int | None = None,
+    ) -> None:
+        if not (0.0 <= alpha < beta <= 1.0):
+            raise ValueError(
+                f"alpha and beta must satisfy 0 <= alpha < beta <= 1, "
+                f"got alpha={alpha}, beta={beta}"
+            )
+        if not isinstance(n_knots, int) or n_knots < 2:
+            raise ValueError(f"n_knots must be an int >= 2, got {n_knots}")
+        if surrogate not in self._VALID_SURROGATES:
+            raise ValueError(
+                f"surrogate must be one of {self._VALID_SURROGATES}, got '{surrogate}'"
+            )
+        if tau_scale not in self._VALID_TAU_SCALES:
+            raise ValueError(
+                f"tau_scale must be one of {self._VALID_TAU_SCALES}, got '{tau_scale}'"
+            )
+        if quantile_interpolation not in self._VALID_INTERPOLATIONS:
+            raise ValueError(
+                f"quantile_interpolation must be one of {self._VALID_INTERPOLATIONS}, "
+                f"got '{quantile_interpolation}'"
+            )
+
+        super().__init__(
+            num_classes=num_classes,
+            queue_size=queue_size,
+            temperature=temperature,
+            reduction=reduction,
+            ignore_index=ignore_index,
+            update_queue_in_eval=update_queue_in_eval,
+            gather_distributed=gather_distributed,
+            max_pool_size=max_pool_size,
+        )
+
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.surrogate = surrogate
+        self.n_knots = n_knots
+        self.tau_scale = tau_scale
+        self.quantile_interpolation = quantile_interpolation
+
+    # ------------------------------------------------------------------
+    # Backward-compatible access to queue internals
+    # ------------------------------------------------------------------
+    # Tests and external code may access _q_logits, _q_targets, _q_ptr
+    # directly on the loss instance. These properties delegate to the
+    # nested _MemoryQueue submodule.
+
+    @property
+    def _q_logits(self):
+        return self._queue._q_logits
+
+    @_q_logits.setter
+    def _q_logits(self, value):
+        self._queue._q_logits = value
+
+    @property
+    def _q_targets(self):
+        return self._queue._q_targets
+
+    @_q_targets.setter
+    def _q_targets(self, value):
+        self._queue._q_targets = value
+
+    @property
+    def _q_ptr(self):
+        return self._queue._q_ptr
+
+    @_q_ptr.setter
+    def _q_ptr(self, value):
+        self._queue._q_ptr = value
+
+    # ------------------------------------------------------------------
+    # Backward-compatible queue methods
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _enqueue(self, logits: torch.Tensor, targets: torch.Tensor) -> None:
+        """Delegate to the internal ``_MemoryQueue``."""
+        self._queue.enqueue(logits, targets)
+
+    def _merge_with_queue(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Delegate to the internal ``_MemoryQueue``."""
+        return self._queue.merge(logits, targets)
+
+    # ------------------------------------------------------------------
+    # Core algorithm
+    # ------------------------------------------------------------------
+
+    def _band_thresholds_and_scale(
+        self, neg: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compute detached band edges and the scale-aware temperature.
+
+        Parameters
+        ----------
+        neg : torch.Tensor, shape [n_iid_neg]
+            Detached iid-negative scores for one class.
+
+        Returns
+        -------
+        t_alpha : torch.Tensor, scalar
+            Lower-FPR band edge ``quantile(neg, 1 - alpha)`` (detached).
+        t_beta : torch.Tensor, scalar
+            Upper-FPR band edge ``quantile(neg, 1 - beta)`` (detached);
+            always ``t_beta <= t_alpha`` since ``alpha < beta``.
+        tau_eff : torch.Tensor, scalar
+            ``temperature * scale`` (detached), with ``scale`` floored at
+            ``_SCALE_EPS``.
+        """
+        t_alpha = torch.quantile(
+            neg, 1.0 - self.alpha, interpolation=self.quantile_interpolation
+        )
+        t_beta = torch.quantile(
+            neg, 1.0 - self.beta, interpolation=self.quantile_interpolation
+        )
+
+        if self.tau_scale == "iqr":
+            q75 = torch.quantile(
+                neg, 0.75, interpolation=self.quantile_interpolation
+            )
+            q25 = torch.quantile(
+                neg, 0.25, interpolation=self.quantile_interpolation
+            )
+            scale = q75 - q25
+        else:  # "band"
+            scale = t_alpha - t_beta
+
+        scale = scale.clamp_min(self._SCALE_EPS)
+        tau_eff = self.temperature * scale
+        return t_alpha, t_beta, tau_eff
+
+    def _compute_pauc(
+        self,
+        scores: torch.Tensor,
+        is_pos: torch.Tensor,
+        is_neg: torch.Tensor,
+        is_iid: torch.Tensor,
+    ) -> tuple[torch.Tensor, bool]:
+        """
+        Compute normalized partial AUC over ``[alpha, beta]`` for one class.
+
+        Parameters
+        ----------
+        scores : torch.Tensor, shape [M]
+            Pooled scores for one class (live + queue, padding stripped).
+            Gradient flows through live-batch scores; queue scores are
+            already detached upstream.
+        is_pos : torch.Tensor, shape [M], dtype=bool
+            Positive mask for this class.
+        is_neg : torch.Tensor, shape [M], dtype=bool
+            Negative mask for this class (``~is_pos``).
+        is_iid : torch.Tensor, shape [M], dtype=bool
+            Per-row iid-eligibility flag.
+
+        Returns
+        -------
+        pauc : torch.Tensor, scalar
+            Normalized partial AUC estimate in [0, 1]. Zero (no gradient) for
+            invalid classes.
+        valid : bool
+            False if there are no positives, no iid negatives, or (pairwise)
+            no band negatives. Invalid classes are excluded from reduction.
+
+        Notes
+        -----
+        Band edges ``t_alpha``/``t_beta`` and ``tau_eff`` are computed from the
+        DETACHED iid negatives, so gradient never flows through the thresholds
+        or the scale. In trapezoid mode gradient reaches positives only; in
+        pairwise mode it reaches positives and band negatives.
+        """
+        iid_neg = is_neg & is_iid
+        n_pos = int(is_pos.sum())
+        n_iid_neg = int(iid_neg.sum())
+        if n_pos == 0 or n_iid_neg == 0:
+            return scores.new_zeros(()), False
+
+        neg = scores[iid_neg].detach()
+        t_alpha, t_beta, tau_eff = self._band_thresholds_and_scale(neg)
+
+        if self.surrogate == "trapezoid":
+            # FPR knots equally spaced over [alpha, beta]; threshold per knot.
+            # dtype must match scores so torch.quantile doesn't raise on float64.
+            f_k = torch.linspace(
+                self.alpha, self.beta, self.n_knots,
+                device=scores.device, dtype=scores.dtype
+            )
+            t_k = torch.quantile(
+                neg, 1.0 - f_k, interpolation=self.quantile_interpolation
+            )  # [n_knots], detached
+            p = scores[is_pos]  # gradient flows here
+            # [n_pos, n_knots] -> mean over positives -> [n_knots]
+            tpr = torch.sigmoid(
+                (p.unsqueeze(1) - t_k.unsqueeze(0)) / tau_eff
+            ).mean(dim=0)
+            # Composite trapezoid on a uniform grid, normalized to [alpha, beta].
+            pauc = (
+                0.5 * tpr[0] + tpr[1:-1].sum() + 0.5 * tpr[-1]
+            ) / (self.n_knots - 1)
+            return pauc, True
+
+        # surrogate == "pairwise": band negatives from the GRADIENT POOL.
+        band = is_neg & (scores >= t_beta) & (scores <= t_alpha)
+        if int(band.sum()) == 0:
+            return scores.new_zeros(()), False
+        p = scores[is_pos]
+        b = scores[band]  # band negatives carry gradient (intended)
+        pauc = torch.sigmoid(
+            (p.unsqueeze(1) - b.unsqueeze(0)) / tau_eff
+        ).mean()
+        return pauc, True
+
+    # ------------------------------------------------------------------
+    # Per-class dispatch (required by _QueuedRankingLoss)
+    # ------------------------------------------------------------------
+
+    def _compute_per_class(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        is_iid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute 1 - pAUC for each class via one-vs-rest decomposition.
+
+        Parameters
+        ----------
+        logits : torch.Tensor, shape [M, C]
+            Pooled logits (live batch + queue, ignore-index rows removed,
+            subsampling applied).
+        targets : torch.Tensor, shape [M]
+            Corresponding integer targets.
+        is_iid : torch.Tensor, shape [M], dtype=bool
+            Per-row iid-eligibility flag for FPR-band threshold estimation.
+
+        Returns
+        -------
+        loss_vec : torch.Tensor, shape [C]
+            Per-class loss values (1 - pAUC).
+        valid_vec : torch.Tensor, shape [C], dtype=bool
+            True for classes with positives, iid negatives, and (pairwise)
+            band negatives.
+        """
+        if self.num_classes == 1:
+            # Binary mode: warn on out-of-range targets
+            bad = targets[(targets != 0) & (targets != 1)]
+            if bad.numel() > 0:
+                warnings.warn(
+                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
+                    f"but found values: {bad[:8].tolist()}. "
+                    "Non-zero values are treated as positive.",
+                    UserWarning,
+                    stacklevel=4,
+                )
+            is_pos = targets.bool()
+            pauc, is_valid = self._compute_pauc(
+                logits[:, 0], is_pos, ~is_pos, is_iid
+            )
+            loss_vals = [1.0 - pauc]
+            valid_mask = [is_valid]
+        else:
+            loss_vals, valid_mask = [], []
+            for c in range(self.num_classes):
+                is_pos = targets == c
+                pauc, is_valid = self._compute_pauc(
+                    logits[:, c], is_pos, ~is_pos, is_iid
+                )
+                loss_vals.append(1.0 - pauc)
+                valid_mask.append(is_valid)
+
+        loss_vec = torch.stack(loss_vals)
+        valid_vec = torch.tensor(valid_mask, device=logits.device)
+        return loss_vec, valid_vec
