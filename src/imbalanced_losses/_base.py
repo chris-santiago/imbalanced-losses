@@ -186,6 +186,7 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
+        is_iid: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute loss and validity for each class.
@@ -197,6 +198,10 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
             removed, subsampling already applied).
         targets : torch.Tensor, shape [M]
             Corresponding integer targets.
+        is_iid : torch.Tensor, shape [M], dtype=bool
+            Per-row flag indicating whether the row is an iid sample
+            eligible for FPR threshold estimation (used by
+            ``PAUCAtBudgetLoss``; existing losses ignore it).
 
         Returns
         -------
@@ -231,6 +236,7 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
+        iid_mask: torch.Tensor | None = None,
         return_per_class: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -243,6 +249,12 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         targets : torch.Tensor, shape [N]
             Integer class labels.  Positions equal to ``ignore_index``
             are excluded from ranking.
+        iid_mask : torch.Tensor, shape [N], dtype=bool, optional
+            Per-row flag indicating which live-batch rows are iid-eligible
+            for FPR threshold estimation (used by ``PAUCAtBudgetLoss``).
+            ``None`` (default) treats all rows as iid, giving identical
+            behavior to passing an explicit all-True mask.  Must match
+            ``logits`` dim-0 when provided.
         return_per_class : bool, optional
             If True, also return per-class losses and a validity mask.
 
@@ -267,18 +279,41 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
             raise ValueError(
                 f"targets must be [N] matching logits, got {tuple(targets.shape)}"
             )
+        if iid_mask is not None and (
+            iid_mask.ndim != 1 or iid_mask.size(0) != logits.size(0)
+        ):
+            raise ValueError(
+                f"iid_mask must be [N] matching logits dim-0, "
+                f"got {tuple(iid_mask.shape)} vs N={logits.size(0)}"
+            )
+
+        # Materialise all-True iid_mask when None so downstream is uniform.
+        # Detached always — iid_mask is never differentiable.
+        if iid_mask is None:
+            live_iid: torch.Tensor = torch.ones(
+                logits.size(0), dtype=torch.bool, device=logits.device
+            )
+        else:
+            live_iid = iid_mask.detach().bool()
 
         # --- DDP gather ------------------------------------------------------
         if self._should_gather():
-            logits  = all_gather_with_grad(logits)
-            targets = all_gather_no_grad(targets)
+            logits   = all_gather_with_grad(logits)
+            targets  = all_gather_no_grad(targets)
+            # Gather iid_mask no-grad alongside targets.  Cast to uint8 for
+            # transport (bool support varies by backend) and cast back.
+            live_iid = all_gather_no_grad(live_iid.to(torch.uint8)).bool()
 
         # --- merge with queue ------------------------------------------------
-        all_logits, all_targets = self._queue.merge(logits, targets)
+        all_logits, all_targets, all_is_iid = self._queue.merge(
+            logits, targets, is_iid=live_iid, return_iid=True
+        )
 
         # --- filter ignore_index ---------------------------------------------
         valid = all_targets != self.ignore_index
-        all_logits, all_targets = all_logits[valid], all_targets[valid]
+        all_logits  = all_logits[valid]
+        all_targets = all_targets[valid]
+        all_is_iid  = all_is_iid[valid]
 
         # --- subsample if pool exceeds max_pool_size -------------------------
         if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
@@ -292,8 +327,8 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
                     stacklevel=2,
                 )
                 self._subsample_warned = True
-            all_logits, all_targets = subsample_pool(
-                all_logits, all_targets, self.max_pool_size
+            all_logits, all_targets, all_is_iid = subsample_pool(
+                all_logits, all_targets, self.max_pool_size, is_iid=all_is_iid
             )
 
         # --- empty pool check ------------------------------------------------
@@ -315,11 +350,11 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         self._validate_filtered_targets(all_targets)
 
         # --- per-class compute -----------------------------------------------
-        loss_vec, valid_vec = self._compute_per_class(all_logits, all_targets)
+        loss_vec, valid_vec = self._compute_per_class(all_logits, all_targets, all_is_iid)
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------
         if self._should_update_queue():
-            self._queue.enqueue(logits, targets)
+            self._queue.enqueue(logits, targets, is_iid=live_iid)
 
         # --- reduction -------------------------------------------------------
         if self.reduction == "none":

@@ -15,7 +15,8 @@ def subsample_pool(
     logits: torch.Tensor,
     targets: torch.Tensor,
     max_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    is_iid: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Minimum-quota subsample of a ranking pool to at most *max_size* rows.
 
@@ -41,11 +42,18 @@ def subsample_pool(
         Integer class labels corresponding to *logits*.
     max_size : int
         Maximum number of rows to return.  Must be positive.
+    is_iid : torch.Tensor, shape [M], dtype=bool, optional
+        Per-row iid flag.  When provided, the returned 3-tuple includes the
+        flag tensor indexed by the same selected rows as logits/targets.
+        When ``None`` (default), the existing 2-tuple is returned, keeping
+        backward compatibility with all existing callers.
 
     Returns
     -------
     logits_sub : torch.Tensor, shape [min(M, max_size), C]
     targets_sub : torch.Tensor, shape [min(M, max_size)]
+    is_iid_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
+        Only returned when *is_iid* is not ``None``.
 
     Notes
     -----
@@ -66,7 +74,9 @@ def subsample_pool(
     """
     m = logits.size(0)
     if m <= max_size:
-        return logits, targets
+        if is_iid is None:
+            return logits, targets
+        return logits, targets, is_iid
 
     device = targets.device
     classes, inverse = targets.unique(return_inverse=True)
@@ -98,4 +108,6 @@ def subsample_pool(
         extra_idx = remaining_idx[perm]
         final_idx = torch.cat([reserved_idx, extra_idx])
 
-    return logits[final_idx], targets[final_idx]
+    if is_iid is None:
+        return logits[final_idx], targets[final_idx]
+    return logits[final_idx], targets[final_idx], is_iid[final_idx]

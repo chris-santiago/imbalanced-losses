@@ -102,3 +102,76 @@ class TestSubsamplePool:
         assert logits.grad is not None
         # Only subsampled rows should have nonzero gradient.
         assert (logits.grad != 0).sum() == 50 * 4
+
+
+class TestSubsamplePoolIidAlignment:
+    """Tests for the optional is_iid parameter added for iid_mask plumbing."""
+
+    def test_noop_returns_two_tuple_when_no_iid(self):
+        """When is_iid is not provided and pool is small, 2-tuple is returned."""
+        logits, targets = _make_pool(32, 4)
+        result = subsample_pool(logits, targets, max_size=64)
+        assert isinstance(result, tuple) and len(result) == 2
+
+    def test_noop_returns_three_tuple_when_iid_provided_small_pool(self):
+        """When is_iid is provided and pool is small, 3-tuple is returned."""
+        logits, targets = _make_pool(32, 4)
+        is_iid = torch.ones(32, dtype=torch.bool)
+        result = subsample_pool(logits, targets, max_size=64, is_iid=is_iid)
+        assert isinstance(result, tuple) and len(result) == 3
+        l2, t2, iid2 = result
+        assert l2 is logits
+        assert t2 is targets
+        assert iid2 is is_iid
+
+    def test_iid_flags_aligned_with_selected_rows(self):
+        """is_iid[i] in output must match is_iid[orig_i] for the same original row."""
+        n, c = 200, 4
+        torch.manual_seed(42)
+        logits  = torch.arange(n * c, dtype=torch.float).reshape(n, c)
+        targets = torch.arange(n) % c
+        # Alternate True/False so we can verify alignment by original index.
+        is_iid  = torch.arange(n) % 2 == 0  # True for even rows
+
+        l2, t2, iid2 = subsample_pool(logits, targets, max_size=50, is_iid=is_iid)
+
+        assert l2.size(0) == 50
+        assert iid2.size(0) == 50
+        assert iid2.dtype == torch.bool
+
+        # Verify alignment: for each selected row, recover original index from
+        # logits (encoded as row_idx * c in column 0) and check flag matches.
+        for row in range(l2.size(0)):
+            orig_idx = int(l2[row, 0].item()) // c
+            assert iid2[row].item() == is_iid[orig_idx].item(), (
+                f"Row {row}: expected is_iid[{orig_idx}]={is_iid[orig_idx].item()}, "
+                f"got {iid2[row].item()}"
+            )
+
+    def test_all_true_iid_returns_all_true(self):
+        """An all-True iid mask should survive subsampling as all-True."""
+        logits, targets = _make_pool(200, 4, seed=1)
+        is_iid = torch.ones(200, dtype=torch.bool)
+        _, _, iid2 = subsample_pool(logits, targets, max_size=50, is_iid=is_iid)
+        assert iid2.all()
+
+    def test_all_false_iid_returns_all_false(self):
+        """An all-False iid mask should survive subsampling as all-False."""
+        logits, targets = _make_pool(200, 4, seed=2)
+        is_iid = torch.zeros(200, dtype=torch.bool)
+        _, _, iid2 = subsample_pool(logits, targets, max_size=50, is_iid=is_iid)
+        assert not iid2.any()
+
+    def test_iid_shape_matches_output_logits(self):
+        """Output is_iid must have same row count as output logits/targets."""
+        logits, targets = _make_pool(300, 5, seed=3)
+        is_iid = torch.randint(0, 2, (300,)).bool()
+        l2, t2, iid2 = subsample_pool(logits, targets, max_size=80, is_iid=is_iid)
+        assert iid2.shape == (l2.size(0),)
+        assert iid2.shape == t2.shape
+
+    def test_existing_callers_unaffected(self):
+        """Callers not passing is_iid must still receive a 2-tuple (no breakage)."""
+        logits, targets = _make_pool(200, 4, seed=4)
+        result = subsample_pool(logits, targets, max_size=50)
+        assert len(result) == 2

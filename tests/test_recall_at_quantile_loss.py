@@ -751,3 +751,110 @@ class TestMaxPoolSize:
         assert 0.0 <= loss.item() <= 1.0
         loss.backward()
         assert logits.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# iid_mask transport (Task 2 plumbing)
+# ---------------------------------------------------------------------------
+
+class TestIidMaskTransport:
+    """
+    Verify that the iid_mask parameter threads through forward correctly.
+
+    RecallAtQuantileLoss ignores is_iid in _compute_per_class; these tests
+    focus on the transport invariants, not pAUC-specific semantics.
+    """
+
+    Q = SANITY_Q
+
+    def test_explicit_all_true_mask_equals_none(self):
+        """Passing an all-True iid_mask must produce numerically identical loss to None."""
+        torch.manual_seed(20)
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        iid_mask = torch.ones(B, dtype=torch.bool)
+
+        loss_none = fn(logits, targets)
+        loss_iid  = fn(logits, targets, iid_mask=iid_mask)
+        assert torch.allclose(loss_none, loss_iid), (
+            f"Expected identical loss; got {loss_none.item()} vs {loss_iid.item()}"
+        )
+
+    def test_partial_iid_mask_runs_without_error(self):
+        """A partial iid_mask (some False) must not raise; loss must be finite."""
+        torch.manual_seed(21)
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        # Mark half the rows as non-iid.
+        iid_mask = torch.arange(B) % 2 == 0
+
+        loss = fn(logits, targets, iid_mask=iid_mask)
+        assert torch.isfinite(loss), f"Loss not finite: {loss.item()}"
+
+    def test_partial_iid_mask_recall_output_unchanged(self):
+        """
+        RecallAtQuantileLoss ignores is_iid in _compute_per_class, so the loss
+        value must equal the no-mask call (Recall doesn't use iid flags for
+        threshold estimation -- that's PAUCAtBudgetLoss behavior).
+        """
+        torch.manual_seed(22)
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        iid_mask = torch.arange(B) % 2 == 0
+
+        loss_no_mask = fn(logits, targets)
+        loss_masked  = fn(logits, targets, iid_mask=iid_mask)
+        assert torch.allclose(loss_no_mask, loss_masked), (
+            "RecallAtQuantileLoss must ignore is_iid; losses should be equal"
+        )
+
+    def test_iid_mask_wrong_shape_raises(self):
+        """A mask whose length doesn't match logits N must raise ValueError."""
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        bad_mask = torch.ones(B + 1, dtype=torch.bool)
+        with pytest.raises(ValueError, match="iid_mask"):
+            fn(logits, targets, iid_mask=bad_mask)
+
+    def test_gradient_flows_with_iid_mask(self):
+        """Gradient must flow to live logits when iid_mask is provided."""
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C, requires_grad=True)
+        targets = torch.randint(0, C, (B,))
+        iid_mask = torch.ones(B, dtype=torch.bool)
+
+        loss = fn(logits, targets, iid_mask=iid_mask)
+        loss.backward()
+        assert logits.grad is not None
+        assert logits.grad.abs().sum().item() > 0
+
+    def test_return_per_class_with_iid_mask(self):
+        """return_per_class=True should work alongside iid_mask."""
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=0)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        iid_mask = torch.ones(B, dtype=torch.bool)
+
+        result = fn(logits, targets, iid_mask=iid_mask, return_per_class=True)
+        assert isinstance(result, tuple) and len(result) == 3
+        loss, per_class, valid = result
+        assert per_class.shape == (C,)
+        assert valid.shape == (C,)
+
+    def test_iid_mask_with_queue_enqueues_and_transports(self):
+        """With a queue, iid_mask must flow through without error across calls."""
+        torch.manual_seed(23)
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=self.Q, queue_size=32)
+        logits  = torch.randn(B, C)
+        targets = torch.randint(0, C, (B,))
+        iid_mask = torch.ones(B, dtype=torch.bool)
+
+        # First call primes the queue.
+        fn(logits, targets, iid_mask=iid_mask)
+        # Second call merges live batch with queued rows.
+        loss2 = fn(logits, targets, iid_mask=iid_mask)
+        assert torch.isfinite(loss2)
