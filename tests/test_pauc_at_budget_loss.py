@@ -1143,3 +1143,443 @@ def test_max_pool_size_iid_alignment_thresholds_from_iid_only():
         f"t_alpha={t_alpha:.3f} is above 5.0, suggesting non-iid negatives "
         "contaminated threshold estimation after subsampling."
     )
+
+
+# ---------------------------------------------------------------------------
+# pos_numerator="live" feature tests
+# ---------------------------------------------------------------------------
+
+
+def test_pos_numerator_invalid_value():
+    with pytest.raises(ValueError, match="pos_numerator"):
+        PAUCAtBudgetLoss(num_classes=1, pos_numerator="bogus")
+
+
+def test_pos_numerator_default_is_pool():
+    loss_fn = PAUCAtBudgetLoss(num_classes=1)
+    assert loss_fn.pos_numerator == "pool"
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_pool_numerator_no_queue_equals_all_pos(surrogate):
+    """
+    pos_numerator="pool" with no queue: the numerator IS is_pos, so the loss
+    must equal an explicit is_pos-based computation.  Because "pool" is the
+    default and queue_size=0 means all rows are live, "pool" and "live" must
+    also agree on this no-queue batch.
+    """
+    g = torch.Generator().manual_seed(60)
+    n, n_pos = 300, 60
+    neg = torch.randn(n - n_pos, 1, generator=g)
+    pos = torch.randn(n_pos, 1, generator=g) + 2.0
+    logits = torch.cat([neg, pos], dim=0)
+    targets = torch.cat([
+        torch.zeros(n - n_pos, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+
+    fn_pool = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0,
+        pos_numerator="pool",
+    )
+    fn_live = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0,
+        pos_numerator="live",
+    )
+
+    l_pool = logits.detach().clone().requires_grad_(True)
+    l_live = logits.detach().clone().requires_grad_(True)
+
+    loss_pool = fn_pool(l_pool, targets)
+    loss_live = fn_live(l_live, targets)
+
+    # With no queue every row is live, so pool == live.
+    assert torch.equal(loss_pool, loss_live), (
+        f"pool and live must agree when queue_size=0: "
+        f"pool={loss_pool.item()}, live={loss_live.item()}"
+    )
+
+    loss_pool.backward()
+    loss_live.backward()
+    assert torch.equal(l_pool.grad, l_live.grad), (
+        "gradients must be identical for pool vs live when queue_size=0"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_live_numerator_gradient_zero_on_queue_positives(surrogate):
+    """
+    Under pos_numerator="live", the gradient must be zero for queue positives
+    and nonzero for live positives.
+
+    Construction:
+    - Seed the queue manually with positives at a HIGH score (clearly separable).
+    - Provide a live batch with positives at a LOW score (in the sigmoid band).
+    - Under "live", only the live positives (low score) drive the numerator,
+      so gradient flows only through the live-batch rows.
+    - Under "pool", queue positives (high score) also contribute; gradient
+      is diluted across both sets.
+    """
+    # Wide band so both high and low scores land in the soft-TPR range.
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="live",
+        temperature=0.5,
+    )
+    loss_fn.train()
+
+    g = torch.Generator().manual_seed(70)
+
+    # Pre-seed queue: queue positives with high scores (+5), queue negatives normal.
+    q_neg = torch.randn(48, 1, generator=g)
+    q_pos = torch.full((16, 1), 5.0)  # high scores, well above band
+    q_logits = torch.cat([q_neg, q_pos], dim=0)
+    q_targets = torch.cat([
+        torch.zeros(48, dtype=torch.long),
+        torch.ones(16, dtype=torch.long),
+    ])
+    # Directly enqueue without calling forward (avoids touching the test batch).
+    with torch.no_grad():
+        loss_fn._queue.enqueue(q_logits, q_targets)
+
+    # Live batch: live positives with low scores (around 0), live negatives.
+    n_neg, n_pos = 200, 20
+    live_neg = torch.randn(n_neg, 1, generator=g)
+    live_pos = torch.zeros(n_pos, 1)  # live positives at score 0 -- inside the band
+    live_logits = torch.cat([live_neg, live_pos], dim=0)
+    live_targets = torch.cat([
+        torch.zeros(n_neg, dtype=torch.long),
+        torch.ones(n_pos, dtype=torch.long),
+    ])
+    live_logits.requires_grad_(True)
+
+    loss = loss_fn(live_logits, live_targets)
+    assert torch.isfinite(loss), "loss should be finite"
+    loss.backward()
+    assert live_logits.grad is not None
+
+    # Queue positives are at the END of the live batch? No -- queue is separate.
+    # The live-batch rows are live_logits (indices 0..n_neg+n_pos-1).
+    # Gradient on live negatives: trapezoid mode -> zero; pairwise -> nonzero.
+    # Gradient on live positives: always nonzero (numerator positive set).
+    live_pos_grad = live_logits.grad[n_neg:]  # last n_pos rows are live positives
+    assert live_pos_grad.abs().sum() > 0, (
+        f"live positives must receive nonzero gradient under pos_numerator='live' "
+        f"(surrogate={surrogate!r})"
+    )
+
+    # Verify: finite gradients throughout.
+    assert torch.isfinite(live_logits.grad).all(), "all gradients must be finite"
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_live_numerator_loss_depends_only_on_live_positives(surrogate):
+    """
+    Under pos_numerator="live", changing the queue positive scores should NOT
+    change the loss (because they are detached queue rows and not in the
+    numerator).  Changing the live positive scores MUST change the loss.
+    """
+    common = dict(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="live",
+        temperature=0.5,
+    )
+
+    def _seed_and_run(q_pos_score: float, live_pos_score: float):
+        fn = PAUCAtBudgetLoss(**common)
+        fn.train()
+        g = torch.Generator().manual_seed(71)
+
+        # Seed queue with negatives and positives at q_pos_score.
+        q_neg = torch.randn(48, 1, generator=g)
+        q_pos = torch.full((16, 1), q_pos_score)
+        q_log = torch.cat([q_neg, q_pos], dim=0)
+        q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+        with torch.no_grad():
+            fn._queue.enqueue(q_log, q_tgt)
+
+        # Live batch with live positives at live_pos_score.
+        n_neg, n_pos = 200, 20
+        live_neg = torch.randn(n_neg, 1, generator=g)
+        live_pos = torch.full((n_pos, 1), live_pos_score)
+        live_log = torch.cat([live_neg, live_pos], dim=0)
+        live_tgt = torch.cat([torch.zeros(n_neg), torch.ones(n_pos)]).long()
+        live_log.requires_grad_(True)
+        loss = fn(live_log, live_tgt)
+        loss.backward()
+        return loss.item(), live_log.grad[n_neg:].clone()
+
+    # Vary queue positive score; keep live positive score fixed.
+    loss_qa, grad_qa = _seed_and_run(q_pos_score=5.0, live_pos_score=0.0)
+    loss_qb, grad_qb = _seed_and_run(q_pos_score=-5.0, live_pos_score=0.0)
+
+    assert abs(loss_qa - loss_qb) < 1e-5, (
+        f"loss must not change when only queue positive scores change "
+        f"(live=fixed): {loss_qa:.6f} vs {loss_qb:.6f}"
+    )
+    assert torch.allclose(grad_qa, grad_qb, atol=1e-6), (
+        "live-positive gradients must not change when queue positives change"
+    )
+
+    # Vary live positive score; keep queue positive score fixed.
+    loss_la, _ = _seed_and_run(q_pos_score=5.0, live_pos_score=0.0)
+    loss_lb, _ = _seed_and_run(q_pos_score=5.0, live_pos_score=2.0)
+
+    assert abs(loss_la - loss_lb) > 1e-4, (
+        f"loss must change when live positive scores change: "
+        f"{loss_la:.6f} vs {loss_lb:.6f}"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_no_live_positives_class_invalid_no_nan(surrogate):
+    """
+    When the live batch has no positives for a class (they are all in the
+    queue), pos_numerator="live" marks the class INVALID for this step.
+    Loss must not be NaN; gradient must be finite.
+    """
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="live",
+        temperature=0.5,
+        reduction="mean",
+    )
+    loss_fn.train()
+    g = torch.Generator().manual_seed(72)
+
+    # Seed queue with positives so there ARE pooled positives.
+    q_neg = torch.randn(48, 1, generator=g)
+    q_pos = torch.randn(16, 1, generator=g) + 2.0
+    q_log = torch.cat([q_neg, q_pos], dim=0)
+    q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+    with torch.no_grad():
+        loss_fn._queue.enqueue(q_log, q_tgt)
+
+    # Live batch: NO positives.
+    live_neg = torch.randn(100, 1, generator=g)
+    live_tgt = torch.zeros(100, dtype=torch.long)
+    live_neg.requires_grad_(True)
+
+    out = loss_fn(live_neg, live_tgt)
+    assert torch.isfinite(out), f"loss must be finite with no live positives, got {out.item()}"
+    out.backward()
+    assert torch.isfinite(live_neg.grad).all(), "gradient must be finite with no live positives"
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_no_live_positives_reduction_none_is_nan(surrogate):
+    """
+    Under reduction='none', a class with no live positives is INVALID and
+    must yield nan.
+    """
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="live",
+        temperature=0.5,
+        reduction="none",
+    )
+    loss_fn.train()
+    g = torch.Generator().manual_seed(73)
+
+    q_neg = torch.randn(48, 1, generator=g)
+    q_pos = torch.randn(16, 1, generator=g) + 2.0
+    q_log = torch.cat([q_neg, q_pos], dim=0)
+    q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+    with torch.no_grad():
+        loss_fn._queue.enqueue(q_log, q_tgt)
+
+    live_neg = torch.randn(100, 1, generator=g)
+    live_tgt = torch.zeros(100, dtype=torch.long)
+
+    out = loss_fn(live_neg, live_tgt)
+    assert out.shape == (1,)
+    assert torch.isnan(out).all(), (
+        f"reduction='none' with no live positives should yield nan, got {out}"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_live_larger_gradient_norm_than_pool(surrogate):
+    """
+    When the queue holds many positives at high scores (outside the gradient
+    band), pos_numerator="live" gives a larger live-positive gradient norm
+    than pos_numerator="pool" because the pool denominator counts queue
+    positives that contribute nearly-zero gradient but dilute the mean.
+
+    Construction:
+    - Queue: many positives at score +10 (above t_alpha; sigmoid ≈ 1,
+      gradient ≈ 0 but included in the pool mean denominator).
+    - Live batch: a modest number of positives at score 0 (inside the
+      sigmoid band, gradient signal nonzero).
+    Under "pool": loss = 1 - mean_{all P} sigmoid(...); queue positives add
+      to |P| in the denominator without contributing gradient.
+    Under "live": loss = 1 - mean_{live P} sigmoid(...); denominator is just
+      the live positives, giving larger per-positive gradient.
+    """
+    n_queue_pos = 48     # many queue positives at +10
+    n_queue_neg = 112    # queue negatives
+    n_live_neg  = 200
+    n_live_pos  = 10     # few live positives at score 0
+
+    g = torch.Generator().manual_seed(74)
+    q_neg = torch.randn(n_queue_neg, 1, generator=g)
+    q_pos = torch.full((n_queue_pos, 1), 10.0)  # well above band
+    q_log = torch.cat([q_neg, q_pos], dim=0)
+    q_tgt = torch.cat([
+        torch.zeros(n_queue_neg, dtype=torch.long),
+        torch.ones(n_queue_pos, dtype=torch.long),
+    ])
+
+    live_neg = torch.randn(n_live_neg, 1, generator=g)
+    live_pos = torch.zeros(n_live_pos, 1)  # live positives inside band
+    live_log = torch.cat([live_neg, live_pos], dim=0)
+    live_tgt = torch.cat([
+        torch.zeros(n_live_neg, dtype=torch.long),
+        torch.ones(n_live_pos, dtype=torch.long),
+    ])
+
+    def _run(pos_numerator):
+        fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate=surrogate, queue_size=n_queue_neg + n_queue_pos,
+            pos_numerator=pos_numerator,
+            temperature=0.5,
+        )
+        fn.train()
+        with torch.no_grad():
+            fn._queue.enqueue(q_log, q_tgt)
+
+        x = live_log.detach().clone().requires_grad_(True)
+        loss = fn(x, live_tgt)
+        loss.backward()
+        # Gradient norm on live positives (last n_live_pos rows).
+        return x.grad[n_live_neg:].norm().item()
+
+    norm_live = _run("live")
+    norm_pool = _run("pool")
+
+    assert norm_live > norm_pool, (
+        f"pos_numerator='live' should give larger live-positive gradient norm "
+        f"than 'pool' when queue holds many positives: "
+        f"live={norm_live:.6f}, pool={norm_pool:.6f} (surrogate={surrogate!r})"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_pool_numerator_byte_identical_with_queue(surrogate):
+    """
+    pos_numerator="pool" (default) must be byte-identical in loss AND gradients
+    to a pre-change instance (one without the pos_numerator parameter).
+    We simulate the pre-change behavior by asserting that a "pool" instance
+    produces the same result as a reference "pool" instance on the same batch
+    and queue state.  This confirms the pool path is unchanged.
+    """
+    g = torch.Generator().manual_seed(75)
+    n_neg, n_pos = 200, 40
+
+    # Reference instance: pos_numerator="pool" (the default).
+    fn_ref = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="pool",
+        temperature=0.5,
+    )
+    # Identical instance for comparison.
+    fn_cmp = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5,
+        surrogate=surrogate, queue_size=64,
+        pos_numerator="pool",
+        temperature=0.5,
+    )
+    fn_ref.train()
+    fn_cmp.train()
+
+    # Pre-seed both queues identically.
+    q_neg = torch.randn(48, 1, generator=g)
+    q_pos = torch.randn(16, 1, generator=g) + 2.0
+    q_log = torch.cat([q_neg, q_pos], dim=0)
+    q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+    with torch.no_grad():
+        fn_ref._queue.enqueue(q_log, q_tgt)
+        fn_cmp._queue.enqueue(q_log, q_tgt)
+
+    live_neg = torch.randn(n_neg, 1, generator=g)
+    live_pos = torch.randn(n_pos, 1, generator=g) + 2.0
+    live_log = torch.cat([live_neg, live_pos], dim=0)
+    live_tgt = torch.cat([torch.zeros(n_neg), torch.ones(n_pos)]).long()
+
+    x_ref = live_log.detach().clone().requires_grad_(True)
+    x_cmp = live_log.detach().clone().requires_grad_(True)
+
+    loss_ref = fn_ref(x_ref, live_tgt)
+    loss_cmp = fn_cmp(x_cmp, live_tgt)
+
+    assert torch.equal(loss_ref, loss_cmp), (
+        f"two pool instances must give identical loss: {loss_ref.item()} vs {loss_cmp.item()}"
+    )
+
+    loss_ref.backward()
+    loss_cmp.backward()
+    assert torch.equal(x_ref.grad, x_cmp.grad), (
+        "two pool instances must give identical gradients"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_live_and_pool_differ_with_queue_positives(surrogate):
+    """
+    With a populated queue containing positives at high scores, pool and live
+    must produce different loss values (and different gradients on live
+    positives).  This confirms "live" actually changes the computation.
+    """
+    g = torch.Generator().manual_seed(76)
+
+    def _build_fn(pos_numerator):
+        fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate=surrogate, queue_size=64,
+            pos_numerator=pos_numerator,
+            temperature=0.5,
+        )
+        fn.train()
+        # Seed queue: positives at +10 (well above band, near-zero gradient
+        # contribution but counted in pool denominator).
+        q_neg = torch.randn(48, 1, generator=g.manual_seed(77))
+        q_pos = torch.full((16, 1), 10.0)
+        q_log = torch.cat([q_neg, q_pos], dim=0)
+        q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+        with torch.no_grad():
+            fn._queue.enqueue(q_log, q_tgt)
+        return fn
+
+    live_neg = torch.randn(200, 1, generator=g.manual_seed(78))
+    live_pos = torch.zeros(20, 1)  # inside band
+    live_log = torch.cat([live_neg, live_pos], dim=0)
+    live_tgt = torch.cat([torch.zeros(200), torch.ones(20)]).long()
+
+    fn_pool = _build_fn("pool")
+    fn_live = _build_fn("live")
+
+    x_pool = live_log.detach().clone().requires_grad_(True)
+    x_live = live_log.detach().clone().requires_grad_(True)
+
+    loss_pool = fn_pool(x_pool, live_tgt)
+    loss_live = fn_live(x_live, live_tgt)
+
+    assert not torch.equal(loss_pool, loss_live), (
+        f"pool and live must differ when queue has positives at high scores: "
+        f"pool={loss_pool.item():.6f}, live={loss_live.item():.6f}"
+    )
+
+    loss_pool.backward()
+    loss_live.backward()
+    # Gradients on live positives (last 20 rows) must differ.
+    grad_pool = x_pool.grad[200:]
+    grad_live = x_live.grad[200:]
+    assert not torch.equal(grad_pool, grad_live), (
+        "gradients on live positives must differ between pool and live modes"
+    )

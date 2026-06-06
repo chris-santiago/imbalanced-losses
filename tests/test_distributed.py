@@ -702,3 +702,177 @@ class TestPAUCGatherDistributed:
             num_classes=1, alpha=0.1, beta=0.5, queue_size=0, gather_distributed=False
         )
         assert torch.allclose(fn_auto(logits, targets), fn_off(logits, targets))
+
+
+# ---------------------------------------------------------------------------
+# is_live plumbing under mocked DDP gather (pos_numerator="live")
+#
+# Verifies that after a mocked multi-rank gather:
+#   - All gathered live rows (from both ranks) have is_live=True.
+#   - Queue rows (appended post-gather by the merge) have is_live=False.
+#   - The loss runs and backward flows correctly.
+# ---------------------------------------------------------------------------
+
+
+class TestPAUCIsLiveDistributed:
+    """
+    Verify that is_live is correctly built post-gather:
+    all gathered rows are live (is_live=True), queue rows are not.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    def _build_two_rank_data(self, seed=300):
+        """
+        Two-rank setup: each rank has 20 rows with some positives and negatives.
+        """
+        g = torch.Generator().manual_seed(seed)
+        r0_neg = torch.rand(16, 1, generator=g) * 2.0 - 1.0
+        r0_pos = torch.randn(4, 1, generator=g) + 3.0
+        r0_l = torch.cat([r0_neg, r0_pos], dim=0)
+        r0_t = torch.cat([torch.zeros(16, dtype=torch.long), torch.ones(4, dtype=torch.long)])
+        r0_iid = torch.ones(20, dtype=torch.bool)
+
+        r1_neg = torch.rand(16, 1, generator=g) * 2.0 - 1.0
+        r1_pos = torch.randn(4, 1, generator=g) + 3.0
+        r1_l = torch.cat([r1_neg, r1_pos], dim=0)
+        r1_t = torch.cat([torch.zeros(16, dtype=torch.long), torch.ones(4, dtype=torch.long)])
+        r1_iid = torch.ones(20, dtype=torch.bool)
+
+        return (r0_l, r0_t, r0_iid), (r1_l, r1_t, r1_iid)
+
+    def test_is_live_all_true_for_gathered_rows_no_queue(self):
+        """
+        With queue_size=0, all rows in the pool come from the gather (live).
+        pos_numerator='live' must agree with 'pool' since every row is live.
+        Both must run forward/backward cleanly.
+        """
+        from unittest.mock import patch
+
+        (r0_l, r0_t, r0_iid), (r1_l, r1_t, r1_iid) = self._build_two_rank_data()
+        local_rank = 0
+        mock = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+
+        fn_pool = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate="trapezoid", queue_size=0,
+            gather_distributed=True,
+            pos_numerator="pool",
+        )
+        fn_live = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate="trapezoid", queue_size=0,
+            gather_distributed=True,
+            pos_numerator="live",
+        )
+        fn_pool._gather_resolved = True
+        fn_live._gather_resolved = True
+
+        r0_l_p = r0_l.detach().requires_grad_(True)
+        r0_l_lv = r0_l.detach().requires_grad_(True)
+
+        # Two forwards need two separate mock call sequences.
+        mock_pool = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+        mock_live = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock_pool):
+            loss_pool = fn_pool(r0_l_p, r0_t, iid_mask=r0_iid)
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock_live):
+            loss_live = fn_live(r0_l_lv, r0_t, iid_mask=r0_iid)
+
+        assert torch.isfinite(loss_pool), "pool loss must be finite"
+        assert torch.isfinite(loss_live), "live loss must be finite"
+
+        # With no queue every row is live: pool and live must agree.
+        assert torch.equal(loss_pool, loss_live), (
+            f"pool={loss_pool.item():.6f} and live={loss_live.item():.6f} "
+            "must be equal when queue_size=0 (all rows are live)"
+        )
+
+        loss_pool.backward()
+        loss_live.backward()
+        assert r0_l_p.grad is not None and torch.isfinite(r0_l_p.grad).all()
+        assert r0_l_lv.grad is not None and torch.isfinite(r0_l_lv.grad).all()
+
+    def test_is_live_false_for_queue_rows_with_populated_queue(self):
+        """
+        With a populated queue, gathered rows are live and queue rows are not.
+        Under pos_numerator='live', queue positives (enqueued before this step)
+        must NOT be in the numerator: the loss must differ from 'pool'.
+
+        This verifies the is_live plumbing is correct post-merge.
+        """
+        from unittest.mock import patch
+
+        g = torch.Generator().manual_seed(301)
+
+        (r0_l, r0_t, r0_iid), (r1_l, r1_t, r1_iid) = self._build_two_rank_data(seed=302)
+
+        # Pre-seed the queue with positives at HIGH scores (+10) -- these are
+        # queue positives that should be excluded from the numerator under "live".
+        q_neg = torch.randn(48, 1, generator=g)
+        q_pos = torch.full((16, 1), 10.0)
+        q_log = torch.cat([q_neg, q_pos], dim=0)
+        q_tgt = torch.cat([torch.zeros(48), torch.ones(16)]).long()
+
+        fn_pool = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate="trapezoid", queue_size=64,
+            gather_distributed=True,
+            pos_numerator="pool",
+            temperature=0.5,
+        )
+        fn_live = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5,
+            surrogate="trapezoid", queue_size=64,
+            gather_distributed=True,
+            pos_numerator="live",
+            temperature=0.5,
+        )
+        fn_pool._gather_resolved = True
+        fn_live._gather_resolved = True
+
+        with torch.no_grad():
+            fn_pool._queue.enqueue(q_log, q_tgt)
+            fn_live._queue.enqueue(q_log, q_tgt)
+
+        mock_pool = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+        mock_live = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+
+        local_rank = 0
+        r0_l_p  = r0_l.detach().requires_grad_(True)
+        r0_l_lv = r0_l.detach().requires_grad_(True)
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock_pool):
+            loss_pool = fn_pool(r0_l_p, r0_t, iid_mask=r0_iid)
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=local_rank), \
+             patch.object(dist, "all_gather", side_effect=mock_live):
+            loss_live = fn_live(r0_l_lv, r0_t, iid_mask=r0_iid)
+
+        assert torch.isfinite(loss_pool), "pool loss must be finite"
+        assert torch.isfinite(loss_live), "live loss must be finite"
+
+        loss_pool.backward()
+        loss_live.backward()
+        assert r0_l_p.grad is not None and torch.isfinite(r0_l_p.grad).all()
+        assert r0_l_lv.grad is not None and torch.isfinite(r0_l_lv.grad).all()
+
+        # With queue positives at +10 (above band), live restricts numerator
+        # to gathered positives only.  Losses MUST differ.
+        assert not torch.equal(loss_pool, loss_live), (
+            "pool and live must differ when queue holds high-score positives: "
+            f"pool={loss_pool.item():.6f}, live={loss_live.item():.6f}"
+        )

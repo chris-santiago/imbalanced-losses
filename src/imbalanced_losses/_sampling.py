@@ -16,6 +16,7 @@ def subsample_pool(
     targets: torch.Tensor,
     max_size: int,
     is_iid: torch.Tensor | None = None,
+    is_live: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Minimum-quota subsample of a ranking pool to at most *max_size* rows.
@@ -47,6 +48,11 @@ def subsample_pool(
         flag tensor indexed by the same selected rows as logits/targets.
         When ``None`` (default), the existing 2-tuple is returned, keeping
         backward compatibility with all existing callers.
+    is_live : torch.Tensor, shape [M], dtype=bool, optional
+        Per-row live-batch flag (True = live-batch row, False = queue row).
+        When provided alongside *is_iid*, it is indexed by the same selected
+        rows and returned as the fourth element.  When ``None`` (default),
+        it does not affect the return arity.
 
     Returns
     -------
@@ -54,6 +60,9 @@ def subsample_pool(
     targets_sub : torch.Tensor, shape [min(M, max_size)]
     is_iid_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
         Only returned when *is_iid* is not ``None``.
+    is_live_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
+        Only returned when *is_live* is not ``None``.  Always follows
+        *is_iid_sub* in position.
 
     Notes
     -----
@@ -76,7 +85,9 @@ def subsample_pool(
     if m <= max_size:
         if is_iid is None:
             return logits, targets
-        return logits, targets, is_iid
+        if is_live is None:
+            return logits, targets, is_iid
+        return logits, targets, is_iid, is_live
 
     device = targets.device
     classes, inverse = targets.unique(return_inverse=True)
@@ -110,4 +121,6 @@ def subsample_pool(
 
     if is_iid is None:
         return logits[final_idx], targets[final_idx]
-    return logits[final_idx], targets[final_idx], is_iid[final_idx]
+    if is_live is None:
+        return logits[final_idx], targets[final_idx], is_iid[final_idx]
+    return logits[final_idx], targets[final_idx], is_iid[final_idx], is_live[final_idx]

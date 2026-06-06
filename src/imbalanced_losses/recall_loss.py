@@ -295,6 +295,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
         is_iid: torch.Tensor,
+        is_live: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - recall for each class via one-vs-rest decomposition.
@@ -309,6 +310,8 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         is_iid : torch.Tensor, shape [M], dtype=bool
             Per-row iid flag (transported for ``PAUCAtBudgetLoss``);
             not used by Recall-at-Quantile.
+        is_live : torch.Tensor, shape [M], dtype=bool
+            Per-row live-batch flag; not used by Recall-at-Quantile.
 
         Returns
         -------

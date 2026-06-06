@@ -187,6 +187,7 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         logits: torch.Tensor,
         targets: torch.Tensor,
         is_iid: torch.Tensor,
+        is_live: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute loss and validity for each class.
@@ -202,6 +203,11 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
             Per-row flag indicating whether the row is an iid sample
             eligible for FPR threshold estimation (used by
             ``PAUCAtBudgetLoss``; existing losses ignore it).
+        is_live : torch.Tensor, shape [M], dtype=bool
+            Per-row flag indicating whether the row came from the live
+            batch (True) or the memory queue (False).  Used by
+            ``PAUCAtBudgetLoss`` when ``pos_numerator="live"``; existing
+            losses accept and ignore it.
 
         Returns
         -------
@@ -304,16 +310,31 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
             # transport (bool support varies by backend) and cast back.
             live_iid = all_gather_no_grad(live_iid.to(torch.uint8)).bool()
 
+        # --- build is_live before merge (N_live = post-gather live-batch size) -
+        # The merge places live rows first, so is_live is True for the first
+        # N_live rows and False for all queue rows.  Built no-grad here; never
+        # enters autograd.
+        n_live = logits.size(0)
+
         # --- merge with queue ------------------------------------------------
         all_logits, all_targets, all_is_iid = self._queue.merge(
             logits, targets, is_iid=live_iid, return_iid=True
         )
+
+        # is_live: True for the N_live live rows (placed first by merge), False
+        # for queue rows.  Aligned row-for-row with all_logits/all_targets.
+        with torch.no_grad():
+            all_is_live = torch.cat([
+                torch.ones(n_live, dtype=torch.bool, device=logits.device),
+                torch.zeros(all_logits.size(0) - n_live, dtype=torch.bool, device=logits.device),
+            ])
 
         # --- filter ignore_index ---------------------------------------------
         valid = all_targets != self.ignore_index
         all_logits  = all_logits[valid]
         all_targets = all_targets[valid]
         all_is_iid  = all_is_iid[valid]
+        all_is_live = all_is_live[valid]
 
         # --- subsample if pool exceeds max_pool_size -------------------------
         if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
@@ -327,8 +348,9 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
                     stacklevel=2,
                 )
                 self._subsample_warned = True
-            all_logits, all_targets, all_is_iid = subsample_pool(
-                all_logits, all_targets, self.max_pool_size, is_iid=all_is_iid
+            all_logits, all_targets, all_is_iid, all_is_live = subsample_pool(
+                all_logits, all_targets, self.max_pool_size,
+                is_iid=all_is_iid, is_live=all_is_live,
             )
 
         # --- empty pool check ------------------------------------------------
@@ -350,7 +372,9 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         self._validate_filtered_targets(all_targets)
 
         # --- per-class compute -----------------------------------------------
-        loss_vec, valid_vec = self._compute_per_class(all_logits, all_targets, all_is_iid)
+        loss_vec, valid_vec = self._compute_per_class(
+            all_logits, all_targets, all_is_iid, all_is_live
+        )
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------
         if self._should_update_queue():

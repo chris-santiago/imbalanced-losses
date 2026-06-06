@@ -175,3 +175,115 @@ class TestSubsamplePoolIidAlignment:
         logits, targets = _make_pool(200, 4, seed=4)
         result = subsample_pool(logits, targets, max_size=50)
         assert len(result) == 2
+
+
+class TestSubsamplePoolIsLiveAlignment:
+    """Tests for the optional is_live parameter (pos_numerator='live' feature)."""
+
+    def test_noop_returns_four_tuple_when_both_flags_provided_small_pool(self):
+        """When pool <= max_size with both flags, 4-tuple is returned."""
+        logits, targets = _make_pool(32, 4)
+        is_iid  = torch.ones(32, dtype=torch.bool)
+        is_live = torch.ones(32, dtype=torch.bool)
+        result = subsample_pool(logits, targets, max_size=64, is_iid=is_iid, is_live=is_live)
+        assert isinstance(result, tuple) and len(result) == 4
+        l2, t2, iid2, live2 = result
+        assert l2 is logits
+        assert t2 is targets
+        assert iid2 is is_iid
+        assert live2 is is_live
+
+    def test_is_live_aligned_with_selected_rows(self):
+        """
+        is_live[i] in output must match is_live[orig_i] for the same original row.
+        Encode the row index in logits[:, 0] to recover orig_idx and verify.
+        """
+        n, c = 200, 4
+        torch.manual_seed(80)
+        logits  = torch.arange(n * c, dtype=torch.float).reshape(n, c)
+        targets = torch.arange(n) % c
+        is_iid  = torch.arange(n) % 2 == 0    # True for even rows
+        # is_live: True for first 100 rows (live), False for last 100 (queue).
+        is_live = torch.arange(n) < 100
+
+        l2, t2, iid2, live2 = subsample_pool(
+            logits, targets, max_size=50, is_iid=is_iid, is_live=is_live
+        )
+
+        assert l2.size(0) == 50
+        assert live2.size(0) == 50
+        assert live2.dtype == torch.bool
+
+        for row in range(l2.size(0)):
+            orig_idx = int(l2[row, 0].item()) // c
+            assert live2[row].item() == is_live[orig_idx].item(), (
+                f"Row {row}: expected is_live[{orig_idx}]={is_live[orig_idx].item()}, "
+                f"got {live2[row].item()}"
+            )
+
+    def test_all_live_rows_survive_as_all_true(self):
+        """An all-True is_live mask should survive subsampling as all-True."""
+        logits, targets = _make_pool(200, 4, seed=5)
+        is_iid  = torch.ones(200, dtype=torch.bool)
+        is_live = torch.ones(200, dtype=torch.bool)
+        _, _, _, live2 = subsample_pool(
+            logits, targets, max_size=50, is_iid=is_iid, is_live=is_live
+        )
+        assert live2.all()
+
+    def test_all_queue_rows_survive_as_all_false(self):
+        """An all-False is_live mask should survive subsampling as all-False."""
+        logits, targets = _make_pool(200, 4, seed=6)
+        is_iid  = torch.ones(200, dtype=torch.bool)
+        is_live = torch.zeros(200, dtype=torch.bool)
+        _, _, _, live2 = subsample_pool(
+            logits, targets, max_size=50, is_iid=is_iid, is_live=is_live
+        )
+        assert not live2.any()
+
+    def test_is_live_shape_matches_output_logits(self):
+        """Output is_live must have same row count as output logits/targets."""
+        logits, targets = _make_pool(300, 5, seed=7)
+        is_iid  = torch.randint(0, 2, (300,)).bool()
+        is_live = torch.randint(0, 2, (300,)).bool()
+        l2, t2, iid2, live2 = subsample_pool(
+            logits, targets, max_size=80, is_iid=is_iid, is_live=is_live
+        )
+        assert live2.shape == (l2.size(0),)
+        assert live2.shape == t2.shape
+
+    def test_is_live_without_is_iid_is_not_supported_by_signature(self):
+        """
+        is_live is only threaded when is_iid is also provided (both are
+        present in the base forward; the API doesn't support is_live alone).
+        This test confirms no regression: without is_iid we still get a 2-tuple.
+        """
+        logits, targets = _make_pool(200, 4, seed=8)
+        result = subsample_pool(logits, targets, max_size=50)
+        assert len(result) == 2
+
+    def test_is_live_iid_both_flags_alignment_independent(self):
+        """
+        Both is_iid and is_live are returned indexed by the same final_idx,
+        so they remain mutually aligned.  Encode both in logits and verify.
+        """
+        n, c = 200, 4
+        torch.manual_seed(81)
+        logits  = torch.arange(n * c, dtype=torch.float).reshape(n, c)
+        targets = torch.arange(n) % c
+        # is_iid: True for rows 0..99; is_live: True for rows 50..149.
+        is_iid  = torch.arange(n) < 100
+        is_live = (torch.arange(n) >= 50) & (torch.arange(n) < 150)
+
+        l2, t2, iid2, live2 = subsample_pool(
+            logits, targets, max_size=50, is_iid=is_iid, is_live=is_live
+        )
+
+        for row in range(l2.size(0)):
+            orig_idx = int(l2[row, 0].item()) // c
+            assert iid2[row].item()  == is_iid[orig_idx].item(),  (
+                f"is_iid misaligned at row {row} (orig_idx={orig_idx})"
+            )
+            assert live2[row].item() == is_live[orig_idx].item(), (
+                f"is_live misaligned at row {row} (orig_idx={orig_idx})"
+            )

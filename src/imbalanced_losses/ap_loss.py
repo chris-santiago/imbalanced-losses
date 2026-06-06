@@ -264,6 +264,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
         is_iid: torch.Tensor,
+        is_live: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - AP for each class via one-vs-rest decomposition.
@@ -278,6 +279,8 @@ class SmoothAPLoss(_QueuedRankingLoss):
         is_iid : torch.Tensor, shape [M], dtype=bool
             Per-row iid flag (transported for ``PAUCAtBudgetLoss``);
             not used by Smooth-AP.
+        is_live : torch.Tensor, shape [M], dtype=bool
+            Per-row live-batch flag; not used by Smooth-AP.
 
         Returns
         -------

@@ -188,6 +188,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     _VALID_INTERPOLATIONS = ("linear", "lower", "higher", "nearest", "midpoint")
     _VALID_SURROGATES = ("trapezoid", "pairwise")
     _VALID_TAU_SCALES = ("iqr", "band")
+    _VALID_POS_NUMERATORS = ("pool", "live")
 
     # Floor on the detached dispersion to avoid div-by-zero when all iid
     # negative scores are (near) equal.
@@ -201,6 +202,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         surrogate: Literal["trapezoid", "pairwise"] = "trapezoid",
         n_knots: int = 2,
         tau_scale: Literal["iqr", "band"] = "iqr",
+        pos_numerator: Literal["pool", "live"] = "pool",
         queue_size: int = 1024,
         temperature: float = 0.1,
         reduction: Literal["mean", "sum", "none"] = "mean",
@@ -225,6 +227,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             raise ValueError(
                 f"tau_scale must be one of {self._VALID_TAU_SCALES}, got '{tau_scale}'"
             )
+        if pos_numerator not in self._VALID_POS_NUMERATORS:
+            raise ValueError(
+                f"pos_numerator must be one of {self._VALID_POS_NUMERATORS}, "
+                f"got '{pos_numerator}'"
+            )
         if quantile_interpolation not in self._VALID_INTERPOLATIONS:
             raise ValueError(
                 f"quantile_interpolation must be one of {self._VALID_INTERPOLATIONS}, "
@@ -247,6 +254,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         self.surrogate = surrogate
         self.n_knots = n_knots
         self.tau_scale = tau_scale
+        self.pos_numerator = pos_numerator
         self.quantile_interpolation = quantile_interpolation
 
         # Warn once per instance when a class is skipped due to near-zero
@@ -354,6 +362,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_pos: torch.Tensor,
         is_neg: torch.Tensor,
         is_iid: torch.Tensor,
+        is_live: torch.Tensor,
     ) -> tuple[torch.Tensor, bool, dict[str, Any]]:
         """
         Compute normalized partial AUC over ``[alpha, beta]`` for one class.
@@ -370,6 +379,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             Negative mask for this class (``~is_pos``).
         is_iid : torch.Tensor, shape [M], dtype=bool
             Per-row iid-eligibility flag.
+        is_live : torch.Tensor, shape [M], dtype=bool
+            Per-row live-batch flag (True = live-batch row, False = queue).
+            Consulted only when ``self.pos_numerator == "live"``.
 
         Returns
         -------
@@ -379,6 +391,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         valid : bool
             False if there are no positives, no iid negatives, the iid-negative
             dispersion is near-zero (degenerate), or (pairwise) no band negatives.
+            When ``pos_numerator="live"``, also False if there are no live
+            positives for this class (no gradient signal this step).
             Invalid classes are excluded from reduction.
         diag : dict
             Diagnostic scalars for this class (all detached) when
@@ -392,15 +406,27 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         Notes
         -----
         Band edges ``t_alpha``/``t_beta`` and ``tau_eff`` are computed from the
-        DETACHED iid negatives, so gradient never flows through the thresholds
-        or the scale. In trapezoid mode gradient reaches positives only; in
-        pairwise mode it reaches positives and band negatives.
+        DETACHED iid negatives regardless of ``pos_numerator`` — the queue
+        still stabilizes thresholds even when the numerator is restricted to
+        live positives.  In trapezoid mode gradient reaches the numerator
+        positives only; in pairwise mode it reaches numerator positives and
+        band negatives.
         """
         iid_neg = is_neg & is_iid
         n_pos = int(is_pos.sum())
         n_iid_neg = int(iid_neg.sum())
         if n_pos == 0 or n_iid_neg == 0:
             return scores.new_zeros(()), False, {}
+
+        # Determine the numerator positive set.
+        if self.pos_numerator == "live":
+            pos_num = is_pos & is_live
+            if int(pos_num.sum()) == 0:
+                # No live positives this step: no gradient signal, mark invalid.
+                return scores.new_zeros(()), False, {}
+        else:
+            # "pool": use all pooled positives (pre-change behavior).
+            pos_num = is_pos
 
         neg = scores[iid_neg].detach()
         t_alpha, t_beta, scale = self._band_thresholds_and_scale(neg)
@@ -442,12 +468,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             t_k = torch.quantile(
                 neg, 1.0 - f_k, interpolation=self.quantile_interpolation
             )  # [n_knots], detached
-            p = scores[is_pos]  # gradient flows here
-            # [n_pos, n_knots]; each row is the contribution vector for one positive.
+            p = scores[pos_num]  # gradient flows here (numerator positive set)
+            # [n_pos_num, n_knots]; each row is the contribution vector for one positive.
             contrib_mat = torch.sigmoid(
                 (p.unsqueeze(1) - t_k.unsqueeze(0)) / tau_eff
             )
-            # [n_knots] -- mean over positives.
+            # [n_knots] -- mean over numerator positives.
             tpr = contrib_mat.mean(dim=0)
             # Composite trapezoid on a uniform grid, normalized to [alpha, beta].
             pauc = (
@@ -461,7 +487,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 weights = contrib_mat.new_ones(self.n_knots)
                 weights[0] = 0.5
                 weights[-1] = 0.5
-                # [n_pos]
+                # [n_pos_num]
                 v = (contrib_mat.detach() * weights.unsqueeze(0)).sum(dim=1) / (self.n_knots - 1)
                 pauc_var = v.var(unbiased=False)
             # band_neg_count: iid negatives in the band [t_beta, t_alpha].
@@ -479,9 +505,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         band = is_neg & (scores >= t_beta) & (scores <= t_alpha)
         if int(band.sum()) == 0:
             return scores.new_zeros(()), False, {}
-        p = scores[is_pos]
-        b = scores[band]  # band negatives carry gradient (intended)
-        # [n_pos, n_band]; each row is the per-positive contribution vector.
+        p = scores[pos_num]   # numerator positive set (gradient flows here)
+        b = scores[band]      # band negatives carry gradient (intended)
+        # [n_pos_num, n_band]; each row is the per-positive contribution vector.
         contrib_mat = torch.sigmoid(
             (p.unsqueeze(1) - b.unsqueeze(0)) / tau_eff
         )
@@ -490,7 +516,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             return pauc, True, {}
         # Per-positive contribution: mean over band negatives for each positive.
         with torch.no_grad():
-            v = contrib_mat.detach().mean(dim=1)  # [n_pos]
+            v = contrib_mat.detach().mean(dim=1)  # [n_pos_num]
             pauc_var = v.var(unbiased=False)
         # band_neg_count counts IID negatives in the band (consistent with
         # trapezoid), since the diagnostic semantics are population-level FPR.
@@ -676,6 +702,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
         is_iid: torch.Tensor,
+        is_live: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - pAUC for each class via one-vs-rest decomposition.
@@ -689,6 +716,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             Corresponding integer targets.
         is_iid : torch.Tensor, shape [M], dtype=bool
             Per-row iid-eligibility flag for FPR-band threshold estimation.
+        is_live : torch.Tensor, shape [M], dtype=bool
+            Per-row live-batch flag; threaded into ``_compute_pauc`` so
+            ``pos_numerator="live"`` can restrict the numerator positive set.
 
         Returns
         -------
@@ -711,7 +741,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 )
             is_pos = targets.bool()
             pauc, is_valid, diag = self._compute_pauc(
-                logits[:, 0], is_pos, ~is_pos, is_iid
+                logits[:, 0], is_pos, ~is_pos, is_iid, is_live
             )
             loss_vals = [1.0 - pauc]
             valid_mask = [is_valid]
@@ -722,7 +752,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             for c in range(self.num_classes):
                 is_pos = targets == c
                 pauc, is_valid, diag = self._compute_pauc(
-                    logits[:, c], is_pos, ~is_pos, is_iid
+                    logits[:, c], is_pos, ~is_pos, is_iid, is_live
                 )
                 loss_vals.append(1.0 - pauc)
                 valid_mask.append(is_valid)
