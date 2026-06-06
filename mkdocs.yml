@@ -1,6 +1,6 @@
 site_name: imbalanced-losses
 site_url: https://chris-santiago.github.io/imbalanced-losses/
-site_description: PyTorch losses for class-imbalanced classification — Focal Loss, Smooth-AP, Recall-at-Quantile, with DDP all-gather support.
+site_description: PyTorch losses for class-imbalanced classification and ranking-metric optimization — Focal Loss, Smooth-AP, Recall-at-Quantile, and Partial-AUC-at-Budget, with DDP all-gather support.
 site_author: Chris Santiago
 repo_url: https://github.com/chris-santiago/imbalanced-losses
 repo_name: chris-santiago/imbalanced-losses
@@ -91,6 +91,7 @@ nav:
   - Explanation:
     - explanation/index.md
     - Why Imbalanced Losses: explanation/why-imbalanced-losses.md
+    - PAUCAtBudgetLoss Deep Dive: explanation/pauc-at-budget-deep-dive.md
     - Memory Queue Design: explanation/memory-queue.md
     - Temperature and Soft Ranking: explanation/temperature-soft-ranking.md
     - DDP All-Gather and Gradients: explanation/ddp-all-gather.md

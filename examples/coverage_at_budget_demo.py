@@ -277,7 +277,7 @@ def run_compare(
 
     live_pos_per_batch = n_pos * bs / (n_va * 4)
     print(
-        f"Synthetic imbalance  |  train pos ~{n_pos} / {n_va * 4}  ({pos_rate * 1e4:.0f} bps) "
+        f"Synthetic imbalance  |  train pos ~{n_pos} / {n_va * 4}  "
         f"|  hidden={hidden}  bs={bs} (~{live_pos_per_batch:.1f} live pos/batch)  "
         f"queue={queue}  budget={budget * 1e4:.0f} bps  |  mean over {n_seeds} seeds\n"
     )
@@ -319,7 +319,7 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--pos-rate", type=float, default=0.0015, help="Positive fraction (default 15 bps).")
+    p.add_argument("--pos-rate", type=float, default=0.0015, help="Positive fraction (default 0.0015; a rare-positive, <1% setting).")
     p.add_argument("--budget", type=float, default=0.005, help="Operating-point budget (default 50 bps).")
     p.add_argument("--hidden", type=int, default=64, help="Encoder width.")
     p.add_argument("--epochs", type=int, default=15)

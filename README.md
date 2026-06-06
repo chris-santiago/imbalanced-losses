@@ -1,6 +1,6 @@
 # imbalanced-losses
 
-**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification — including Focal Loss, Smooth-AP, Recall-at-Quantile, and Partial-AUC at Budget — with built-in DDP all-gather support for globally-correct rank estimation and normalization across multi-GPU training.
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification and ranking-metric optimization — Focal Loss, plus differentiable surrogates for Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget — with built-in DDP all-gather support for globally-correct rank estimation across multi-GPU training. (Imbalance is the design center — the memory queue and DDP gather exist for stable estimation at low positive rates — but the ranking losses optimize ranking/operating-point metrics more generally.)
 
 **What's in it:**
 
@@ -479,7 +479,7 @@ python examples/per_class_metrics_demo.py
 
 ### [`coverage_at_budget_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/coverage_at_budget_demo.py) — coverage@budget with PAUCAtBudgetLoss
 
-On an extreme-imbalance (~15 bps) problem with a *contested top*, compares weighted CE, SmoothAP, and `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget — the alert/review metric, distinct from whole-curve AUCPR. Shows PAUC pairwise recovering coverage CE leaves behind, the trapezoid-vs-pairwise surrogate choice, and the `pos_numerator="live"` gradient-dilution effect. Needs `numpy` + `scikit-learn`.
+On an extreme-imbalance (<1% positives) problem with a *contested top*, compares weighted CE, SmoothAP, and `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget — the alert/review metric, distinct from whole-curve AUCPR. Shows PAUC pairwise recovering coverage CE leaves behind, the trapezoid-vs-pairwise surrogate choice, and the `pos_numerator="live"` gradient-dilution effect. Needs `numpy` + `scikit-learn`.
 
 ```bash
 python examples/coverage_at_budget_demo.py --n-seeds 5
