@@ -234,3 +234,7 @@ for epoch in range(epochs):
         for xb, yb in val_loader:
             ...  # queue frozen, no contamination
 ```
+
+## See also
+
+[`examples/coverage_at_budget_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/coverage_at_budget_demo.py) — runnable comparison on an extreme-imbalance (~15 bps) problem with a contested top: weighted CE vs `SmoothAPLoss` vs `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget. Shows PAUC pairwise recovering coverage CE leaves behind, why the trapezoid surrogate is the wrong tool for a hard-negative top, and the `pos_numerator` gradient-dilution effect. Requires `numpy` + `scikit-learn`.
