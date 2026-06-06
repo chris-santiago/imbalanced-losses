@@ -239,7 +239,12 @@ def run_compare(
     pos_rate: float, budget: float, hidden: int, epochs: int,
     bs: int, queue: int, n_samples: int, seed: int, n_seeds: int,
 ):
-    a, b = budget / 2, budget * 1.5  # band brackets the operating point
+    # This demo uses the symmetric band [budget/2, 1.5*budget] that produced its
+    # documented results table (see docs/explanation/pauc-at-budget-deep-dive.md).
+    # NOTE: the RECOMMENDED DEFAULT for new code is alpha~=0, beta~=budget (the band
+    # of all false-positives above the operating threshold) -- it is empirically
+    # better in the contested-top regime; see the PAUCAtBudgetLoss docstring/docs.
+    a, b = budget / 2, budget * 1.5
 
     def pauc(surrogate, pos_numerator):
         return lambda X, y, s: train_ranking(

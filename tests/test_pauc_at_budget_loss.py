@@ -21,8 +21,8 @@ from imbalanced_losses import PAUCAtBudgetLoss
 
 def test_construction_defaults():
     loss = PAUCAtBudgetLoss(num_classes=4)
-    assert loss.alpha == 0.0025
-    assert loss.beta == 0.0075
+    assert loss.alpha == 0.0
+    assert loss.beta == 0.005
     assert loss.surrogate == "trapezoid"
     assert loss.n_knots == 2
     assert loss.tau_scale == "iqr"

@@ -108,8 +108,10 @@ loss    = 1 − pAUC
 ```python
 from imbalanced_losses import PAUCAtBudgetLoss
 
-# Optimize pAUC around a 50 bps operating point
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+# Optimize pAUC around a 50 bps operating point.
+# Recommended band: alpha=0 (t_alpha=max(neg)), beta=budget.
+# Contrasts positives against all false-positives above the operating threshold.
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 4)
 targets = torch.randint(0, 4, (256,))
 loss = loss_fn(logits, targets)
@@ -183,8 +185,8 @@ loss_fn = RecallAtQuantileLoss(num_classes=4, quantile=0.005, queue_size=1024)
 loss = loss_fn(logits, targets)
 loss.backward()
 
-# Partial AUC around a 50 bps operating point
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+# Partial AUC around a 50 bps operating point (alpha=0, beta=budget recommended)
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 4)
 targets = torch.randint(0, 4, (256,))
 loss = loss_fn(logits, targets)
@@ -238,8 +240,8 @@ loss_fn.reset_queue()
 | `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss only)* `torch.quantile` interpolation method |
-| `alpha` | `0.0025` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1` |
-| `beta` | `0.0075` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; brackets the operating point |
+| `alpha` | `0.0` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, covering all top false-positives. |
+| `beta` | `0.005` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; set to your target operating-point FPR. |
 | `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives — for wide/volatile bands |
 | `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
@@ -247,7 +249,7 @@ loss_fn.reset_queue()
 
 **Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 
-**Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate. For `PAUCAtBudgetLoss`, the pooled iid-negative count should substantially exceed `1/alpha` for the tail quantile to be unbiased; check the `band_neg_count` diagnostic.
+**Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate. For `PAUCAtBudgetLoss` with the recommended `alpha=0, beta=budget`, only `t_beta = quantile(neg, 1 - beta)` requires adequate pool coverage (`~1/beta` iid negatives); `t_alpha = max(neg_iid)` requires no tail-quantile estimation. Check the `band_neg_count` diagnostic.
 
 ## `LossWarmupWrapper` — BCE/CE warmup + loss blending + geometric temperature decay
 

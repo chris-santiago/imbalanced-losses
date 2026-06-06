@@ -94,16 +94,42 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     iid-negative count substantially exceeds ``1/alpha``.  Monitor
     ``band_neg_count`` in diagnostics and set ``queue_size`` accordingly.
 
+    The recommended band convention is ``alpha ≈ 0, beta ≈ budget`` (where
+    ``budget`` is the target FPR, e.g. ``beta=0.005`` for a 50 bps operating
+    point).  This sets the upper threshold ``t_alpha = quantile(neg, 1.0) =
+    max(neg)`` and the lower threshold ``t_beta = quantile(neg, 1 - budget)``,
+    so the band covers every false-positive that falls above the budget
+    threshold, i.e. all negatives scoring at or above the operating point.
+
+    The older convention ``[budget/2, 1.5·budget]`` — e.g. ``[0.0025, 0.0075]``
+    for a 50 bps point — excludes the highest-scoring (worst) negatives via its
+    lower edge ``alpha = budget/2`` and extends below the operating threshold via
+    its upper edge ``beta = 1.5·budget``.  A band sweep (8 seeds, synthetic
+    contested-top extreme-imbalance data, 50 bps budget) found coverage@budget
+    to be monotone in both edges: smaller ``alpha`` and smaller ``beta`` are
+    better in every cell, and the old convention sits in the poorly-performing
+    high-``alpha`` region (the worst cell being ``alpha=budget/2, beta=2.5*budget``).
+    The recommended ``alpha=0, beta=budget`` band fixes both defects by
+    contrasting positives against all false-positives at the budget.
+
+    **Caveats:** the sweep evidence is synthetic, at a single budget (50 bps),
+    and in the contested-top regime.  The improvement is concentrated at
+    ``pos_rate ≪ budget``; once ``pos_rate ≥ budget``, coverage@budget is
+    mechanically capped at ``budget/pos_rate`` and band choice is irrelevant.
+
     Parameters
     ----------
     num_classes : int
         Number of output classes. Use 1 for binary mode.
     alpha : float, optional
         Lower FPR band edge. Must satisfy ``0 <= alpha < beta <= 1``.
-        Default: 0.0025.
+        ``alpha=0`` sets ``t_alpha = max(neg_iid)``, contrasting positives
+        against all negatives above the budget threshold.
+        Default: 0.0 (recommended for contested-top extreme-imbalance).
     beta : float, optional
         Upper FPR band edge. Must satisfy ``0 <= alpha < beta <= 1``.
-        Default: 0.0075.
+        Set to your target operating-point FPR (e.g. ``0.005`` for 50 bps).
+        Default: 0.005.
     surrogate : {'trapezoid', 'pairwise'}, optional
         pAUC estimator. ``'trapezoid'`` (default) integrates soft-TPR over
         ``n_knots`` FPR knots; gradient flows through positives only.
@@ -179,7 +205,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
     Examples
     --------
-    >>> loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075)
+    >>> loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005)
     >>> logits  = torch.randn(256, 4)
     >>> targets = torch.randint(0, 4, (256,))
     >>> loss = loss_fn(logits, targets)
@@ -226,8 +252,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     def __init__(
         self,
         num_classes: int,
-        alpha: float = 0.0025,
-        beta: float = 0.0075,
+        alpha: float = 0.0,
+        beta: float = 0.005,
         surrogate: Literal["trapezoid", "pairwise"] = "trapezoid",
         n_knots: int = 2,
         tau_scale: Literal["iqr", "band"] = "iqr",
@@ -466,14 +492,20 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         # or an exploding gradient).  Emit a one-time warning.
         if scale <= self._SCALE_EPS:
             if not self._degenerate_warned:
+                _alpha_note = (
+                    "alpha=0 means t_alpha=max(neg_iid); dispersion is near-zero "
+                    "because iid negatives have equal (or near-equal) scores."
+                    if self.alpha == 0.0 else
+                    f"fewer than ~{1.0 / self.alpha:.4g} iid negatives are needed "
+                    f"to resolve the tail quantile at alpha={self.alpha:.4g}."
+                )
                 warnings.warn(
                     f"{type(self).__name__}: iid-negative score dispersion is "
                     f"near-zero (scale={scale.item():.2e} <= _SCALE_EPS={self._SCALE_EPS:.2e}) "
                     f"for at least one class. This typically means all iid negatives "
                     f"have equal (or near-equal) scores, or the FPR band "
                     f"[{self.alpha}, {self.beta}] is too narrow relative to the "
-                    f"available iid-negative count (fewer than ~1/{self.alpha:.4g} iid "
-                    f"negatives are needed to resolve the tail quantile). "
+                    f"available iid-negative count ({_alpha_note}) "
                     f"The affected class is skipped (marked INVALID). "
                     f"To fix: increase queue_size or ensure iid negatives cover a "
                     f"meaningful score range. "

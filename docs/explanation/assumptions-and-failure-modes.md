@@ -161,7 +161,7 @@ This loss optimizes the normalized partial AUC over a false-positive-rate band `
 
 - Your evaluation metric is partial AUC over a specific FPR range (e.g. pAUC in [0, 0.01] for screening).
 - The band `[alpha, beta]` is narrow enough to track a meaningful operating point but wide enough to contain a stable estimate.
-- The pooled iid-negative count substantially exceeds `1/alpha`. At `alpha=0.0025` (50 bps center), you need well above 400 pooled iid negatives. `queue_size=1024` with a batch of 256 comfortably satisfies this.
+- The pooled iid-negative count is adequate for `t_beta` estimation. With the recommended `alpha=0, beta=0.005` (50 bps), only `t_beta = quantile(neg, 0.995)` needs enough pool coverage (at least ~200 iid negatives); `t_alpha = max(neg_iid)` requires no tail-quantile estimation. `queue_size=1024` with a batch of 256 comfortably satisfies this.
 - The model's score distribution is reasonably spread — a degenerate constant-output model produces near-zero iid-negative IQR, which causes the loss to skip the affected class.
 
 ### When it breaks down

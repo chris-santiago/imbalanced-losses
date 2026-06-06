@@ -12,8 +12,10 @@ Differentiable partial-AUC-over-an-FPR-band loss with an optional memory queue. 
 from imbalanced_losses import PAUCAtBudgetLoss
 import torch
 
-# Band [0.0025, 0.0075] brackets FPR = 0.005 (50 bps).
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+# Recommended band: alpha=0, beta=budget.
+# t_alpha = max(neg_iid), t_beta = quantile at the budget threshold.
+# Contrasts positives against every false-positive above the operating cutoff.
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 4)
 targets = torch.randint(0, 4, (256,))
 
@@ -24,7 +26,7 @@ loss.backward()
 ### Binary classification
 
 ```python
-loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0025, beta=0.0075, queue_size=1024)
+loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 1)
 targets = torch.randint(0, 2, (256,))
 
@@ -69,8 +71,8 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 | Parameter | Default | Notes |
 |---|---|---|
 | `num_classes` | required | Use `1` for binary |
-| `alpha` | `0.0025` | Lower FPR band edge; `0 <= alpha < beta <= 1` |
-| `beta` | `0.0075` | Upper FPR band edge; brackets the operating point (not a ceiling) |
+| `alpha` | `0.0` | Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, including all top negatives. |
+| `beta` | `0.005` | Upper FPR band edge; set to your target operating-point FPR (e.g. `0.005` for 50 bps). |
 | `surrogate` | `"trapezoid"` | `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives (band negatives carry gradient) — for wide/volatile bands |
 | `n_knots` | `2` | Trapezoid FPR knots; `2` is accurate for narrow bands, `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | Scale used for the scale-aware temperature: `"iqr"` (stable bulk statistic; pair with small `temperature`) or `"band"` (sized to the operating region; pair with `temperature` near 1.0) |
@@ -84,9 +86,13 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 
 ## Band selection guidance
 
-The band `[alpha, beta]` brackets the FPR you deploy at. For a 50 bps (FPR = 0.005) operating point, `[0.0025, 0.0075]` centers the band on it. Band **width** is a bias–variance knob: narrower tracks a tighter point (lower bias, higher variance); wider averages over more of the ROC (lower variance, more bias).
+**Recommended convention: `alpha ≈ 0, beta ≈ budget`.** For a 50 bps (FPR = 0.005) operating point, use `alpha=0.0, beta=0.005`. This sets `t_alpha = max(neg_iid)` and `t_beta = quantile(neg_iid, 1 - budget)`, so the band covers every false-positive that scores above the operating threshold.
 
-The band edges are estimated as score quantiles of the **iid negatives** and approximate *population* FPR only when the pooled iid-negative count substantially exceeds `1/alpha`. Below that, the tail quantile is biased toward the maximum negative score. Use `queue_size` to accumulate enough negatives, and the `band_neg_count` diagnostic as the empirical check. A class whose iid-negative score dispersion is degenerate (≈ 0) is skipped (marked invalid) with a one-time warning.
+The older convention `[budget/2, 1.5·budget]` (e.g. `[0.0025, 0.0075]` for 50 bps) has two defects: its lower edge `alpha = budget/2` excludes the highest-scoring (worst) negatives from the contrast, and its upper edge `beta = 1.5·budget` extends below the budget threshold into negatives that don't matter for coverage. A band sweep on synthetic contested-top extreme-imbalance data found coverage@budget to be monotone in both edges (smaller is better), with the old convention in the poorly-performing high-`alpha` region (the single worst cell is `alpha=budget/2, beta=2.5·budget`), well below the `alpha≈0, beta≈budget` optimum.
+
+**Caveat:** this evidence is synthetic, at a single budget (50 bps), in the contested-top regime. The improvement is concentrated at `pos_rate ≪ budget`. Once `pos_rate ≥ budget`, coverage@budget is mechanically capped at `budget/pos_rate` and band choice is irrelevant.
+
+The band edges are estimated as score quantiles of the **iid negatives** and approximate *population* FPR only when the pooled iid-negative count is adequate. With `alpha=0`, the upper threshold is always the maximum negative score (no tail-quantile bias for `t_alpha`); only `t_beta` requires enough negatives to resolve `quantile(neg, 1 - beta)`. Use `queue_size` to accumulate enough negatives, and the `band_neg_count` diagnostic as the empirical check. A class whose iid-negative score dispersion is degenerate (≈ 0) is skipped (marked invalid) with a one-time warning.
 
 ## Choosing among the ranking losses
 

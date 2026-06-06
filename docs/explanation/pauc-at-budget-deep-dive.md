@@ -79,9 +79,10 @@ t_β = quantile(neg_iid, 1 − β)        [no grad]      (t_β ≤ t_α since α
 ```
 
 A negative is "in the band" iff `t_β ≤ s ≤ t_α`. FPR at threshold `t` is the
-fraction of negatives scoring above `t`, so this is exactly FPR ∈ `[α, β]`
-(empirically: on 2M N(0,1) negatives with `α=0.0025, β=0.0075`, the realized FPR at
-the edges is 0.0025 / 0.0075 and the band holds ≈ `β − α` of the mass).
+fraction of negatives scoring above `t`, so this is exactly FPR ∈ `[α, β]`.
+With the recommended `α=0`, `t_α = max(neg_iid)` and the band covers all negatives
+above the budget threshold (empirically: on 2M N(0,1) negatives with `α=0, β=0.005`,
+the band holds ≈ `β` of the mass and includes the top-scoring false-positives).
 
 ### 2.3 Surrogates
 
@@ -181,17 +182,72 @@ No mathematical errors were found.
 
 ## 4. Experiments
 
-These are small, controlled, CPU-scale synthetic studies (see
-`examples/coverage_at_budget_demo.py`), reported to characterize behavior — **not**
-large-scale benchmark claims. Metrics are averaged over seeds because coverage at
-50 bps is estimated from few validation positives and is noisy per seed.
+These are small, controlled, CPU-scale synthetic studies — **not** large-scale
+benchmark claims. They come in two tiers, and the second is the stronger basis for
+everything that follows:
 
-### 4.1 Contested-negative top
+1. **The shipped demo** (`examples/coverage_at_budget_demo.py`) — a single,
+   reproducible contested-top instance you can run in one command (§4.3).
+2. **A controlled investigation** — a CI-backed ablation (8 seeds, bootstrap-over-seed
+   paired CIs) that isolates *what* makes the advantage appear and characterizes it
+   across cue form, budget, surrogate, and capacity. This is far more informative than
+   any single demo run: it identifies the **binding variable** and underwrites the
+   mechanism in §5.
 
-Data: sub-1% positives; hard "decoy" negatives sit at the operating point,
-separable only by a weak non-linear cue; "confounder" negatives carry that cue
-without the easy signal (so over-using it costs AUCPR). Weighted CE protects the bulk
-and under-resolves the top.
+Metrics are averaged over seeds because coverage at 50 bps is estimated from few
+validation positives and is noisy per seed; the investigation reports a bootstrap CI
+on every lift and counts a result only when the CI excludes zero.
+
+### 4.1 The binding variable: is the operating-point cue one cross-entropy under-learns?
+
+A single "pairwise beats CE by X %" number does not tell you *when* the loss helps.
+The controlled ablation answers that by holding **the same two discriminative
+features** fixed and varying only the **functional form of the cue** that separates
+positives from the decoys at the operating point. The cue's linearity — not bulk
+difficulty, capacity, or class ratio — is the determinant:
+
+| cue (50 bps, 8 seeds) | CE coverage | PAUC-pairwise | lift [95 % CI] |
+|---|---:|---:|---|
+| **linear** (same two features) | 0.864 | 0.880 | **+0.015 [+0.005, +0.024]** |
+| **nonlinear, product** (`f5·f6`) | 0.575 | 0.791 | **+0.216 [+0.183, +0.257]** |
+| **nonlinear, radial** (distinct form) | 0.426 | 0.638 | **+0.212 [+0.177, +0.247]** |
+
+A **linear** cue is cheap for cross-entropy to capture, so its coverage stays high
+(0.86) and PAUC adds almost nothing (+0.015). A **nonlinear** cue that is relevant
+only to the rare top is one cross-entropy's bulk-dominated gradient never invests in
+(coverage 0.43–0.58), and the band-focused PAUC gradient drives the MLP to learn it —
+an **order-of-magnitude larger** lift that **replicates across two distinct nonlinear
+forms** with intervals that do not overlap the linear cue's. This is the headline
+result of the investigation, and §5 explains the mechanism behind it.
+
+Two qualifiers come from the same study:
+
+- **Operating-point specific.** Across these cells AUROC stays ~0.99 — the loss moves
+  coverage at the budget without making a globally better-ranked model. The advantage
+  is concentrated exactly where you deploy, which is the whole point.
+- **Budget-dependent.** The nonlinear-product lift falls from **+0.216 at 50 bps** to
+  **+0.045 [+0.035, +0.055] at 100 bps**: a wider budget is easier for cross-entropy,
+  leaving less for the band to recover. The advantage is largest at the tightest
+  budgets, and is gated on enough capacity (an MLP, to represent the cue at all) plus
+  CE warmup and temperature annealing for stable training.
+
+### 4.2 Surrogate specificity: only `pairwise` survives a contested-*negative* top
+
+Within the nonlinear regime the surrogate choice is not a free parameter. The
+**pairwise** surrogate carries the entire advantage; the **trapezoid** surrogate
+collapses to the trivial floor, because it only lifts positives toward detached
+thresholds and never suppresses the band negatives — the wrong tool when the top is
+contested by hard *negatives*. `SmoothAPLoss`, a strong whole-curve ranking baseline
+that sees the same data, reaches ~0.72 in the favorable regime but is beaten on
+coverage@budget by the band-restricted pairwise surrogate (~0.79), exactly as
+expected for a whole-curve objective that does not concentrate at one operating point.
+
+### 4.3 The shipped demo: a contested-negative top (reproducible)
+
+The bundled demo is one reproducible instance of the favorable regime: sub-1 %
+positives; hard "decoy" negatives at the operating point, separable only by a weak
+nonlinear cue; "confounder" negatives that carry the cue without the easy signal (so
+over-using it costs AUCPR). Weighted CE protects the bulk and under-resolves the top.
 
 | loss | AUCPR | coverage@50bps |
 |---|---|---|
@@ -201,26 +257,119 @@ and under-resolves the top.
 | **PAUC pairwise** | ~0.54 | **0.772 ± 0.051** |
 
 The pairwise surrogate recovers coverage CE leaves on the table (**+35 %**,
-seed-stable). The trapezoid collapses here: it only lifts positives toward a frozen
-threshold and cannot suppress the band negatives — the wrong surrogate for a
-hard-*negative* top.
+seed-stable) — the same effect the CI-backed ablation in §4.1 isolates, here in a
+form you can reproduce in one command.
 
-### 4.2 The `pos_numerator` rescue (non-contested top)
+### 4.4 The `pos_numerator` rescue (non-contested top)
 
 On easier data where the top is not contested by hard negatives, the trapezoid is
 the natural surrogate, but with a large queue and few live positives it is
 gradient-diluted under `"pool"`. Switching to `pos_numerator="live"` restores it to
-competitive coverage. (On the contested-negative data of §4.1, the opposite holds —
+competitive coverage. (On the contested-negative data of §4.3, the opposite holds —
 pairwise wants `"pool"`.)
 
-### 4.3 Where the gap closes
+### 4.5 Where the gap closes
 
 On cleanly separable tops — e.g. the Kaggle credit-card fraud data (~17 bps), whose
 top is well separated (AUROC ≈ 0.97) — weighted CE already catches ~84 % at 50 bps,
 and all losses land within noise. There is simply no contested region for a band loss
 to recover. **This is the honest common case for easy data.**
 
-## 5. When to use it (and when not)
+## 5. Why it wins: adaptive hard-negative mining at the operating point
+
+§4.1 shows the pairwise surrogate recovering coverage that weighted CE leaves on the
+table. This section explains *why*, and the explanation is deflationary in a useful
+way: the win is a **gradient-allocation effect**, not a property unique to the
+partial-AUC objective. The evidence below comes from a controlled investigation on
+contested-top synthetic data (a nonlinear, rarely-relevant cue; 8 seeds, bootstrap
+CIs over paired per-seed differences) — the same regime as §4.1, run with the
+diagnostics instrumented.
+
+### 5.1 The mechanism: the band *is* a hard-negative miner
+
+The pairwise surrogate contrasts each positive against the negatives whose scores
+fall in the FPR band around the budget. **By construction those band negatives are
+the decoys** — they are the only negatives that reach the top of the ranking — so
+almost all of the loss's gradient is spent on the positives-versus-decoy contrast,
+which is exactly the comparison the cue is needed to resolve. Cross-entropy
+optimizes average log-loss; it sees the decoys as ~1.2 % of all negatives and never
+concentrates there, so the bulk-dominated gradient under-invests in the one
+distinction that decides coverage at the budget.
+
+Two diagnostics on **identical data and scores** make this concrete:
+
+- **Band enrichment.** The pairwise band is **~73 % decoys against a 1.2 % base
+  rate** — roughly **60× enrichment** — and it selects them **with no decoy
+  labels.** The band is a label-free hard-negative miner.
+- **Gradient mass.** PAUC places **~96 % of its negative-gradient mass on decoys**,
+  versus **~58 % for cross-entropy** scored on the same model outputs.
+
+### 5.2 It is allocation, not capacity — and a label-free rule reproduces it
+
+If the advantage were that PAUC *represents* the cue better, giving cross-entropy the
+same gradient concentration would not help. It does. On the contested-top cell
+(CE 0.576, pairwise PAUC 0.792):
+
+| variant | coverage@50bps | note |
+|---|---|---|
+| Weighted CE | 0.576 | baseline |
+| CE + oracle decoy up-weight ×10 | 0.767 | uses decoy labels |
+| CE + label-free top-score HNM | 0.765 | no labels — mines the top of the negative ranking |
+| **PAUC pairwise** | **0.792** | adaptive, label-free |
+
+Concentrating cross-entropy's gradient — whether by an oracle decoy up-weight or a
+label-free top-score hard-negative-mining rule — **recovers ~90 % of the advantage**
+(the −0.216 gap collapses to ≈ −0.025). A complementary check rules out the capacity
+story directly: a **linear probe** separating positives from decoys on the
+penultimate activations scores **0.895 (CE) vs 0.910 (PAUC)** — nearly equal, so both
+models *encode* the cue and differ only in whether the objective **acts on it at the
+budget.** And the concentration must be *bounded*: crude over-concentration degrades a
+pointwise loss (oracle ×30 < ×10 in every cell; ×50 → 0.702, ×200 → 0.632), whereas
+PAUC's bounded contrast over an adaptively tracking band does not.
+
+The effect **transfers** across cue form (product, radial) and budget (50, 100 bps):
+concentrating cross-entropy's gradient closes **≥ 89 % of the CE→PAUC gap in all four
+cells**, and a label-free HNM-CE **matches or beats PAUC in three of the four.** So
+the partial-AUC objective has no categorically higher ceiling here. Its distinct
+contribution is delivering the concentration **adaptively and stably, without a tuned
+up-weight factor and without decoy labels** — the band tracks the operating point as
+the score scale drifts, where a hand-set mining factor does not.
+
+### 5.3 Band escape — why the default `α` leaves coverage on the table
+
+The same mechanism explains where the *default* band underperforms, and the fix is
+one knob. The decoys pile up at the very top of the negative score distribution, but
+the pairwise gradient only reaches the FPR band `[α, β]`. With the older default
+`[budget/2, 1.5·budget]`, that band contains only **40–48 % of the decoys** while
+**21 % (50 bps) to 41 % (100 bps) escape *above* it** (above `t_α`) and receive no
+gradient at all — compared with **92–94 %** captured by a top-2 % miner.
+
+```
+default band [budget/2, 1.5·budget]:   t_β        t_α
+score axis  ──────────────┼──── band ───┼──────────►  (higher score)
+                          │             │
+   decoys below        in band      decoys ESCAPE here
+   (no gradient)       (gradient)   (no gradient — but they're the worst FPs)
+```
+
+Because `α = budget/2` caps the band below the top, the highest-scoring
+false-positives — the decoys that most hurt coverage — sit *above* `t_α` and are
+never pushed down. **Lowering `α` toward 0 widens the band up to `t_α = max(neg_iid)`,
+covering the escaped top decoys.** This improves PAUC in every cell (**+0.017 to
++0.056** over the default) and makes wide-band PAUC match or beat the HNM rule in
+three of four cells. A full sweep over both edges and four positive rates finds the
+robust optimum at **`α = 0, β = budget`** — precisely the band of false-positives at
+the operating point — which is why that is now the recommended default (§6). The gain
+concentrates at `pos_rate ≪ budget` and vanishes once `pos_rate ≥ budget`, where
+coverage@budget is capped at `budget / pos_rate`.
+
+The takeaway for practice: **a label-free hard-negative-mined cross-entropy and
+PAUC with a sufficiently wide band are roughly equivalent implementations of the same
+gradient-concentration mechanism.** Reach for the pairwise band when you want that
+concentration delivered adaptively and without labels; if you already have a working
+HNM pipeline, you are most of the way there.
+
+## 6. When to use it (and when not)
 
 **Reach for `PAUCAtBudgetLoss` when:**
 
@@ -241,8 +390,15 @@ to recover. **This is the honest common case for easy data.**
 
 **Configuration heuristics:**
 
-- Band `[α, β]` brackets the operating FPR (e.g. `[0.0025, 0.0075]` around 50 bps);
-  band width is a bias–variance knob.
+- **Recommended band: `α ≈ 0, β ≈ budget`** (e.g. `alpha=0.0, beta=0.005` for
+  50 bps). Sets `t_alpha = max(neg_iid)`, contrasting positives against every
+  false-positive above the budget threshold. The older `[budget/2, 1.5·budget]`
+  convention excludes the highest-scoring negatives (via `alpha = budget/2`) and
+  extends below the threshold (via `beta = 1.5·budget`); a band sweep on
+  synthetic contested-top data found it in the poorly-performing high-`alpha`
+  region (the worst cell being `alpha=budget/2, beta=2.5·budget`).
+  Caveat: evidence is synthetic, 50 bps only, contested-top regime; improvement
+  concentrates at `pos_rate ≪ budget`.
 - Contested-negative top → `surrogate="pairwise"`, `pos_numerator="pool"`.
 - Non-contested top, few live positives + large queue → `surrogate="trapezoid"`,
   `pos_numerator="live"`.
@@ -251,7 +407,7 @@ to recover. **This is the honest common case for easy data.**
 - Watch `band_neg_count` (band populated?) and `grad_pos_count` (positives carrying
   gradient?) via `return_diagnostics=True`.
 
-## 6. Limitations
+## 7. Limitations
 
 - **Strong baseline.** Weighted CE is hard to beat on separable tops; the wins are
   regime-specific (contested operating points), and on synthetic data the gaps,

@@ -58,7 +58,7 @@ for c in valid.nonzero(as_tuple=True)[0].tolist():
 ```python
 from imbalanced_losses import PAUCAtBudgetLoss
 
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, queue_size=1024)
 loss, per_class, valid = loss_fn(logits, targets, return_per_class=True)
 
 for c in valid.nonzero(as_tuple=True)[0].tolist():

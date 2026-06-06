@@ -139,7 +139,9 @@ loss_fn = RecallAtQuantileLoss(
 ```python
 from imbalanced_losses import PAUCAtBudgetLoss
 
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, queue_size=1024)
+# Recommended band: alpha=0, beta=budget.
+# Contrasts positives against all false-positives above the operating threshold.
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 4)
 targets = torch.randint(0, 4, (256,))
 loss = loss_fn(logits, targets)
@@ -153,7 +155,7 @@ loss.backward()
 Set `num_classes=1` and pass targets in `{0, 1}`:
 
 ```python
-loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0025, beta=0.0075, queue_size=1024)
+loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0, beta=0.005, queue_size=1024)
 logits  = torch.randn(256, 1)
 targets = torch.randint(0, 2, (256,))
 loss = loss_fn(logits, targets)
@@ -165,11 +167,11 @@ loss.backward()
 The default `"trapezoid"` surrogate integrates soft-TPR over `n_knots` FPR knots within the band. Gradient flows through positives only. Use `"pairwise"` when the band is wide or the FPR boundaries are volatile — it compares positives against the negatives that land inside the band, so band negatives also carry gradient:
 
 ```python
-# Narrow band (default): trapezoid with 2 knots is accurate
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075, surrogate="trapezoid", n_knots=2)
+# Default band (alpha=0, beta=budget): trapezoid with 2 knots is accurate for narrow bands
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, surrogate="trapezoid", n_knots=2)
 
 # Wide or volatile band: pairwise is more robust
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.001, beta=0.05, surrogate="pairwise")
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.05, surrogate="pairwise")
 ```
 
 ### Undilute the gradient at extreme imbalance
@@ -182,7 +184,7 @@ queue still feeds the thresholds), restoring an undiluted gradient:
 
 ```python
 # Few live positives per batch + large queue: undilute the trapezoid numerator
-loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0025, beta=0.0075,
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005,
                            surrogate="trapezoid", pos_numerator="live", queue_size=8192)
 ```
 
@@ -201,9 +203,9 @@ print(stats["band_neg_count"])  # iid negatives landing in the FPR band
 print(stats["grad_pos_count"])  # live positives carrying gradient (rank-local)
 ```
 
-If `band_neg_count` is near zero, the band is too narrow for the current pool size — increase `queue_size` or widen the band. If `grad_pos_count` is near 1, gradient signal is weak — increase the effective batch (DDP all-gather or larger `queue_size`), or set `pos_numerator="live"` (trapezoid) so the numerator uses only the gradient-carrying live positives.
+If `band_neg_count` is near zero, the band is too narrow for the current pool size — increase `queue_size`. If `grad_pos_count` is near 1, gradient signal is weak — increase the effective batch (DDP all-gather or larger `queue_size`), or set `pos_numerator="live"` (trapezoid) so the numerator uses only the gradient-carrying live positives.
 
-The pooled iid-negative count should substantially exceed `1/alpha`. At `alpha=0.0025` that means well above 400 pooled iid negatives; `queue_size=1024` with a batch of 256 gives 1280, which is comfortable.
+With `alpha=0` (recommended), `t_alpha = max(neg_iid)` requires no tail-quantile estimation. Only `t_beta = quantile(neg_iid, 1 - beta)` requires adequate pool coverage; `queue_size=1024` with a batch of 256 gives 1280 negatives, well above the `~1/beta` minimum for `beta=0.005`.
 
 ---
 

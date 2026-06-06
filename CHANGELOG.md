@@ -7,6 +7,31 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 *No unreleased changes.*
 
+## 0.4.1 — 2026-06-06
+
+### Changed
+
+- **`PAUCAtBudgetLoss` default band** is now `alpha=0.0, beta=0.005` (was
+  `alpha=0.0025, beta=0.0075`). The new default sets the upper threshold to
+  `max(neg_iid)` and the lower edge to the budget quantile, so positives are
+  contrasted against every false-positive above the operating point. A band sweep
+  (8 seeds, synthetic contested-top data) placed the previous `[budget/2, 1.5·budget]`
+  band in a poorly-performing high-`alpha` region: it excludes the highest-scoring
+  negatives and extends below the operating threshold. **This changes default
+  behavior** — pass `alpha=0.0025, beta=0.0075` explicitly to retain the previous band.
+
+### Fixed
+
+- `PAUCAtBudgetLoss`: avoid a latent `ZeroDivisionError` in the degenerate-dispersion
+  warning path when `alpha=0` (the warning message no longer divides by `alpha`).
+
+### Other
+
+- Expanded the `PAUCAtBudgetLoss` deep-dive with the win mechanism (adaptive
+  hard-negative mining at the operating point), a CI-backed cue-linearity ablation,
+  and the band-escape / `alpha`-lever analysis. Updated the reference, how-to,
+  README, and demo to the recommended `alpha=0, beta=budget` band.
+
 ## 0.4.0 — 2026-06-05
 
 ### Added
