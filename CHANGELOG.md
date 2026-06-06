@@ -29,13 +29,6 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 - `PAUCAtBudgetLoss` now skips (marks invalid) a class whose iid-negative score
   dispersion is degenerate (≈ 0), with a one-time warning, instead of producing a
   signal-free or exploding gradient.
-- Corrected misleading "stratified" terminology for minimum-quota pool subsampling.
-
-### Changed
-
-- Extracted the shared memory queue and forward flow into `_MemoryQueue` and the
-  `_QueuedRankingLoss` base class (`SmoothAPLoss` and `RecallAtQuantileLoss` now
-  build on it).
 
 ### Other
 
@@ -43,3 +36,22 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
   how-to, and explanation pages, plus README and demo-reference updates.
 - Scale-invariance, DDP iid-gather, degenerate-dispersion, and `pos_numerator`
   test coverage for `PAUCAtBudgetLoss`.
+
+## 0.3.2 — 2026-05-20
+
+### Changed
+
+- Extracted the shared memory queue and forward flow into `_MemoryQueue` and the
+  `_QueuedRankingLoss` base class (`SmoothAPLoss` and `RecallAtQuantileLoss` now
+  build on it).
+
+### Fixed
+
+- Corrected misleading "stratified" terminology for minimum-quota pool subsampling.
+
+### Other
+
+- README: added missing params and demos, documented DDP variable-size support,
+  fixed required annotations.
+- Linked demo references to GitHub source; added "See also" / "Next steps" demo
+  references across the how-to and tutorial pages.
