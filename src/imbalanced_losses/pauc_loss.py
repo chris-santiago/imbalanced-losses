@@ -126,6 +126,17 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         ``t_alpha - t_beta`` -- sized directly to the operating region (pair
         with ``temperature`` near 1.0; recommended for wide/volatile bands).
         Default: 'iqr'.
+    pos_numerator : {'pool', 'live'}, optional
+        Which positives form the soft-TPR numerator (and the pairwise positive
+        set). ``'pool'`` (default) uses all pooled positives (live batch + queue),
+        matching the queue's stabilising role but diluting the live-positive
+        gradient by ``1 / |P_pool|`` when the queue holds many detached positives.
+        ``'live'`` uses only the live-batch positives, giving an undiluted
+        gradient -- useful at extreme imbalance where the queue swamps the few
+        live positives -- at the cost of a higher-variance TPR estimate (mean over
+        the ~few live positives). Thresholds and ``tau_eff`` always use the full
+        pooled iid negatives regardless of this setting. A class with no live
+        positives in a step is skipped (invalid) under ``'live'``. Default: 'pool'.
     queue_size : int, optional
         Circular buffer size (rows). Larger queues stabilise the quantile-based
         band edges -- at low FPR you need many negatives for a meaningful tail
