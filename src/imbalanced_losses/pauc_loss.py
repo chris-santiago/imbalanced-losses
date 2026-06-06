@@ -194,6 +194,24 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
     Trapezoid cost is O(|P| x n_knots); pairwise cost is O(|P| x |band|).
     No O(M^2) path.
+
+    References
+    ----------
+    This loss is an original design, not a published method, but the
+    partial-AUC-over-a-band objective and its estimators build on prior work:
+
+    .. [1] D. K. McClish (1989). "Analyzing a Portion of the ROC Curve."
+       Medical Decision Making 9(3), 190-195. -- partial AUC over an ROC region.
+    .. [2] L. E. Dodd and M. S. Pepe (2003). "Partial AUC Estimation and
+       Regression." Biometrics 59(3), 614-623. -- nonparametric pAUC estimator
+       (the consistent plug-in the trapezoid surrogate relates to).
+    .. [3] H. Narasimhan and S. Agarwal (2013). "A Structural SVM Based Approach
+       for Optimizing Partial AUC." ICML 2013. -- optimizing pAUC over an FPR
+       band [alpha, beta] as a learning objective (the KDD 2013 "tight" variant
+       gives the boundary-corrected estimator).
+    .. [4] D. Zhu, G. Li, B. Wang, X. Wu, and T. Yang (2022). "When AUC meets
+       DRO: Optimizing Partial AUC for Deep Learning with Non-Convex Convergence
+       Guarantee." ICML 2022. -- deep one-/two-way pAUC surrogate optimization.
     """
 
     _VALID_INTERPOLATIONS = ("linear", "lower", "higher", "nearest", "midpoint")

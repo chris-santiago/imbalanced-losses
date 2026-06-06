@@ -103,6 +103,8 @@ loss    = 1 − pAUC
 
 `PAUCAtBudgetLoss` sits between `SmoothAPLoss` (whole PR/ROC curve) and `RecallAtQuantileLoss` (single threshold): it optimizes a *band* of the ROC. Reach for it when the business constraint is a fixed false-alarm budget.
 
+*Background:* this is an original loss, but partial AUC has a long lineage — as a metric (McClish, *Medical Decision Making* 1989; Dodd & Pepe, *Biometrics* 2003) and as a learning objective (Narasimhan & Agarwal, *ICML* 2013; Zhu et al., *ICML* 2022). See the [reference page](https://chris-santiago.github.io/imbalanced-losses/reference/pauc-at-budget-loss/) for full citations.
+
 ```python
 from imbalanced_losses import PAUCAtBudgetLoss
 
