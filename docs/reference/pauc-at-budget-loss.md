@@ -74,6 +74,7 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 | `surrogate` | `"trapezoid"` | `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives (band negatives carry gradient) — for wide/volatile bands |
 | `n_knots` | `2` | Trapezoid FPR knots; `2` is accurate for narrow bands, `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | Scale used for the scale-aware temperature: `"iqr"` (stable bulk statistic; pair with small `temperature`) or `"band"` (sized to the operating region; pair with `temperature` near 1.0) |
+| `pos_numerator` | `"pool"` | Positives in the soft-TPR numerator (and the pairwise positive set): `"pool"` (all pooled positives) or `"live"` (live-batch only). `"live"` gives an undiluted gradient when the queue swamps the few live positives at extreme imbalance — most beneficial for `"trapezoid"`; `"pairwise"` usually prefers `"pool"` to keep the positive×band-negative contrast populated |
 | `temperature` | `0.1` | **Dimensionless** multiplier on `tau_eff = temperature * scale` — not raw logits. Larger = smoother/biased-to-0.5; smaller = sharper but risks saturation |
 | `queue_size` | `1024` | Larger queues stabilise the tail quantile; at low FPR you need many pooled negatives |
 | `reduction` | `"mean"` | `"none"` returns `[C]`; invalid classes are `nan` |

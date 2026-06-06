@@ -182,6 +182,10 @@ The band edges are estimated from scores labeled as iid negatives. By default (`
 
 If `grad_pos_count` (from diagnostics) sits near 1, very few positives carry gradient per forward pass. The loss value is correct but its variance is high. Remedies: increase effective batch size via DDP all-gather, widen the band slightly, or increase `queue_size`.
 
+**Gradient dilution from the queue**
+
+The default `pos_numerator="pool"` averages the soft-TPR numerator over all pooled positives — live batch plus the (detached) memory queue. At extreme imbalance the queue holds far more positives than the live batch, so the live-positive gradient is scaled by `1/|P_pool|` and the `"trapezoid"` surrogate can underperform or destabilize. Setting `pos_numerator="live"` computes the numerator over the live positives only (the queue still feeds the thresholds), restoring an undiluted gradient. This is most beneficial for `"trapezoid"`; the `"pairwise"` surrogate generally prefers `"pool"`, since restricting its positive×band-negative contrast to the few live positives can starve it.
+
 **Temperature mismatch**
 
 `PAUCAtBudgetLoss` uses a dimensionless `temperature` (default `0.1`) multiplied by a robust scale of the iid negatives (`tau_eff = temperature * scale`). This is intentionally different from the raw-logit `temperature=0.01` of the other ranking losses. Do not reuse a temperature value tuned for `SmoothAPLoss` or `RecallAtQuantileLoss` directly — the units differ.
@@ -236,7 +240,7 @@ The table below maps common failure symptoms to root causes and remedies.
 | RecallAtQuantile unstable threshold | Pool too sparse near quantile | Increase queue size; check `(M * q) ≥ 10` |
 | PAUCAtBudget band empty (`band_neg_count` ≈ 0) | Pool too small relative to `1/alpha` | Increase `queue_size`; check pooled iid negatives >> `1/alpha` |
 | PAUCAtBudget class skipped (degenerate dispersion) | iid-negative scores nearly constant | Model may be outputting uniform scores; check score range and warmup |
-| PAUCAtBudget gradient weak (`grad_pos_count` ≈ 1) | Few positives in effective pool | Increase batch size, use DDP all-gather, or widen the band |
+| PAUCAtBudget gradient weak (`grad_pos_count` ≈ 1) | Few positives in effective pool | Increase batch size, use DDP all-gather, widen the band, or set `pos_numerator="live"` (trapezoid) |
 | Focal loss noisy despite tuning | High label noise in positive class | Reduce γ; inspect label quality |
 | DDP: loss diverges across workers | Missing all-gather | Set `gather_distributed=True` or use auto-detect |
 | Training spike after phase switch | Queue poisoning from warmup logits | Verify `LossWarmupWrapper` handles the switch; check queue reset |

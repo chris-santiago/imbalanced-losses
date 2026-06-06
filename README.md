@@ -241,6 +241,7 @@ loss_fn.reset_queue()
 | `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives — for wide/volatile bands |
 | `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
+| `pos_numerator` | `"pool"` | *(PAUCAtBudgetLoss only)* Positives in the soft-TPR numerator: `"pool"` (all pooled) or `"live"` (live-batch only). `"live"` removes the memory queue's gradient dilution at extreme imbalance — most useful for the `"trapezoid"` surrogate; `"pairwise"` usually prefers `"pool"` to keep enough positives in the contrast |
 
 **Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 
@@ -472,6 +473,14 @@ Demonstrates `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuanti
 
 ```bash
 python examples/per_class_metrics_demo.py
+```
+
+### [`coverage_at_budget_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/coverage_at_budget_demo.py) — coverage@budget with PAUCAtBudgetLoss
+
+On an extreme-imbalance (~15 bps) problem with a *contested top*, compares weighted CE, SmoothAP, and `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget — the alert/review metric, distinct from whole-curve AUCPR. Shows PAUC pairwise recovering coverage CE leaves behind, the trapezoid-vs-pairwise surrogate choice, and the `pos_numerator="live"` gradient-dilution effect. Needs `numpy` + `scikit-learn`.
+
+```bash
+python examples/coverage_at_budget_demo.py --n-seeds 5
 ```
 
 ## Tests
