@@ -1,0 +1,14 @@
+# SmoothAP ranking loss with CE warmup.
+# epochs, lr, batch_size, queue_size are intentionally absent so they flow from
+# the resolved training config (conf/training/default.yaml or capacity.yaml).
+# temp, temp_end, warmup_frac, blend_frac are kept as arm-specific defaults
+# (different from pauc defaults; temp 0.1->0.01 vs pauc 0.5->0.1).
+kind: smoothap
+capacity: mlp_2x64
+early_stop: true
+eval_every: 5
+temp: 0.1
+temp_end: 0.01
+warmup_frac: 0.30
+blend_frac: 0.15
+wd_sweep: [0.0, 0.0001, 0.001]

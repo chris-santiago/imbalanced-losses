@@ -1,0 +1,31 @@
+# Alpha widen (reproduces experiment 05).
+# Expected geometry: headline (sequential split convention — no val set)
+#
+# Does widening PAUC's band toward the top (alpha -> 0) close its gap to HNM-CE?
+# Compares pauc_std (band [0.5,1.5]) vs pauc_wide (band [0.0,1.5]) against CE and
+# CE-HNM across cue x budget.  an_alpha_lever reports the wide-minus-std lift.
+#
+# The 'band' axis is a TRAINING-axis: it is a cell override threaded into the
+# PAUC arm via _apply_cell_to_arm (cell band overrides the arm default).  CE
+# arms ignore band; PAUC trains once per (budget, band).
+#
+# data_axes: cue changes the data; budget and band are training-axes.
+name: alpha_widen
+axes:
+  cue: [nonlinear_prod, nonlinear_radial]
+  budget: [0.005, 0.010]
+  band: [[0.5, 1.5], [0.0, 1.5]]
+data_axes: [cue]
+arms: [weighted_ce, ce_hnm, pauc_pairwise]
+diagnostics: [metric_specificity]
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false
+  ce_hnm:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false

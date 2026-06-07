@@ -1,0 +1,18 @@
+# Confounder sweep (reproduces experiment 08's surrogate view).
+# Expected geometry: confounder (pass geometry=confounder in overrides)
+# Uses independent split convention (val set present for sweep selection).
+#
+# Unifying sweep: confounder_frac = 0 -> free cue -> ~0 advantage; confounder up
+# -> costly cue -> large PAUC advantage.  an_surrogate reports coverage by
+# condition (trivial / CE / trapezoid / smoothap / pairwise) across the sweep.
+#
+# data_axes: confounder_frac and pos_rate change the data; budget is single.
+name: confounder_sweep
+axes:
+  confounder_frac: [0.0, 0.01, 0.03, 0.06]   # exp 08's sweep values
+  pos_rate: [0.0015, 0.005]
+  budget: [0.005]
+data_axes: [confounder_frac, pos_rate]
+arms: [trivial, weighted_ce, pauc_pairwise, pauc_trapezoid, smoothap]
+band: [0.5, 1.5]
+diagnostics: [metric_specificity]

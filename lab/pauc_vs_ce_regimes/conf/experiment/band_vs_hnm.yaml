@@ -1,0 +1,24 @@
+# Band vs HNM (reproduces experiment 04).
+# Expected geometry: headline (sequential split convention — no val set)
+#
+# Measures decoy geometry on the CE model's test scores: decoy recall inside
+# PAUC's band [alpha,beta], inside HNM's top-2%, and the fraction escaping above
+# the band.  an_band_escape recomputes this from the STORED CE test scores.
+#
+# data_axes: cue changes the data; budget is a training-axis (CE trains once and
+#   the band geometry is recomputed per budget from the stored scores).
+# requests_scores: store test scores + grp in each record so an_band_escape can
+#   recompute band geometry per budget.
+name: band_vs_hnm
+axes:
+  cue: [nonlinear_prod, nonlinear_radial]
+  budget: [0.005, 0.010]
+data_axes: [cue]
+arms: [weighted_ce]
+band: [0.5, 1.5]
+diagnostics: [band_decoy_geometry]
+requests_scores: true
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false

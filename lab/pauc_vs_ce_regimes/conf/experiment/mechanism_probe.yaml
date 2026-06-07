@@ -1,0 +1,34 @@
+# Mechanism probe (reproduces experiment 02).
+# Expected geometry: headline (sequential split convention — no val set)
+#
+# Reproduces 02's three tests on the nonlinear-product cell:
+#   T1 gradient allocation on decoys (grad_mass diagnostic) + PAUC band decoy-frac
+#   T2 oracle/HNM gap-closure vs PAUC (ce_oracle, ce_hnm arms vs pauc_pairwise)
+#   T3 representation probe pos-vs-decoy (repr_probe diagnostic, needs stored model)
+#
+# data_axes: cue changes the data; budget is single here.
+# requests_model: an_mechanism needs the trained models to recompute grad_mass /
+#   repr_probe as consumers, so store the model in each record.
+name: mechanism_probe
+axes:
+  cue: [nonlinear_prod]   # exp 02 is fixed to the nonlinear-product cell
+  budget: [0.005]
+data_axes: [cue]
+arms: [weighted_ce, ce_oracle, ce_hnm, pauc_pairwise]
+band: [0.5, 1.5]
+diagnostics: [grad_mass, repr_probe, band_decoy_geometry]
+requests_model: true
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false
+  ce_oracle:
+    wd_sweep: [0.0]
+    early_stop: false
+  ce_hnm:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false

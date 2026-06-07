@@ -1,0 +1,39 @@
+# Cue ablation experiment.
+# Expected geometry: headline (pair geometry=headline in the Hydra overrides).
+#
+# axes:   each key lists the values to cartesian-product over; the cell dict
+#         has one key per axis.  'cue' is threaded into geometry_spec['cue'];
+#         'budget' is threaded into arm_spec['budget'] (influences alpha/beta).
+#
+# arms:   list of arm config-group names to compare in each cell.
+#
+# band:   [alpha_mult, beta_mult] relative to budget for PAUC arms.
+#         Overrides the arm's default when present here.
+#
+# diagnostics: named diagnostics to compute on the trained model.
+#     'metric_specificity' — coverage lift vs auroc lift per cue (cue_ablation only).
+#
+# split_convention: set in geometry YAML for data splitting strategy.
+#
+# arm_overrides: collapse sweeps to match the original 01_cue_ablation.py which used
+#   a SINGLE plain weighted-CE (no wd sweep) and a SINGLE PAUC config (no temp sweep).
+#   This produces exactly one config per arm (no val-based model selection needed).
+# data_axes: subset of axes that change the generated dataset.  Axes NOT listed
+#   here are training-axes (same data, different model/eval) and are evaluated
+#   on the shared in-memory dataset.  cue changes the data; budget does not.
+name: cue_ablation
+axes:
+  cue: [linear, nonlinear_prod, nonlinear_radial]
+  budget: [0.005, 0.010]
+data_axes: [cue]
+arms: [weighted_ce, pauc_pairwise]
+band: [0.5, 1.5]
+diagnostics: [metric_specificity]
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false

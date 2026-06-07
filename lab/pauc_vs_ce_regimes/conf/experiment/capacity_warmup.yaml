@@ -1,0 +1,23 @@
+# Capacity warmup — stub; filled in next task.
+# Expected geometry: hard_bulk (pass geometry=hard_bulk in overrides)
+#
+# Use training=capacity group to get the capacity epoch schedule, larger batch,
+# and higher lr.  Always pass training=capacity in the hydra_overrides when
+# running this experiment:
+#   hydra_overrides: [experiment=capacity_warmup,geometry=hard_bulk,training=capacity]
+#
+# arm_overrides: capacity_warmup uses independent splits and val-based selection,
+#   so sweeps are kept.  A custom temp_sweep for pauc_pairwise can be injected
+#   here without touching the arm YAML (e.g. temp_sweep: [0.2, 0.4]).
+# data_axes: pos_rate and decoy_frac change the hard_bulk data; capacity, budget,
+#   and the wd/temp sweeps are training-axes (same data, different model/eval).
+name: capacity_warmup
+axes:
+  pos_rate: [0.001, 0.002, 0.005]
+  decoy_frac: [0.0, 0.30]
+  capacity: [linear, mlp_1x16, mlp_2x64]
+  budget: [0.005]
+data_axes: [pos_rate, decoy_frac]
+arms: [trivial, weighted_ce, pauc_pairwise]
+band: [0.5, 1.5]
+diagnostics: []

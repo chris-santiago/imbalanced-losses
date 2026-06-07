@@ -1,0 +1,26 @@
+# Hard-bulk geometry — used in experiment 07.
+# 31-dimensional: D_BULK(4) + D_CONTEST(3) + D_NOISE(24).
+# Positives: bulk and contest features shifted up.
+#
+# split_convention: independent
+#   Train, val, and test use independent seeds (seed offsets +0/+1000/+2000).
+#   This supports val-based model selection (early_stop, sweep selection) for
+#   experiment 07's capacity arms.
+#
+# NOTE: The flow's seed_base=7000 does NOT reproduce 07's original compound
+# seed formulas.  CI overlap (not exact per-seed match) is the acceptance
+# criterion for this geometry.
+kind: hard_bulk
+n_feat: 31
+d_bulk: 4
+d_contest: 3
+d_noise: 24
+mu_bulk: 0.30
+mu_contest: 0.40
+pos_rate: 0.005
+decoy_frac: 0.0
+n_train: 100000
+n_val: 100000
+n_test: 400000
+seed_base: 7000
+split_convention: independent

@@ -1,0 +1,3 @@
+# Trivial baseline: mean of easy-signal features [0,1,2].
+kind: trivial
+bulk_feats: [0, 1, 2]

@@ -1,0 +1,28 @@
+# Local-only investigation artifacts — NOT part of the public release.
+# Everything not listed here ships: README.md, reports/TECHNICAL_REPORT.md,
+# figures/, conf/, and the flow/ pipeline (pauc_flow.py, validate.py, test_pauc_flow.py).
+
+# Superseded per-cycle scripts, raw data, peer reviews, and process notes
+_archive/
+
+# Internal reports — only TECHNICAL_REPORT.md is published
+reports/REPORT.md
+reports/CONCLUSIONS.md
+reports/REPORT_ADDENDUM.md
+
+# Investigation process artifacts
+HYPOTHESIS.md
+INVESTIGATION_LOG.jsonl
+
+# Figure referenced only by the excluded reports (orphaned in the public set)
+figures/fig_regime_extreme.png
+
+# Throwaway plumbing-proof spikes and raw run captures
+flow/spike_config.py
+flow/spike_foreach.py
+flow/run_*.log
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.DS_Store

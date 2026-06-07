@@ -1,0 +1,14 @@
+# PAUC trapezoid surrogate with CE warmup + temperature anneal.
+# epochs, lr, batch_size, queue_size are intentionally absent so they flow from
+# the resolved training config (conf/training/default.yaml or capacity.yaml).
+kind: pauc
+capacity: mlp_2x64
+early_stop: true
+eval_every: 5
+surrogate: trapezoid
+temp: 0.5
+temp_end: 0.1
+warmup_frac: 0.30
+blend_frac: 0.15
+wd_sweep: [0.0, 0.0001, 0.001]
+band: [0.5, 1.5]

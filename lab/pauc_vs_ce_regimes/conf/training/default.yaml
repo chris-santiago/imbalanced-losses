@@ -1,0 +1,25 @@
+# Default training config — used for headline/confounder experiments (01-06, 08).
+#
+# These values are threaded through the DAG into build_model and train_arm as
+# fallback defaults.  Per-arm YAML values take precedence when present.
+#
+# hid:          hidden-layer width for mlp_2x64 (64 units per layer)
+# epochs:       training epochs for headline/confounder arms
+# batch:        batch size
+# lr:           Adam learning rate
+# queue:        memory-queue size for PAUC/SmoothAP losses
+# warmup_frac:  fraction of total steps for CE warmup phase
+# blend_frac:   fraction of steps for warmup-to-main blend
+# temp_start:   temperature at start of anneal (PAUC)
+# temp_end:     annealed-to temperature (PAUC)
+# eval_every:   early-stop check cadence (epochs between val evaluations)
+hid: 64
+epochs: 15
+batch: 4096
+lr: 0.001
+queue: 8192
+warmup_frac: 0.30
+blend_frac: 0.15
+temp_start: 0.5
+temp_end: 0.1
+eval_every: 25

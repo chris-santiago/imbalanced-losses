@@ -1,0 +1,11 @@
+# CE with hard-negative mining (top 2% up-weighted by factor 50).
+# epochs, lr, batch_size, queue_size are intentionally absent so they flow from
+# the resolved training config (conf/training/default.yaml or capacity.yaml).
+kind: ce
+capacity: mlp_2x64
+early_stop: true
+eval_every: 5
+hnm:
+  top_q: 0.02
+  factor: 50.0
+wd_sweep: [0.0, 0.0001, 0.001]

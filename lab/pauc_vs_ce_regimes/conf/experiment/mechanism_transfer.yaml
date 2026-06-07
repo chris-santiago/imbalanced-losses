@@ -1,0 +1,32 @@
+# Mechanism transfer (reproduces experiment 03).
+# Expected geometry: headline (sequential split convention — no val set)
+#
+# Tests whether the gradient-concentration mechanism transfers across cue form
+# and budget: gap-closure of concentrated-CE (oracle / HNM) toward PAUC in each
+# cue x budget cell.
+#
+# data_axes: cue changes the data; budget is a training-axis (same data, the
+#   budget-agnostic CE arms train once and are evaluated at every budget; PAUC
+#   trains per budget).
+name: mechanism_transfer
+axes:
+  cue: [nonlinear_prod, nonlinear_radial]
+  budget: [0.005, 0.010]
+data_axes: [cue]
+arms: [weighted_ce, ce_oracle, ce_hnm, pauc_pairwise]
+band: [0.5, 1.5]
+diagnostics: [metric_specificity, grad_mass]
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false
+  ce_oracle:
+    wd_sweep: [0.0]
+    early_stop: false
+  ce_hnm:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false

@@ -1,0 +1,25 @@
+# Confounder geometry — used in experiment 08.
+# Positives and decoys get the easy signal; confounders carry the nonlinear
+# product cue without the easy signal.
+#
+# split_convention: independent
+#   Train, val, and test use independent seeds (seed offsets +0/+1000/+2000).
+#   This supports val-based model selection for experiment 08's sweep arms.
+#
+# NOTE: The flow's seed_base=7000 does NOT reproduce 08's original compound
+# seed formulas.  CI overlap (not exact per-seed match) is the acceptance
+# criterion for this geometry.
+kind: confounder
+n_feat: 20
+easy_feats: [0, 1, 2]
+cue_feats: [5, 6]
+easy: 2.5
+sep: 1.7
+decoy_frac: 0.012
+pos_rate: 0.0015
+confounder_frac: 0.05
+n_train: 150000
+n_val: 50000
+n_test: 300000
+seed_base: 7000
+split_convention: independent

@@ -1,0 +1,29 @@
+# Master config for the PAUC-vs-CE Metaflow pipeline.
+#
+# Hydra defaults list: composes geometry + experiment groups simultaneously.
+#
+# To run an experiment override both groups together:
+#   --config-value cfg "hydra_overrides: [experiment=cue_ablation,geometry=headline]"
+#
+# Shorthand for defaults (headline + cue_ablation are the defaults):
+#   --config-value cfg "hydra_overrides: [experiment=cue_ablation]"
+#
+# To run capacity_warmup (uses hard_bulk geometry):
+#   --config-value cfg "hydra_overrides: [experiment=capacity_warmup,geometry=hard_bulk]"
+#
+# Smoke / fast runs — shrink seeds and data via overrides:
+#   --config-value cfg "hydra_overrides: [experiment=cue_ablation,seeds=1,geometry.n_train=5000,geometry.n_val=2000,geometry.n_test=10000]"
+
+defaults:
+  - geometry: headline
+  - experiment: cue_ablation
+  - training: default
+  - _self_
+
+# Global knobs
+seeds: 8
+bootstrap:
+  n_resamples: 1000
+  seed: 0
+# Hint for Metaflow --max-workers; not enforced here.
+max_workers: 8

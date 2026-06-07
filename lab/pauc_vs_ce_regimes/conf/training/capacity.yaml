@@ -1,0 +1,20 @@
+# Capacity-warmup training config — used for experiment 07 (capacity_warmup).
+#
+# epochs is a per-capacity dict: each capacity string maps to its epoch count.
+# train_cell looks up cfg.training.epochs[capacity] for capacity arms.
+#
+# warmup_frac: 1/3 of total steps for CE warmup (longer than headline default)
+# temp_start / temp_end: no anneal for capacity experiment (fixed temperature)
+hid: 64
+epochs:
+  linear: 150
+  mlp_1x16: 200
+  mlp_2x64: 200
+batch: 8192
+lr: 0.002
+queue: 8192
+warmup_frac: 0.3333
+blend_frac: 0.15
+temp_start: 0.5
+temp_end: 0.5
+eval_every: 25

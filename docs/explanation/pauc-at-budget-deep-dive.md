@@ -443,3 +443,17 @@ build on:
 See also the [`PAUCAtBudgetLoss` reference](../reference/pauc-at-budget-loss.md),
 [Use Ranking Losses](../how-to/use-ranking-losses.md), and
 [Assumptions and Failure Modes](assumptions-and-failure-modes.md).
+
+## Further reading: the regime study
+
+The regime characterization here — when the PAUC win is large versus when it vanishes — is drawn
+from a controlled, CI-backed synthetic study. For the full methodology, results, mechanism, and
+limitations, and to reproduce the numbers yourself:
+
+- [**Technical report**](https://github.com/chris-santiago/imbalanced-losses/blob/main/lab/pauc_vs_ce_regimes/reports/TECHNICAL_REPORT.md)
+  — `PAUCAtBudgetLoss` vs well-tuned cross-entropy on coverage@budget: cue nonlinearity as the binding
+  variable, the operating-point-specific mechanism, surrogate and `pos_numerator` ablations, and the
+  boundary conditions where the advantage disappears.
+- [**Reproducible pipeline**](https://github.com/chris-santiago/imbalanced-losses/tree/main/lab/pauc_vs_ce_regimes)
+  — the self-contained Metaflow + Hydra reproducer (`flow/pauc_flow.py`, configs in `conf/`, validator
+  at `flow/validate.py`). All evidence is synthetic.

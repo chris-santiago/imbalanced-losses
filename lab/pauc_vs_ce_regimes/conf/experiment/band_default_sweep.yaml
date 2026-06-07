@@ -1,0 +1,42 @@
+# Band default sweep (reproduces experiment 06).
+# Expected geometry: headline (sequential split convention — no val set)
+#
+# Default-setting sweep: find a robust default band [alpha,beta] across positive
+# rates by sweeping alpha = ma*budget for ma in {0,0.1,0.25,0.5} and beta =
+# mb*budget for mb in {1.0,1.5,2.5}.  Reference: label-free HNM-CE.  Metric:
+# coverage@50bps.  an_default_sweep reports the best band per pos_rate and the
+# most-robust band across rates.
+#
+# data_axes: pos_rate changes the data; budget is single; the band grid is the
+#   training-axis (12 PAUC combos share each pos_rate dataset).
+name: band_default_sweep
+axes:
+  cue: [nonlinear_prod]
+  pos_rate: [0.001, 0.005, 0.01, 0.02]
+  budget: [0.005]
+  band:
+    - [0.0, 1.0]
+    - [0.0, 1.5]
+    - [0.0, 2.5]
+    - [0.1, 1.0]
+    - [0.1, 1.5]
+    - [0.1, 2.5]
+    - [0.25, 1.0]
+    - [0.25, 1.5]
+    - [0.25, 2.5]
+    - [0.5, 1.0]
+    - [0.5, 1.5]
+    - [0.5, 2.5]
+# cue is single-valued and constant here; listing it as a data-axis keeps the
+# geometry spec correct without multiplying dataset keys.
+data_axes: [pos_rate, cue]
+arms: [ce_hnm, pauc_pairwise]
+diagnostics: [band_decoy_geometry]
+arm_overrides:
+  ce_hnm:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false

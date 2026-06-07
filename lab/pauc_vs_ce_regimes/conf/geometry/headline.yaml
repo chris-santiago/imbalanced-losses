@@ -1,0 +1,24 @@
+# Headline geometry — used in experiments 01-06.
+# Maps to make_data(geometry_spec, seed) with kind='headline'.
+#
+# split_convention: sequential
+#   Train and test are drawn from a single RNG advanced sequentially, matching
+#   the original 01_cue_ablation.py two-call convention:
+#       rng = np.random.default_rng(7000+seed)
+#       make_data(N_TR, cue, rng)   # train
+#       make_data(N_TE, cue, rng)   # test (continues same stream)
+#   No validation set is produced.  Arms with early_stop or sweep selection
+#   must not be used under this convention without independent splits.
+kind: headline
+n_feat: 20
+easy_feats: [0, 1, 2]
+cue_feats: [5, 6]
+easy: 2.5
+sep: 1.7
+decoy_frac: 0.012
+pos_rate: 0.0015
+n_train: 150000
+n_val: 50000
+n_test: 300000
+seed_base: 7000
+split_convention: sequential
