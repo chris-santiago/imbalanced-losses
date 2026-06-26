@@ -7,6 +7,26 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 *No unreleased changes.*
 
+## 0.4.2 — 2026-06-25
+
+### Fixed
+
+- **`LossWarmupWrapper` no longer fails silently when `on_train_batch_start` is
+  omitted.** In epoch mode (and the no-warmup fast path), forgetting to wire the
+  per-step hook left temperature scheduling silently disabled: `temp_start`,
+  `temp_end`, and `temp_decay_steps` were ignored and `main_loss.temperature`
+  never decayed, with no error and a plausible-looking constant in the logs.
+  Phase switching still worked, so the failure was invisible. `forward` now emits
+  a one-time `UserWarning` when the main phase is active, the main loss exposes a
+  `temperature`, and the batch hook has never been called. The batch hook is
+  required in epoch mode too, not only step mode.
+
+### Other
+
+- Added a public `lab/pauc_vs_ce_regimes/` study (PAUC-vs-CE operating-point
+  regimes) and linked it from the `PAUCAtBudgetLoss` deep-dive. Research material
+  only; not part of the shipped package.
+
 ## 0.4.1 — 2026-06-06
 
 ### Changed
