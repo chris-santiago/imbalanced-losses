@@ -1,0 +1,2661 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="PyTorch losses for class-imbalanced classification and ranking-metric optimization — Focal Loss, Smooth-AP, Recall-at-Quantile, and Partial-AUC-at-Budget, with DDP all-gather support.">
+      
+      
+        <meta name="author" content="Chris Santiago">
+      
+      
+        <link rel="canonical" href="https://chris-santiago.github.io/imbalanced-losses/explanation/pauc-at-budget-deep-dive/">
+      
+      
+        <link rel="prev" href="../why-imbalanced-losses/">
+      
+      
+        <link rel="next" href="../memory-queue/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>PAUCAtBudgetLoss Deep Dive - imbalanced-losses</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#paucatbudgetloss-a-deep-dive" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="imbalanced-losses" class="md-header__button md-logo" aria-label="imbalanced-losses" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            imbalanced-losses
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              PAUCAtBudgetLoss Deep Dive
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/chris-santiago/imbalanced-losses" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    chris-santiago/imbalanced-losses
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../tutorials/" class="md-tabs__link">
+          
+  
+  
+  Tutorials
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../how-to/" class="md-tabs__link">
+          
+  
+  
+  How-To Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../reference/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../" class="md-tabs__link">
+          
+  
+  
+  Explanation
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="imbalanced-losses" class="md-nav__button md-logo" aria-label="imbalanced-losses" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    imbalanced-losses
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/chris-santiago/imbalanced-losses" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    chris-santiago/imbalanced-losses
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tutorials
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Tutorials
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tutorials
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tutorials/multiclass-classification/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Multiclass Classification
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    How-To Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    How-To Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    How-To Guides
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/use-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Use Focal Loss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/use-ranking-losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Use Ranking Losses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/configure-warmup/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configure Warmup and Blending
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/train-with-ddp/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Train with DDP
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/log-per-class-metrics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Log Per-Class Metrics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/migrate-from-cross-entropy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Migrate from BCE / CrossEntropyLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/sigmoid-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SigmoidFocalLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/softmax-focal-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SoftmaxFocalLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/smooth-ap-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SmoothAPLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/recall-at-quantile-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    RecallAtQuantileLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/pauc-at-budget-loss/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    PAUCAtBudgetLoss
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/loss-warmup-wrapper/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LossWarmupWrapper
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/distributed/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Distributed Utilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Explanation
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Explanation
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Explanation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../why-imbalanced-losses/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Why Imbalanced Losses
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    PAUCAtBudgetLoss Deep Dive
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    PAUCAtBudgetLoss Deep Dive
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#abstract" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Abstract
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-motivation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Motivation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-formulation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Formulation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Formulation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-the-target-quantity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 The target quantity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-band-edges-iid-anchored-stop-gradient" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 Band edges (iid-anchored, stop-gradient)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-surrogates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Surrogates
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-scale-aware-temperature" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 Scale-aware temperature
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-pos_numerator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 pos_numerator
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-mechanisms-and-properties" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Mechanisms and properties
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Mechanisms and properties">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-stays-population-fpr-iid-anchoring" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 β stays population FPR (iid anchoring)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-scale-invariance-the-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 Scale invariance (the τ design)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-gradient-dilution-and-pos_numerator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 Gradient dilution and pos_numerator
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-degenerate-dispersion-guard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 Degenerate-dispersion guard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-verified-correctness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 Verified correctness
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-experiments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Experiments
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Experiments">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-the-binding-variable-is-the-operating-point-cue-one-cross-entropy-under-learns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 The binding variable: is the operating-point cue one cross-entropy under-learns?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-surrogate-specificity-only-pairwise-survives-a-contested-negative-top" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Surrogate specificity: only pairwise survives a contested-negative top
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-the-shipped-demo-a-contested-negative-top-reproducible" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 The shipped demo: a contested-negative top (reproducible)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-the-pos_numerator-rescue-non-contested-top" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 The pos_numerator rescue (non-contested top)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#45-where-the-gap-closes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.5 Where the gap closes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-why-it-wins-adaptive-hard-negative-mining-at-the-operating-point" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Why it wins: adaptive hard-negative mining at the operating point
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Why it wins: adaptive hard-negative mining at the operating point">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-the-mechanism-the-band-is-a-hard-negative-miner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 The mechanism: the band is a hard-negative miner
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-it-is-allocation-not-capacity-and-a-label-free-rule-reproduces-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 It is allocation, not capacity — and a label-free rule reproduces it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#53-band-escape-why-the-default-leaves-coverage-on-the-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.3 Band escape — why the default α leaves coverage on the table
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-when-to-use-it-and-when-not" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. When to use it (and when not)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Limitations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        References
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#further-reading-the-regime-study" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Further reading: the regime study
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../memory-queue/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Queue Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../temperature-soft-ranking/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Temperature and Soft Ranking
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ddp-all-gather/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    DDP All-Gather and Gradients
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../assumptions-and-failure-modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Assumptions and Failure Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#abstract" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Abstract
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-motivation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Motivation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-formulation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Formulation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Formulation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-the-target-quantity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 The target quantity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-band-edges-iid-anchored-stop-gradient" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 Band edges (iid-anchored, stop-gradient)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-surrogates" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Surrogates
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-scale-aware-temperature" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 Scale-aware temperature
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-pos_numerator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 pos_numerator
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-mechanisms-and-properties" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Mechanisms and properties
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Mechanisms and properties">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-stays-population-fpr-iid-anchoring" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 β stays population FPR (iid anchoring)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-scale-invariance-the-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 Scale invariance (the τ design)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-gradient-dilution-and-pos_numerator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 Gradient dilution and pos_numerator
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-degenerate-dispersion-guard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 Degenerate-dispersion guard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-verified-correctness" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 Verified correctness
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-experiments" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Experiments
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Experiments">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-the-binding-variable-is-the-operating-point-cue-one-cross-entropy-under-learns" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 The binding variable: is the operating-point cue one cross-entropy under-learns?
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-surrogate-specificity-only-pairwise-survives-a-contested-negative-top" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 Surrogate specificity: only pairwise survives a contested-negative top
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-the-shipped-demo-a-contested-negative-top-reproducible" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 The shipped demo: a contested-negative top (reproducible)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-the-pos_numerator-rescue-non-contested-top" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 The pos_numerator rescue (non-contested top)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#45-where-the-gap-closes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.5 Where the gap closes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-why-it-wins-adaptive-hard-negative-mining-at-the-operating-point" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Why it wins: adaptive hard-negative mining at the operating point
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Why it wins: adaptive hard-negative mining at the operating point">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-the-mechanism-the-band-is-a-hard-negative-miner" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 The mechanism: the band is a hard-negative miner
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-it-is-allocation-not-capacity-and-a-label-free-rule-reproduces-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 It is allocation, not capacity — and a label-free rule reproduces it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#53-band-escape-why-the-default-leaves-coverage-on-the-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.3 Band escape — why the default α leaves coverage on the table
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-when-to-use-it-and-when-not" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. When to use it (and when not)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-limitations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Limitations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        References
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#further-reading-the-regime-study" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Further reading: the regime study
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href="../.." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Explanation
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="paucatbudgetloss-a-deep-dive">PAUCAtBudgetLoss: a deep dive<a class="headerlink" href="#paucatbudgetloss-a-deep-dive" title="Permanent link">&para;</a></h1>
+<p>A technical write-up of <code>PAUCAtBudgetLoss</code> — what it optimizes, how each piece
+works, where it helps, and where it does not. It is candid about limitations:
+on easy problems a well-weighted cross-entropy is hard to beat, and the gains
+are regime-specific.</p>
+<h2 id="abstract">Abstract<a class="headerlink" href="#abstract" title="Permanent link">&para;</a></h2>
+<p><code>PAUCAtBudgetLoss</code> optimizes the <strong>normalized partial AUC over a false-positive-rate
+band</strong> <code>[α, β]</code> that brackets a deployment operating point (e.g. a 50 bps alert
+budget), rather than the whole ROC/PR curve or a single score threshold. The band
+edges are estimated as <strong>stop-gradient score quantiles of the iid negatives</strong>, so
+<code>β</code> keeps meaning population FPR even when a caller densifies the batch. A
+<strong>scale-aware temperature</strong> keeps the surrogate's sharpness constant in FPR units as
+the model's score scale drifts during training. Two surrogates are provided — a
+<strong>trapezoid</strong> estimator (soft-TPR integrated over the band) and a <strong>pairwise</strong>
+estimator (band-restricted Smooth-AP) — and a <code>pos_numerator</code> switch controls
+whether the numerator uses all pooled positives or only the live, gradient-carrying
+ones. The loss is an original design; the partial-AUC objective it targets has a
+long published lineage (see <a href="#references">References</a>).</p>
+<h2 id="1-motivation">1. Motivation<a class="headerlink" href="#1-motivation" title="Permanent link">&para;</a></h2>
+<p>For an alerting or review workload, the metric that matters is <strong>coverage at a
+budget</strong>: if you can action the top <code>b</code> fraction of scores (say the top 0.5 % —
+"50 bps"), what fraction of positives do you catch? Equivalently, recall at a fixed
+low false-positive rate. This is decided entirely at the <strong>top of the score
+ranking</strong>, and standard objectives do not optimize it directly:</p>
+<ul>
+<li><strong>Cross-entropy</strong> optimizes calibrated per-sample likelihood. Its gradient is
+  spread across the whole distribution and, at extreme imbalance, dominated by the
+  mass of easy negatives.</li>
+<li><strong>AUCPR / Smooth-AP</strong> optimize the <em>whole</em> precision–recall curve.</li>
+<li><strong>Recall-at-Quantile</strong> optimizes a <em>single</em> threshold.</li>
+</ul>
+<p>A common symptom motivates this loss: improving a model — scaling up capacity, more
+training, better features — can <strong>raise mid-range AUCPR while leaving, or even
+degrading, coverage at the operating point.</strong> The model gets better in the bulk of
+the score distribution and no better, or worse, exactly where it is deployed.
+Whole-curve and per-sample objectives have no special pull on the top of the
+ranking, so improvements land where the mass is, not where the budget is. When your
+objective is a <em>band</em> of the ROC around a fixed budget, optimize that band directly.</p>
+<p><code>PAUCAtBudgetLoss</code> sits between Smooth-AP (whole curve) and Recall-at-Quantile
+(single point): it optimizes a <strong>region</strong> of the ROC.</p>
+<h2 id="2-formulation">2. Formulation<a class="headerlink" href="#2-formulation" title="Permanent link">&para;</a></h2>
+<p>For one class, let <code>s</code> be the scores, <code>P</code> the positives, and <code>N</code> the negatives.</p>
+<h3 id="21-the-target-quantity">2.1 The target quantity<a class="headerlink" href="#21-the-target-quantity" title="Permanent link">&para;</a></h3>
+<p>The normalized partial AUC over the FPR band <code>[α, β]</code> has a clean probabilistic
+form:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pAUC_norm(α, β) = P( s_i &gt; s_j  |  i ∈ P,  s_j ∈ band )
+</code></pre></div>
+<p>where the <strong>band</strong> is the set of negatives whose score falls between the two FPR
+edges. Writing <code>g</code> for the negative score density and <code>TPR(t) = P(s_pos &gt; t)</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>∫_α^β TPR(u) du  =  ∫_{t_β}^{t_α} P(s_pos &gt; t) g(t) dt  =  P(s_pos &gt; s_neg ∧ s_neg ∈ band)
+</code></pre></div>
+<p>and the band holds exactly <code>(β − α)</code> of the negative mass, so dividing by <code>(β − α)</code>
+gives the conditional probability above. This makes the loss a <em>consistent plug-in
+estimator</em> of a well-defined integral, not a heuristic.</p>
+<h3 id="22-band-edges-iid-anchored-stop-gradient">2.2 Band edges (iid-anchored, stop-gradient)<a class="headerlink" href="#22-band-edges-iid-anchored-stop-gradient" title="Permanent link">&para;</a></h3>
+<p>The two edges are score quantiles of the <strong>iid negatives only</strong>, detached:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>t_α = quantile(neg_iid, 1 − α)        [no grad]
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>t_β = quantile(neg_iid, 1 − β)        [no grad]      (t_β ≤ t_α since α &lt; β)
+</code></pre></div>
+<p>A negative is "in the band" iff <code>t_β ≤ s ≤ t_α</code>. FPR at threshold <code>t</code> is the
+fraction of negatives scoring above <code>t</code>, so this is exactly FPR ∈ <code>[α, β]</code>.
+With the recommended <code>α=0</code>, <code>t_α = max(neg_iid)</code> and the band covers all negatives
+above the budget threshold (empirically: on 2M N(0,1) negatives with <code>α=0, β=0.005</code>,
+the band holds ≈ <code>β</code> of the mass and includes the top-scoring false-positives).</p>
+<h3 id="23-surrogates">2.3 Surrogates<a class="headerlink" href="#23-surrogates" title="Permanent link">&para;</a></h3>
+<p><strong>Trapezoid</strong> (default). Place <code>n_knots</code> equally-spaced FPR knots <code>f_k ∈ [α, β]</code>
+(endpoints included), each with a detached threshold <code>t_k = quantile(neg_iid, 1 − f_k)</code>.
+Soft-TPR at each knot, then composite-trapezoid integrate:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>TPR̂_k = mean_{i ∈ P} σ((s_i − t_k) / τ_eff)
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>pAUC  = ( ½·TPR̂_0 + Σ_mid TPR̂_k + ½·TPR̂_{K−1} ) / (n_knots − 1)
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>loss  = 1 − pAUC
+</code></pre></div>
+<p>Gradient flows through positives only; negatives enter solely via the detached
+thresholds. Cost is <code>O(|P| × n_knots)</code>. For a narrow band, <code>n_knots = 2</code> is accurate
+(trapezoid error scales as <code>(β − α)³ · TPR''</code>); use <code>n_knots ≥ 3</code> for wide bands.</p>
+<p><strong>Pairwise</strong> (<code>surrogate="pairwise"</code>). Band-restricted Smooth-AP — compare positives
+against the negatives that land <em>inside</em> the band, which carry gradient:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>pAUC = mean_{i ∈ P, j ∈ band} σ((s_i − s_j) / τ_eff)
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>loss = 1 − pAUC
+</code></pre></div>
+<p>Cost is <code>O(|P| × |band|)</code>. Because it <em>pushes the band negatives down</em>, it is the
+right tool when the operating point is contested by hard negatives.</p>
+<h3 id="24-scale-aware-temperature">2.4 Scale-aware temperature<a class="headerlink" href="#24-scale-aware-temperature" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>τ_eff = temperature × scale          (scale detached)
+</code></pre></div>
+<p>where <code>scale</code> is a robust dispersion of the iid negatives — <code>IQR</code> by default
+(<code>tau_scale="iqr"</code>), or the band width <code>t_α − t_β</code> (<code>tau_scale="band"</code>).
+<code>temperature</code> is therefore a <strong>dimensionless</strong> multiplier (default <code>0.1</code>), unlike the
+raw-logit <code>temperature=0.01</code> of the sibling losses.</p>
+<h3 id="25-pos_numerator">2.5 <code>pos_numerator</code><a class="headerlink" href="#25-pos_numerator" title="Permanent link">&para;</a></h3>
+<p><code>"pool"</code> (default) averages the numerator over all pooled positives (live batch +
+memory queue); <code>"live"</code> averages over the live-batch positives only. See §3.3.</p>
+<h2 id="3-mechanisms-and-properties">3. Mechanisms and properties<a class="headerlink" href="#3-mechanisms-and-properties" title="Permanent link">&para;</a></h2>
+<h3 id="31-stays-population-fpr-iid-anchoring">3.1 β stays population FPR (iid anchoring)<a class="headerlink" href="#31-stays-population-fpr-iid-anchoring" title="Permanent link">&para;</a></h3>
+<p>Because the edges depend only on rows flagged <code>iid_mask=True</code>, appending non-iid
+negatives (caller-side hard-negative mining / class-balanced sampling) does not move
+<code>t_α</code> / <code>t_β</code>. With <code>iid_mask=None</code> (the default) every negative is treated as iid —
+correct for any pipeline that never densifies negatives by class. The mask is
+gathered across DDP ranks and stored per-row in the queue, so the edges are computed
+from the <strong>global</strong> iid-negative pool. <em>(Verified: thresholds and loss are
+bit-invariant to injected non-iid negatives.)</em></p>
+<h3 id="32-scale-invariance-the-design">3.2 Scale invariance (the τ design)<a class="headerlink" href="#32-scale-invariance-the-design" title="Permanent link">&para;</a></h3>
+<p>A fixed raw-logit temperature silently hardens as a model's score scale inflates
+during training — the sigmoid saturates and band gradient vanishes exactly when
+overfitting begins. Since <code>τ_eff ∝ scale</code> (a detached statistic of the negatives),
+the ratio <code>(s − t)/τ_eff</code> is held roughly constant: scaling all logits by a constant
+leaves the normalized loss and the gradient <em>direction</em> unchanged. <em>(Verified: loss
+bit-identical and gradient-direction cosine 1.0 under score scaling, for both
+<code>tau_scale</code> settings and all quantile interpolations.)</em></p>
+<h3 id="33-gradient-dilution-and-pos_numerator">3.3 Gradient dilution and <code>pos_numerator</code><a class="headerlink" href="#33-gradient-dilution-and-pos_numerator" title="Permanent link">&para;</a></h3>
+<p>The trapezoid numerator is a mean over positives. At extreme imbalance a minibatch
+holds only a handful of live (gradient-carrying) positives, while the memory queue
+holds many <em>detached</em> ones. Under <code>pos_numerator="pool"</code> the live gradient is scaled
+by <code>1/|P_pool|</code> and the soft-TPR value is dominated by stale queue positives — the
+trapezoid surrogate underperforms or destabilizes. <code>pos_numerator="live"</code> computes
+the numerator over the live positives only (the queue still feeds the thresholds),
+restoring an undiluted gradient. This is <strong>surrogate-dependent</strong>: it rescues the
+trapezoid, but the pairwise surrogate generally prefers <code>"pool"</code>, because restricting
+its positive × band-negative contrast to a few live positives starves it.</p>
+<h3 id="34-degenerate-dispersion-guard">3.4 Degenerate-dispersion guard<a class="headerlink" href="#34-degenerate-dispersion-guard" title="Permanent link">&para;</a></h3>
+<p>If the iid-negative dispersion is ≈ 0 (near-constant negatives, or a band collapsed
+because too few iid negatives resolve the tail quantile), the class is marked invalid
+and excluded from the reduction, with a one-time warning — instead of producing a
+signal-free or exploding gradient. Relatedly, the band edges approximate population
+FPR only when the pooled iid-negative count <strong>substantially exceeds <code>1/α</code></strong>; below
+that the tail quantile is biased toward the maximum. The <code>band_neg_count</code> diagnostic
+is the empirical check.</p>
+<h3 id="35-verified-correctness">3.5 Verified correctness<a class="headerlink" href="#35-verified-correctness" title="Permanent link">&para;</a></h3>
+<p>A technical review checked the math against analytic/large-sample references: the
+quantile→FPR mapping is exact; the trapezoid normalization equals mean-TPR over the
+band; trapezoid and pairwise both estimate <code>P(s_pos &gt; s_neg | s_neg ∈ band)</code>; the
+band edges and <code>τ_eff</code> are detached so gradient flows only through positives
+(trapezoid) or positives + band negatives (pairwise); degenerate cases are NaN-free.
+No mathematical errors were found.</p>
+<h2 id="4-experiments">4. Experiments<a class="headerlink" href="#4-experiments" title="Permanent link">&para;</a></h2>
+<p>These are small, controlled, CPU-scale synthetic studies — <strong>not</strong> large-scale
+benchmark claims. They come in two tiers, and the second is the stronger basis for
+everything that follows:</p>
+<ol>
+<li><strong>The shipped demo</strong> (<code>examples/coverage_at_budget_demo.py</code>) — a single,
+   reproducible contested-top instance you can run in one command (§4.3).</li>
+<li><strong>A controlled investigation</strong> — a CI-backed ablation (8 seeds, bootstrap-over-seed
+   paired CIs) that isolates <em>what</em> makes the advantage appear and characterizes it
+   across cue form, budget, surrogate, and capacity. This is far more informative than
+   any single demo run: it identifies the <strong>binding variable</strong> and underwrites the
+   mechanism in §5.</li>
+</ol>
+<p>Metrics are averaged over seeds because coverage at 50 bps is estimated from few
+validation positives and is noisy per seed; the investigation reports a bootstrap CI
+on every lift and counts a result only when the CI excludes zero.</p>
+<h3 id="41-the-binding-variable-is-the-operating-point-cue-one-cross-entropy-under-learns">4.1 The binding variable: is the operating-point cue one cross-entropy under-learns?<a class="headerlink" href="#41-the-binding-variable-is-the-operating-point-cue-one-cross-entropy-under-learns" title="Permanent link">&para;</a></h3>
+<p>A single "pairwise beats CE by X %" number does not tell you <em>when</em> the loss helps.
+The controlled ablation answers that by holding <strong>the same two discriminative
+features</strong> fixed and varying only the <strong>functional form of the cue</strong> that separates
+positives from the decoys at the operating point. The cue's linearity — not bulk
+difficulty, capacity, or class ratio — is the determinant:</p>
+<table>
+<thead>
+<tr>
+<th>cue (50 bps, 8 seeds)</th>
+<th style="text-align: right;">CE coverage</th>
+<th style="text-align: right;">PAUC-pairwise</th>
+<th>lift [95 % CI]</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>linear</strong> (same two features)</td>
+<td style="text-align: right;">0.864</td>
+<td style="text-align: right;">0.880</td>
+<td><strong>+0.015 [+0.005, +0.024]</strong></td>
+</tr>
+<tr>
+<td><strong>nonlinear, product</strong> (<code>f5·f6</code>)</td>
+<td style="text-align: right;">0.575</td>
+<td style="text-align: right;">0.791</td>
+<td><strong>+0.216 [+0.183, +0.257]</strong></td>
+</tr>
+<tr>
+<td><strong>nonlinear, radial</strong> (distinct form)</td>
+<td style="text-align: right;">0.426</td>
+<td style="text-align: right;">0.638</td>
+<td><strong>+0.212 [+0.177, +0.247]</strong></td>
+</tr>
+</tbody>
+</table>
+<p>A <strong>linear</strong> cue is cheap for cross-entropy to capture, so its coverage stays high
+(0.86) and PAUC adds almost nothing (+0.015). A <strong>nonlinear</strong> cue that is relevant
+only to the rare top is one cross-entropy's bulk-dominated gradient never invests in
+(coverage 0.43–0.58), and the band-focused PAUC gradient drives the MLP to learn it —
+an <strong>order-of-magnitude larger</strong> lift that <strong>replicates across two distinct nonlinear
+forms</strong> with intervals that do not overlap the linear cue's. This is the headline
+result of the investigation, and §5 explains the mechanism behind it.</p>
+<p>Two qualifiers come from the same study:</p>
+<ul>
+<li><strong>Operating-point specific.</strong> Across these cells AUROC stays ~0.99 — the loss moves
+  coverage at the budget without making a globally better-ranked model. The advantage
+  is concentrated exactly where you deploy, which is the whole point.</li>
+<li><strong>Budget-dependent.</strong> The nonlinear-product lift falls from <strong>+0.216 at 50 bps</strong> to
+  <strong>+0.045 [+0.035, +0.055] at 100 bps</strong>: a wider budget is easier for cross-entropy,
+  leaving less for the band to recover. The advantage is largest at the tightest
+  budgets, and is gated on enough capacity (an MLP, to represent the cue at all) plus
+  CE warmup and temperature annealing for stable training.</li>
+</ul>
+<h3 id="42-surrogate-specificity-only-pairwise-survives-a-contested-negative-top">4.2 Surrogate specificity: only <code>pairwise</code> survives a contested-<em>negative</em> top<a class="headerlink" href="#42-surrogate-specificity-only-pairwise-survives-a-contested-negative-top" title="Permanent link">&para;</a></h3>
+<p>Within the nonlinear regime the surrogate choice is not a free parameter. The
+<strong>pairwise</strong> surrogate carries the entire advantage; the <strong>trapezoid</strong> surrogate
+collapses to the trivial floor, because it only lifts positives toward detached
+thresholds and never suppresses the band negatives — the wrong tool when the top is
+contested by hard <em>negatives</em>. <code>SmoothAPLoss</code>, a strong whole-curve ranking baseline
+that sees the same data, reaches ~0.72 in the favorable regime but is beaten on
+coverage@budget by the band-restricted pairwise surrogate (~0.79), exactly as
+expected for a whole-curve objective that does not concentrate at one operating point.</p>
+<h3 id="43-the-shipped-demo-a-contested-negative-top-reproducible">4.3 The shipped demo: a contested-negative top (reproducible)<a class="headerlink" href="#43-the-shipped-demo-a-contested-negative-top-reproducible" title="Permanent link">&para;</a></h3>
+<p>The bundled demo is one reproducible instance of the favorable regime: sub-1 %
+positives; hard "decoy" negatives at the operating point, separable only by a weak
+nonlinear cue; "confounder" negatives that carry the cue without the easy signal (so
+over-using it costs AUCPR). Weighted CE protects the bulk and under-resolves the top.</p>
+<table>
+<thead>
+<tr>
+<th>loss</th>
+<th>AUCPR</th>
+<th>coverage@50bps</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Weighted CE</td>
+<td>~0.24</td>
+<td>0.573 ± 0.094</td>
+</tr>
+<tr>
+<td>SmoothAP</td>
+<td>~0.47</td>
+<td>0.704 ± 0.152</td>
+</tr>
+<tr>
+<td>PAUC trapezoid</td>
+<td>~0.11</td>
+<td>0.38 (collapses)</td>
+</tr>
+<tr>
+<td><strong>PAUC pairwise</strong></td>
+<td>~0.54</td>
+<td><strong>0.772 ± 0.051</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The pairwise surrogate recovers coverage CE leaves on the table (<strong>+35 %</strong>,
+seed-stable) — the same effect the CI-backed ablation in §4.1 isolates, here in a
+form you can reproduce in one command.</p>
+<h3 id="44-the-pos_numerator-rescue-non-contested-top">4.4 The <code>pos_numerator</code> rescue (non-contested top)<a class="headerlink" href="#44-the-pos_numerator-rescue-non-contested-top" title="Permanent link">&para;</a></h3>
+<p>On easier data where the top is not contested by hard negatives, the trapezoid is
+the natural surrogate, but with a large queue and few live positives it is
+gradient-diluted under <code>"pool"</code>. Switching to <code>pos_numerator="live"</code> restores it to
+competitive coverage. (On the contested-negative data of §4.3, the opposite holds —
+pairwise wants <code>"pool"</code>.)</p>
+<h3 id="45-where-the-gap-closes">4.5 Where the gap closes<a class="headerlink" href="#45-where-the-gap-closes" title="Permanent link">&para;</a></h3>
+<p>On cleanly separable tops — e.g. the Kaggle credit-card fraud data (~17 bps), whose
+top is well separated (AUROC ≈ 0.97) — weighted CE already catches ~84 % at 50 bps,
+and all losses land within noise. There is simply no contested region for a band loss
+to recover. <strong>This is the honest common case for easy data.</strong></p>
+<h2 id="5-why-it-wins-adaptive-hard-negative-mining-at-the-operating-point">5. Why it wins: adaptive hard-negative mining at the operating point<a class="headerlink" href="#5-why-it-wins-adaptive-hard-negative-mining-at-the-operating-point" title="Permanent link">&para;</a></h2>
+<p>§4.1 shows the pairwise surrogate recovering coverage that weighted CE leaves on the
+table. This section explains <em>why</em>, and the explanation is deflationary in a useful
+way: the win is a <strong>gradient-allocation effect</strong>, not a property unique to the
+partial-AUC objective. The evidence below comes from a controlled investigation on
+contested-top synthetic data (a nonlinear, rarely-relevant cue; 8 seeds, bootstrap
+CIs over paired per-seed differences) — the same regime as §4.1, run with the
+diagnostics instrumented.</p>
+<h3 id="51-the-mechanism-the-band-is-a-hard-negative-miner">5.1 The mechanism: the band <em>is</em> a hard-negative miner<a class="headerlink" href="#51-the-mechanism-the-band-is-a-hard-negative-miner" title="Permanent link">&para;</a></h3>
+<p>The pairwise surrogate contrasts each positive against the negatives whose scores
+fall in the FPR band around the budget. <strong>By construction those band negatives are
+the decoys</strong> — they are the only negatives that reach the top of the ranking — so
+almost all of the loss's gradient is spent on the positives-versus-decoy contrast,
+which is exactly the comparison the cue is needed to resolve. Cross-entropy
+optimizes average log-loss; it sees the decoys as ~1.2 % of all negatives and never
+concentrates there, so the bulk-dominated gradient under-invests in the one
+distinction that decides coverage at the budget.</p>
+<p>Two diagnostics on <strong>identical data and scores</strong> make this concrete:</p>
+<ul>
+<li><strong>Band enrichment.</strong> The pairwise band is <strong>~73 % decoys against a 1.2 % base
+  rate</strong> — roughly <strong>60× enrichment</strong> — and it selects them <strong>with no decoy
+  labels.</strong> The band is a label-free hard-negative miner.</li>
+<li><strong>Gradient mass.</strong> PAUC places <strong>~96 % of its negative-gradient mass on decoys</strong>,
+  versus <strong>~58 % for cross-entropy</strong> scored on the same model outputs.</li>
+</ul>
+<h3 id="52-it-is-allocation-not-capacity-and-a-label-free-rule-reproduces-it">5.2 It is allocation, not capacity — and a label-free rule reproduces it<a class="headerlink" href="#52-it-is-allocation-not-capacity-and-a-label-free-rule-reproduces-it" title="Permanent link">&para;</a></h3>
+<p>If the advantage were that PAUC <em>represents</em> the cue better, giving cross-entropy the
+same gradient concentration would not help. It does. On the contested-top cell
+(CE 0.576, pairwise PAUC 0.792):</p>
+<table>
+<thead>
+<tr>
+<th>variant</th>
+<th>coverage@50bps</th>
+<th>note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Weighted CE</td>
+<td>0.576</td>
+<td>baseline</td>
+</tr>
+<tr>
+<td>CE + oracle decoy up-weight ×10</td>
+<td>0.767</td>
+<td>uses decoy labels</td>
+</tr>
+<tr>
+<td>CE + label-free top-score HNM</td>
+<td>0.765</td>
+<td>no labels — mines the top of the negative ranking</td>
+</tr>
+<tr>
+<td><strong>PAUC pairwise</strong></td>
+<td><strong>0.792</strong></td>
+<td>adaptive, label-free</td>
+</tr>
+</tbody>
+</table>
+<p>Concentrating cross-entropy's gradient — whether by an oracle decoy up-weight or a
+label-free top-score hard-negative-mining rule — <strong>recovers ~90 % of the advantage</strong>
+(the −0.216 gap collapses to ≈ −0.025). A complementary check rules out the capacity
+story directly: a <strong>linear probe</strong> separating positives from decoys on the
+penultimate activations scores <strong>0.895 (CE) vs 0.910 (PAUC)</strong> — nearly equal, so both
+models <em>encode</em> the cue and differ only in whether the objective <strong>acts on it at the
+budget.</strong> And the concentration must be <em>bounded</em>: crude over-concentration degrades a
+pointwise loss (oracle ×30 &lt; ×10 in every cell; ×50 → 0.702, ×200 → 0.632), whereas
+PAUC's bounded contrast over an adaptively tracking band does not.</p>
+<p>The effect <strong>transfers</strong> across cue form (product, radial) and budget (50, 100 bps):
+concentrating cross-entropy's gradient closes <strong>≥ 89 % of the CE→PAUC gap in all four
+cells</strong>, and a label-free HNM-CE <strong>matches or beats PAUC in three of the four.</strong> So
+the partial-AUC objective has no categorically higher ceiling here. Its distinct
+contribution is delivering the concentration <strong>adaptively and stably, without a tuned
+up-weight factor and without decoy labels</strong> — the band tracks the operating point as
+the score scale drifts, where a hand-set mining factor does not.</p>
+<h3 id="53-band-escape-why-the-default-leaves-coverage-on-the-table">5.3 Band escape — why the default <code>α</code> leaves coverage on the table<a class="headerlink" href="#53-band-escape-why-the-default-leaves-coverage-on-the-table" title="Permanent link">&para;</a></h3>
+<p>The same mechanism explains where the <em>default</em> band underperforms, and the fix is
+one knob. The decoys pile up at the very top of the negative score distribution, but
+the pairwise gradient only reaches the FPR band <code>[α, β]</code>. With the older default
+<code>[budget/2, 1.5·budget]</code>, that band contains only <strong>40–48 % of the decoys</strong> while
+<strong>21 % (50 bps) to 41 % (100 bps) escape <em>above</em> it</strong> (above <code>t_α</code>) and receive no
+gradient at all — compared with <strong>92–94 %</strong> captured by a top-2 % miner.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>default band [budget/2, 1.5·budget]:   t_β        t_α
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>score axis  ──────────────┼──── band ───┼──────────►  (higher score)
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>                          │             │
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>   decoys below        in band      decoys ESCAPE here
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>   (no gradient)       (gradient)   (no gradient — but they&#39;re the worst FPs)
+</code></pre></div>
+<p>Because <code>α = budget/2</code> caps the band below the top, the highest-scoring
+false-positives — the decoys that most hurt coverage — sit <em>above</em> <code>t_α</code> and are
+never pushed down. <strong>Lowering <code>α</code> toward 0 widens the band up to <code>t_α = max(neg_iid)</code>,
+covering the escaped top decoys.</strong> This improves PAUC in every cell (<strong>+0.017 to
++0.056</strong> over the default) and makes wide-band PAUC match or beat the HNM rule in
+three of four cells. A full sweep over both edges and four positive rates finds the
+robust optimum at <strong><code>α = 0, β = budget</code></strong> — precisely the band of false-positives at
+the operating point — which is why that is now the recommended default (§6). The gain
+concentrates at <code>pos_rate ≪ budget</code> and vanishes once <code>pos_rate ≥ budget</code>, where
+coverage@budget is capped at <code>budget / pos_rate</code>.</p>
+<p>The takeaway for practice: <strong>a label-free hard-negative-mined cross-entropy and
+PAUC with a sufficiently wide band are roughly equivalent implementations of the same
+gradient-concentration mechanism.</strong> Reach for the pairwise band when you want that
+concentration delivered adaptively and without labels; if you already have a working
+HNM pipeline, you are most of the way there.</p>
+<h2 id="6-when-to-use-it-and-when-not">6. When to use it (and when not)<a class="headerlink" href="#6-when-to-use-it-and-when-not" title="Permanent link">&para;</a></h2>
+<p><strong>Reach for <code>PAUCAtBudgetLoss</code> when:</strong></p>
+<ul>
+<li>Your deployment metric is recall at a fixed, low false-positive <strong>budget</strong> (alerting,
+  screening, fraud review), not whole-curve AP.</li>
+<li>The operating point is <strong>contested by hard negatives</strong> the model must learn to push
+  down — use <code>surrogate="pairwise"</code>.</li>
+<li>You are at extreme imbalance but the pool (batch + queue, with DDP gather) holds far
+  more than <code>1/α</code> iid negatives.</li>
+</ul>
+<p><strong>Prefer something else when:</strong></p>
+<ul>
+<li>The top is already cleanly separable — a well-weighted CE or <code>SmoothAPLoss</code> is hard
+  to beat, and the extra machinery buys little.</li>
+<li>You care about the <strong>whole</strong> ranking → <code>SmoothAPLoss</code>; or a <strong>single hard
+  threshold</strong> → <code>RecallAtQuantileLoss</code>.</li>
+<li>The pool cannot supply enough iid negatives for a stable tail quantile at your <code>α</code>.</li>
+</ul>
+<p><strong>Configuration heuristics:</strong></p>
+<ul>
+<li><strong>Recommended band: <code>α ≈ 0, β ≈ budget</code></strong> (e.g. <code>alpha=0.0, beta=0.005</code> for
+  50 bps). Sets <code>t_alpha = max(neg_iid)</code>, contrasting positives against every
+  false-positive above the budget threshold. The older <code>[budget/2, 1.5·budget]</code>
+  convention excludes the highest-scoring negatives (via <code>alpha = budget/2</code>) and
+  extends below the threshold (via <code>beta = 1.5·budget</code>); a band sweep on
+  synthetic contested-top data found it in the poorly-performing high-<code>alpha</code>
+  region (the worst cell being <code>alpha=budget/2, beta=2.5·budget</code>).
+  Caveat: evidence is synthetic, 50 bps only, contested-top regime; improvement
+  concentrates at <code>pos_rate ≪ budget</code>.</li>
+<li>Contested-negative top → <code>surrogate="pairwise"</code>, <code>pos_numerator="pool"</code>.</li>
+<li>Non-contested top, few live positives + large queue → <code>surrogate="trapezoid"</code>,
+  <code>pos_numerator="live"</code>.</li>
+<li><code>tau_scale="iqr"</code> with small <code>temperature</code> (≈0.1) for stability; <code>"band"</code> with
+  <code>temperature ≈ 1.0</code> for wide/volatile bands.</li>
+<li>Watch <code>band_neg_count</code> (band populated?) and <code>grad_pos_count</code> (positives carrying
+  gradient?) via <code>return_diagnostics=True</code>.</li>
+</ul>
+<h2 id="7-limitations">7. Limitations<a class="headerlink" href="#7-limitations" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Strong baseline.</strong> Weighted CE is hard to beat on separable tops; the wins are
+  regime-specific (contested operating points), and on synthetic data the gaps,
+  while real, can be modest and seed-noisy.</li>
+<li><strong>Surrogate is regime-dependent.</strong> Trapezoid suits non-contested tops (lifting hard
+  positives) and collapses on contested-<em>negative</em> tops; pairwise suits contested
+  tops but needs enough positives in its contrast. There is no single dominant
+  surrogate.</li>
+<li><strong><code>pos_numerator</code> is also regime-dependent</strong> (<code>"live"</code> for trapezoid dilution;
+  <code>"pool"</code> for pairwise), which is a real configuration burden.</li>
+<li><strong>Tail-quantile sensitivity.</strong> At very low <code>α</code> the band edge is defined by few
+  negatives; a small pool gives a biased, jittery threshold. Needs pool ≫ <code>1/α</code>.</li>
+<li><strong>No large-scale benchmark validation.</strong> The evidence here is controlled synthetic
+  studies plus a small real dataset; the loss has not been validated on large public
+  benchmarks or against the deep-pAUC methods in the literature.</li>
+<li><strong><code>pos_numerator="live"</code> + <code>max_pool_size</code></strong> subsampling are not jointly exercised;
+  the live numerator is intended for the minibatch-with-queue regime.</li>
+</ul>
+<h2 id="references">References<a class="headerlink" href="#references" title="Permanent link">&para;</a></h2>
+<p>This loss is an original design, but the partial-AUC objective and its estimators
+build on:</p>
+<ol>
+<li>D. K. McClish (1989). <em>Analyzing a Portion of the ROC Curve.</em> Medical Decision
+   Making 9(3), 190–195.</li>
+<li>L. E. Dodd and M. S. Pepe (2003). <em>Partial AUC Estimation and Regression.</em>
+   Biometrics 59(3), 614–623.</li>
+<li>H. Narasimhan and S. Agarwal (2013). <em>A Structural SVM Based Approach for
+   Optimizing Partial AUC.</em> ICML 2013. (And the KDD 2013 "tight" variant.)</li>
+<li>D. Zhu, G. Li, B. Wang, X. Wu, T. Yang (2022). <em>When AUC meets DRO: Optimizing
+   Partial AUC for Deep Learning with Non-Convex Convergence Guarantee.</em> ICML 2022.</li>
+</ol>
+<p>See also the <a href="../../reference/pauc-at-budget-loss/"><code>PAUCAtBudgetLoss</code> reference</a>,
+<a href="../../how-to/use-ranking-losses/">Use Ranking Losses</a>, and
+<a href="../assumptions-and-failure-modes/">Assumptions and Failure Modes</a>.</p>
+<h2 id="further-reading-the-regime-study">Further reading: the regime study<a class="headerlink" href="#further-reading-the-regime-study" title="Permanent link">&para;</a></h2>
+<p>The regime characterization here — when the PAUC win is large versus when it vanishes — is drawn
+from a controlled, CI-backed synthetic study. For the full methodology, results, mechanism, and
+limitations, and to reproduce the numbers yourself:</p>
+<ul>
+<li><a href="https://github.com/chris-santiago/imbalanced-losses/blob/main/lab/pauc_vs_ce_regimes/reports/TECHNICAL_REPORT.md"><strong>Technical report</strong></a>
+  — <code>PAUCAtBudgetLoss</code> vs well-tuned cross-entropy on coverage@budget: cue nonlinearity as the binding
+  variable, the operating-point-specific mechanism, surrogate and <code>pos_numerator</code> ablations, and the
+  boundary conditions where the advantage disappears.</li>
+<li><a href="https://github.com/chris-santiago/imbalanced-losses/tree/main/lab/pauc_vs_ce_regimes"><strong>Reproducible pipeline</strong></a>
+  — the self-contained Metaflow + Hydra reproducer (<code>flow/pauc_flow.py</code>, configs in <code>conf/</code>, validator
+  at <code>flow/validate.py</code>). All evidence is synthetic.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.expand", "navigation.path", "toc.follow", "content.code.copy", "content.code.annotate"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
