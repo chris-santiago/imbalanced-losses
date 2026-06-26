@@ -1217,3 +1217,99 @@ class TestFinalMainWeight:
         assert w.main_weight == pytest.approx(3 * 0.6 / 4)
         w.on_train_batch_start(3)  # past blend
         assert w.main_weight == pytest.approx(0.6)
+
+
+# ---------------------------------------------------------------------------
+# Batch hook required for temperature scheduling (silent-failure guard)
+# ---------------------------------------------------------------------------
+
+
+class _NoTempLoss(nn.Module):
+    """Main-loss stub without a ``temperature`` attribute."""
+
+    def forward(self, logits, targets):
+        return logits.sum() * 0.0
+
+
+def _batch(c: int = 4, b: int = 16):
+    return torch.randn(b, c), torch.randint(0, c, (b,))
+
+
+class TestBatchHookRequired:
+    """
+    on_train_batch_start drives the temperature schedule. Omitting it in the
+    main phase silently freezes temperature; forward must warn once when it
+    detects the batch hook was never called (covers epoch mode and no-warmup).
+    """
+
+    def test_epoch_mode_only_epoch_hook_warns(self):
+        # The reported HIGH: epoch-based warmup, only the epoch hook wired.
+        w = _make_wrapper(warmup_epochs=2)
+        for e in range(3):  # 0,1 warmup; 2 = first main epoch (arms sentinel)
+            w.on_train_epoch_start(e)
+        assert not w.in_warmup
+        logits, targets = _batch()
+        with pytest.warns(UserWarning, match="on_train_batch_start"):
+            w(logits, targets)
+
+    def test_epoch_mode_both_hooks_silent(self):
+        # Correctly wired path stays silent — no regression.
+        w = _make_wrapper(warmup_epochs=2)
+        for e in range(3):
+            w.on_train_epoch_start(e)
+            for s in range(2):
+                w.on_train_batch_start(e * 2 + s)
+        logits, targets = _batch()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            w(logits, targets)
+        assert not [r for r in rec if "on_train_batch_start" in str(r.message)]
+
+    def test_no_warmup_without_batch_hook_warns(self):
+        # Same root cause via the no-warmup fast path (_switch_step == 0).
+        w = _make_wrapper(warmup_epochs=0)
+        assert not w.in_warmup
+        logits, targets = _batch()
+        with pytest.warns(UserWarning, match="on_train_batch_start"):
+            w(logits, targets)
+
+    def test_no_warmup_with_batch_hook_silent(self):
+        w = _make_wrapper(warmup_epochs=0)
+        w.on_train_batch_start(0)
+        logits, targets = _batch()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            w(logits, targets)
+        assert not [r for r in rec if "on_train_batch_start" in str(r.message)]
+
+    def test_warns_only_once_per_instance(self):
+        w = _make_wrapper(warmup_epochs=0)
+        logits, targets = _batch()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            w(logits, targets)
+            w(logits, targets)
+            w(logits, targets)
+        hits = [r for r in rec if "on_train_batch_start" in str(r.message)]
+        assert len(hits) == 1
+
+    def test_no_warning_when_main_loss_has_no_temperature(self):
+        # Nothing to schedule → no nag, even without the batch hook.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # swallow the init missing-temperature warning
+            w = _make_wrapper(warmup_epochs=0, main_loss=_NoTempLoss())
+        logits, targets = _batch()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            w(logits, targets)
+        assert not [r for r in rec if "on_train_batch_start" in str(r.message)]
+
+    def test_no_warning_during_warmup(self):
+        # Batch hook legitimately not needed yet while still in warmup.
+        w = _make_wrapper(warmup_epochs=2)
+        w.on_train_epoch_start(0)
+        logits, targets = _batch()
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            w(logits, targets)
+        assert not [r for r in rec if "on_train_batch_start" in str(r.message)]

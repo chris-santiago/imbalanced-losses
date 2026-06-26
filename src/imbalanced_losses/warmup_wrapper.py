@@ -81,7 +81,12 @@ class LossWarmupWrapper(nn.Module):
     Call :meth:`on_train_epoch_start` and :meth:`on_train_batch_start`
     from the corresponding PyTorch Lightning hooks (or your training loop).
     In step mode, :meth:`on_train_epoch_start` is optional (only needed
-    when ``reset_queue_each_epoch=True``).
+    when ``reset_queue_each_epoch=True``).  :meth:`on_train_batch_start`
+    is **required** whenever ``main_loss`` exposes a ``temperature`` —
+    in **epoch mode as well as step mode** — because it is the only thing
+    that drives the temperature schedule.  Omitting it leaves the
+    temperature undecayed (it never moves toward ``temp_end``); a one-time
+    ``UserWarning`` is emitted from :meth:`forward` if this is detected.
 
     Parameters
     ----------
@@ -230,6 +235,8 @@ class LossWarmupWrapper(nn.Module):
         self._epoch: int = 0
         self._global_step: int = 0  # tracked internally in step mode
         self._switch_step: int | None = None  # global step when main phase began
+        self._batch_hook_seen: bool = False  # set once on_train_batch_start runs
+        self._no_batch_hook_warned: bool = False  # one-time guard for the warning
 
         # Fast path: no warmup.
         no_warmup = (self._step_mode and self.warmup_steps == 0) or (
@@ -359,6 +366,8 @@ class LossWarmupWrapper(nn.Module):
             Monotonically increasing global step counter, as provided by
             ``self.global_step`` in a LightningModule.
         """
+        self._batch_hook_seen = True
+
         if self._step_mode:
             self._global_step = global_step
             # In step mode, the sentinel is set here (not in on_train_epoch_start).
@@ -431,6 +440,22 @@ class LossWarmupWrapper(nn.Module):
         """
         if self.in_warmup:
             return self.warmup_loss(logits, targets)
+        if (
+            not self._batch_hook_seen
+            and not self._no_batch_hook_warned
+            and self._has_temperature
+        ):
+            warnings.warn(
+                f"{type(self).__name__}: on_train_batch_start() was never called in "
+                f"the main phase, so temperature scheduling is disabled and "
+                f"{type(self.main_loss).__name__}.temperature will not decay toward "
+                f"temp_end. Call on_train_batch_start(global_step) every training step "
+                f"(required in epoch mode too, not only step mode). "
+                f"(This warning is shown once per instance.)",
+                UserWarning,
+                stacklevel=2,
+            )
+            self._no_batch_hook_warned = True
         w = self.main_weight
         if w >= 1.0:
             return self.main_loss(logits, targets, **kwargs)
