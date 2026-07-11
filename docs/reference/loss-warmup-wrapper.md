@@ -17,7 +17,7 @@ loss_fn = LossWarmupWrapper(
     main_loss=SmoothAPLoss(num_classes=10, queue_size=1024),
     warmup_epochs=5,
     blend_epochs=2,
-    temp_start=0.5,
+    temp_start=0.5,   # deliberately above the 0.05 default: softer start
     temp_end=0.01,
     temp_decay_steps=50_000,
 )
@@ -114,10 +114,10 @@ The blend ramp always targets `final_main_weight`, not `1.0`.
 Temperature decays geometrically from `temp_start` to `temp_end` over `temp_decay_steps` steps, measured from the moment of phase switch:
 
 ```
-temp(t) = temp_start * (temp_end / temp_start) ^ (elapsed / temp_decay_steps)
+temp(t) = temp_start * (temp_end / temp_start) ^ min(1, elapsed / temp_decay_steps)
 ```
 
-The clock starts at the first main-phase batch, not at training epoch 0.
+The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end` once `temp_decay_steps` steps have elapsed. The clock starts at the first main-phase batch, not at training epoch 0.
 
 ## Parameter reference
 
@@ -134,7 +134,7 @@ The clock starts at the first main-phase batch, not at training epoch 0.
 | `blend_steps` | `None` | Linear blend steps. Mutually exclusive with `blend_epochs > 0`. |
 | `final_main_weight` | `1.0` | Target `main_loss` weight after the blend ramp (or at hard switch). Must be in `(0, 1]`. Use `< 1.0` to hold a permanent mix (e.g. `0.75` = 75 % main / 25 % warmup forever). |
 | `reset_queue_each_epoch` | `False` | Reset `main_loss` queue each main-phase epoch |
-| `gather_distributed` | `None` | Forwarded to `main_loss.gather_distributed`; `None` auto-detects DDP |
+| `gather_distributed` | `None` | `None` leaves `main_loss`'s own setting untouched (which auto-detects DDP by default); pass `True`/`False` to override it |
 
 ## Properties
 

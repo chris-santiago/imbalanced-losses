@@ -26,6 +26,6 @@ loss.backward()
 | Parameter | Default | Effect |
 |---|---|---|
 | `alpha` | `0.25` | Weights positives; set to `-1` to disable |
-| `gamma` | `2.0` | Higher = more focus on hard examples; `0` = vanilla BCE |
+| `gamma` | `2.0` | Higher = more focus on hard examples; `0` with `alpha=-1` = vanilla BCE (with the default `alpha=0.25` it is alpha-weighted BCE) |
 | `reduction` | `"mean"` | `"mean"` averages over elements; `"sum"` for total; `"none"` returns per-element tensor |
 | `gather_distributed` | `None` | Auto-detects DDP; set `False` to opt out |

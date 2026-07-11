@@ -82,7 +82,7 @@ Use `"iqr"` for most cases. Switch to `"band"` when the band is very wide and yo
 | Stable mid-training | `0.02–0.05` |
 | Late training refinement | `0.005–0.01` |
 
-The `temp_start=0.5, temp_end=0.01` defaults in `LossWarmupWrapper` examples cover the full range over the main training phase.
+The `LossWarmupWrapper` defaults (`temp_start=0.05`, `temp_end=0.005`) decay from the stable mid-training range into the late-training refinement range over the main phase. Raise `temp_start` toward 0.1–0.5 if the main phase begins with weakly separated scores.
 
 ## Connection to the discontinuous rank
 

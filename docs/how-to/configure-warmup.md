@@ -199,11 +199,13 @@ loss_fn = LossWarmupWrapper(
 In step mode, also call `on_train_epoch_start` so the wrapper knows when each epoch begins:
 
 ```python
+global_step = 0
 for epoch in range(total_epochs):
     loss_fn.on_train_epoch_start(epoch)
-    for step, batch in enumerate(dataloader):
+    for batch in dataloader:
         loss_fn.on_train_batch_start(global_step)
         ...
+        global_step += 1
 ```
 
 **Note:** The wrapper always resets the queue automatically at the warmup-to-main phase switch, regardless of this setting.

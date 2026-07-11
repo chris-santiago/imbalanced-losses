@@ -72,10 +72,16 @@ loss_fn = SmoothAPLoss(num_classes=4, gather_distributed=False)
 
 ## Confirm distributed setup
 
-Both helpers raise `RuntimeError` if called before `dist.init_process_group`. They are no-ops (return the input unchanged) when `world_size == 1`:
+Both helpers raise `RuntimeError` if called before `dist.init_process_group` — even on a single GPU. Once a process group is initialized with `world_size == 1`, they are no-ops (return the input unchanged):
 
 ```python
-# Single GPU: no-op, returns tensor unchanged
+import torch.distributed as dist
+
+# Requires an initialized process group, even for the single-GPU case
+# (torchrun sets this up for you; standalone scripts must do it explicitly)
+dist.init_process_group("gloo", init_method="tcp://localhost:29500", rank=0, world_size=1)
+
+# world_size == 1: no-op, returns tensor unchanged
 logits_global = all_gather_with_grad(logits)
-assert logits_global is logits   # True on single GPU
+assert logits_global is logits   # True when world_size == 1
 ```

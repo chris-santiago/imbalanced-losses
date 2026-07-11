@@ -18,9 +18,11 @@ Ranking losses do not decompose. `SmoothAPLoss` estimates the rank of each posit
 
 All-gather collects tensors from all workers and concatenates them before the loss computation. Every worker sees the full global batch, computes the same ranks and thresholds, and produces the same loss value. Gradient all-reduction then works correctly because the loss is the same function of each worker's local parameters.
 
+One caveat: if `max_pool_size` subsampling triggers, each rank draws its own random subset (the `torch.randperm` in the subsampler is unseeded and per-rank), so the loss value can differ slightly across ranks on those steps. The queues stay identical regardless, because the full post-gather batch — not the subsampled pool — is enqueued.
+
 ## Why gradient flow is non-trivial
 
-Standard `dist.all_gather` returns detached tensors — the gathered slices have no connection to the computation graph. If you simply all-gathered logits and passed them to the loss, only 1/world_size of the gradient would flow back to the model parameters (through the local slice), and the other 3/4 would be silently dropped.
+Standard `dist.all_gather` writes into fresh output buffers that have no connection to the computation graph — every gathered slice comes back detached, including the local rank's own. If you simply all-gathered logits and passed them to the loss, *zero* gradient would flow back to the model parameters. The loss value would be correct and training would silently do nothing.
 
 `all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the original tensor (which is connected to the computation graph), while keeping other workers' slices detached:
 
@@ -28,7 +30,7 @@ Standard `dist.all_gather` returns detached tensors — the gathered slices have
 gathered[rank] = tensor   # restores gradient connection
 ```
 
-This matches DDP semantics: each worker's optimizer step uses gradients from the local model parameters only, but the loss is computed globally.
+Each rank therefore backpropagates only through its own 1/world_size of the global batch. The other ranks' contributions are not lost: every rank computes the identical global loss, so each rank produces the gradient with respect to its own slice, and DDP's gradient all-reduce sums those per-slice gradients into the full-batch gradient before the optimizer step. This matches DDP semantics: each worker's optimizer step uses gradients from the local model parameters only, but the loss is computed globally.
 
 ## Variable batch sizes across ranks
 
@@ -57,9 +59,11 @@ Because every worker calls `all_gather` before passing to the loss, every worker
 
 ## Auto-detection vs. explicit control
 
-The default `gather_distributed=None` resolves gathering on the first forward call after the process group is initialized. This is safe because:
+The default `gather_distributed=None` resolves gathering on the very first forward call, and the result is cached permanently — the check happens once, not on every forward. This means the process group must already be initialized when that first forward runs:
 
 1. `dist.is_initialized()` returns `False` before `init_process_group` is called
-2. The result is cached — the check happens once, not on every forward
+2. If the first forward happens before `init_process_group` — e.g. a dry-run or shape-check forward during setup — auto-detection resolves to "no gathering" and stays that way for the life of the instance, even after the process group comes up
+
+If your training setup performs any forward pass before `init_process_group`, pass `gather_distributed=True` explicitly.
 
 Set `gather_distributed=False` to opt out entirely (e.g. if you are manually gathering before calling the loss, or if you are using a custom distributed backend that does not support `dist.all_gather`).

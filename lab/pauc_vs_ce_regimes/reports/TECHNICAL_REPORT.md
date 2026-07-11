@@ -7,8 +7,8 @@ fixed 50 bps false-positive budget — by **+0.216 [+0.183, +0.257]** (≈+38%) 
 well-tuned cross-entropy baseline when the operating point is contested by a **nonlinear, rarely-relevant
 cue that cross-entropy under-learns**. A **linear** cue built from the same two discriminative features,
 under the same protocol, yields only **+0.015 [+0.005, +0.024]**, and the large effect replicates under a
-second, distinct nonlinear form (radial cue, **+0.212 [+0.177, +0.247]**) — isolating the cue's *linearity*,
-not any property of the features, as the driver. The advantage
+second, distinct nonlinear form (radial cue, **+0.212 [+0.177, +0.247]**) — isolating the cue's *functional
+form* (linear vs interaction) at the same two features as the driver. The advantage
 is operating-point specific (AUROC ≈ 0.99 throughout), carried only by the pairwise surrogate (the
 trapezoid surrogate collapses to the trivial floor), and budget-dependent (the nonlinear-product lift falls
 to +0.045 [+0.035, +0.055] at 100 bps). The advantage is a **gradient-allocation** effect — PAUC
@@ -53,8 +53,10 @@ so the bulk-dominated cross-entropy gradient never invests in it.
 The subject is `PAUCAtBudgetLoss` in two surrogate variants. The **pairwise** surrogate gives gradient to
 the band negatives: the specific near-threshold negatives occupying the `[α, β]` FPR band are pushed below
 the positives. The **trapezoid** surrogate gives gradient through positives only: positives are lifted over
-detached negative-quantile thresholds, but band negatives are not directly suppressed. The band is set
-relative to the budget (α = budget/2, β = 1.5 × budget) using detached iid-negative quantiles. The pairwise
+detached negative-quantile thresholds, but band negatives are not directly suppressed. These experiments
+deliberately use the older band convention, set relative to the budget (α = budget/2, β = 1.5 × budget)
+using detached iid-negative quantiles; the library default has since changed (v0.4.1) to α = 0, β = budget,
+which matches this report's own recommendation (§3, Appendix A). The pairwise
 surrogate additionally requires `pos_numerator="pool"`, which pools positives across the memory queue; the
 `"live"` setting starves the pairwise numerator at extreme imbalance (about 4.4 live positives per batch at
 0.15% positive rate).
@@ -307,8 +309,9 @@ budget. Crude over-concentration degrades a pointwise loss (oracle ×30 < ×10 i
 
 The mechanism transfers across cue form and budget. Re-run on the radial cue and at 100 bps on identical
 data (the `mechanism_transfer` slice, `conf/experiment/mechanism_transfer.yaml`; radial CE 0.427 matches the headline 0.426), concentrating cross-entropy's
-gradient closes ≥89% of the CE→PAUC gap in all four cells (product/radial × 50/100 bps), with the PAUC band
-52–82% decoys throughout. PAUC's small +0.025 edge over concentrated cross-entropy is specific to the
+gradient closes the CE→PAUC gap in all four cells (product/radial × 50/100 bps): ≈89% in the product/50-bps
+cell — the one cell where concentrated cross-entropy does not overshoot — and past 100% in the other three,
+where it overshoots PAUC outright, with the PAUC band 52–82% decoys throughout. PAUC's small +0.025 edge over concentrated cross-entropy is specific to the
 product/50-bps cell and does not generalize: the label-free top-score hard-negative-mined cross-entropy
 matches or beats PAUC in three of the four cells (product 100 bps 0.870 vs 0.866; radial 50 bps 0.664 vs
 0.638; radial 100 bps 0.809 vs 0.755). The win is therefore a gradient-allocation effect that a simple,
@@ -316,20 +319,20 @@ label-free hard-negative-mining rule reproduces and often exceeds; the partial-A
 contribution is delivering that concentration adaptively and stably without a tuned mining factor or
 decoy labels, not a categorically higher ceiling. Figures: `figures/fig_mechanism.png`, `figures/fig_mechanism_transfer.png`.
 
-The cells where PAUC trails HNM are explained geometrically by its default band, and the gap is closed
-by one knob. The decoys pile at the top of the negative score distribution, but PAUC's pairwise gradient
+The cells where PAUC trails HNM are explained geometrically by the older-convention band these
+experiments use, and the gap is closed by one knob. The decoys pile at the top of the negative score distribution, but PAUC's pairwise gradient
 only reaches the thin FPR band `[α, β] = [budget/2, 1.5·budget]`: that band contains only **40–48% of
 decoys**, while **21% (50 bps) to 41% (100 bps) escape above it** (above `t_α`) and receive no gradient,
 whereas HNM's top-2% captures **92–94%** (the `band_vs_hnm` slice, `conf/experiment/band_vs_hnm.yaml`; 8 seeds, bootstrap CIs ±1–2 pts).
 Lowering `α` toward 0 widens the band to
-cover the escaped top decoys (here `β` is held at the default `1.5·budget`; Appendix A sweeps both edges
-and finds tightening `β` to `budget` helps further), and this **improves PAUC in every cell (+0.017 to +0.056 over the default)**
+cover the escaped top decoys (here `β` is held at the older convention's `1.5·budget`; Appendix A sweeps both edges
+and finds tightening `β` to `budget` helps further), and this **improves PAUC in every cell (+0.017 to +0.056 over the older band)**
 and makes wide-band PAUC match or beat HNM in three of four cells (product 50 bps 0.808, product 100 bps
 0.894, radial 50 bps 0.694; behind only at radial 100 bps, 0.786 vs 0.809; the `alpha_widen` slice,
 `conf/experiment/alpha_widen.yaml`; `figures/fig_alpha_widen.png`). A full band sweep over both edges and four positive rates (Appendix A) finds the
-robust optimum at **α = 0, β = budget** — the band of false-positives at the budget — with the default
+robust optimum at **α = 0, β = budget** — the band of false-positives at the budget — with the former default
 `[budget/2, 1.5·budget]` in the poorly-performing high-α region (worst cell `α=budget/2, β=2.5·budget`); the gain is concentrated at `pos_rate ≪ budget` and vanishes
-once `pos_rate ≥ budget` (coverage@budget capped at `budget/pos_rate`). The default `α = budget/2` is
+once `pos_rate ≥ budget` (coverage@budget capped at `budget/pos_rate`). The older convention's `α = budget/2` is
 therefore too conservative for this regime: it excludes the highest-scoring negatives by construction.
 Label-free HNM-CE and PAUC with a sufficiently wide band are roughly equivalent implementations of the
 same gradient-concentration mechanism.
@@ -345,8 +348,9 @@ failure modes. The deployment posture is therefore gated and verifiable per depl
   linear/cheap, or the top is uncontested), ship cross-entropy. Only if cross-entropy demonstrably leaves
   coverage@budget unrealized at a contested operating point does adoption proceed.
 - **Step 1 — configure.** PAUC-pairwise + cross-entropy warmup (≈30%) + temperature annealing (≈0.5 → 0.1) +
-  `pos_numerator="pool"` + `queue_size` ≫ 1/α, on a model with enough capacity to represent the cue, selecting
-  hyperparameters on validation coverage@budget.
+  `pos_numerator="pool"` + `queue_size` large enough to resolve the band's smaller nonzero edge — ≫ 1/β
+  (≈200 at a 50 bps budget with β = budget); 1/α applies only when α > 0 — on a model with enough capacity
+  to represent the cue, selecting hyperparameters on validation coverage@budget.
 - **Step 2 — deploy with a fallback.** The cross-entropy-warmed checkpoint is always available from the warmup
   phase; if PAUC training destabilizes or holdout coverage@budget regresses, ship cross-entropy. Roll out via
   shadow then canary, promoting only on a CI-separated coverage@budget gain, with rollback on coverage not
@@ -429,13 +433,15 @@ the constructed geometry.
 
 A focused sweep of the band relative to the budget (the `band_default_sweep` slice,
 `conf/experiment/band_default_sweep.yaml`; product cue; budget 50 bps; 8 seeds; identical data) varied `α = mα·budget` (`mα ∈ {0, 0.1, 0.25, 0.5}`) and `β = mβ·budget`
-(`mβ ∈ {1.0, 1.5, 2.5}`) across positive rates {0.1%, 0.5%, 1%, 2%}. Coverage@50bps is monotone in both
-edges — smaller α and smaller β are better in every cell — and the robust optimum is **α = 0, β =
+(`mβ ∈ {1.0, 1.5, 2.5}`) across positive rates {0.1%, 0.5%, 1%, 2%}. Coverage@50bps is near-monotone in
+both edges — smaller α and smaller β are better wherever the band matters, with ties within seed noise
+once `pos_rate ≥ budget` (e.g. at pos 1%, β=budget scores 0.47175 vs β=1.5·budget 0.47183) — and the
+robust optimum is **α = 0, β =
 budget**: the band `[t_budget, max]`, which contrasts positives against all negatives scoring above the
-operating-point threshold (every false-positive at the budget). The default `[budget/2, 1.5·budget]` is
+operating-point threshold (every false-positive at the budget). The former default `[budget/2, 1.5·budget]` is
 in the poorly-performing high-α region (e.g. at pos 0.1%, 0.716 vs the optimum 0.775, +0.06; the single worst cell is `α=budget/2, β=2.5·budget` at 0.667). The gain is
 concentrated at `pos_rate ≪ budget` and vanishes once `pos_rate ≥ budget`, where coverage@budget is
 mechanically capped at `budget/pos_rate` and the band choice is irrelevant. The recommended default for
 contested-top, extreme-imbalance problems is therefore **α ≈ 0, β ≈ budget**, not the conservative
-`[budget/2, 1.5·budget]`. Evidence is the product cue at one budget, synthetic, β not swept below 1.0.
+`[budget/2, 1.5·budget]`; the library adopted this recommendation as its shipped default in v0.4.1. Evidence is the product cue at one budget, synthetic, β not swept below 1.0.
 Figure: `figures/fig_default_sweep.png`.

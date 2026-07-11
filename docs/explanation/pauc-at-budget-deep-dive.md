@@ -136,8 +136,11 @@ negatives (caller-side hard-negative mining / class-balanced sampling) does not 
 `t_α` / `t_β`. With `iid_mask=None` (the default) every negative is treated as iid —
 correct for any pipeline that never densifies negatives by class. The mask is
 gathered across DDP ranks and stored per-row in the queue, so the edges are computed
-from the **global** iid-negative pool. *(Verified: thresholds and loss are
-bit-invariant to injected non-iid negatives.)*
+from the **global** iid-negative pool. *(Verified: the thresholds are bit-invariant to
+injected non-iid negatives for both surrogates; the loss is bit-invariant for the
+trapezoid surrogate only. The pairwise surrogate deliberately contrasts positives
+against every negative that lands in the band — iid or not — so injected non-iid
+negatives that fall in the band do change its loss.)*
 
 ### 3.2 Scale invariance (the τ design)
 
@@ -167,9 +170,11 @@ If the iid-negative dispersion is ≈ 0 (near-constant negatives, or a band coll
 because too few iid negatives resolve the tail quantile), the class is marked invalid
 and excluded from the reduction, with a one-time warning — instead of producing a
 signal-free or exploding gradient. Relatedly, the band edges approximate population
-FPR only when the pooled iid-negative count **substantially exceeds `1/α`**; below
-that the tail quantile is biased toward the maximum. The `band_neg_count` diagnostic
-is the empirical check.
+FPR only when the pooled iid-negative count comfortably resolves the band's smaller
+nonzero edge: **substantially exceeding `1/β`** with the default `α=0` (where
+`t_α = max(neg_iid)` needs no tail quantile at all), and additionally `1/α` when
+`α > 0`; below that the tail quantile is biased toward the maximum. The
+`band_neg_count` diagnostic is the empirical check.
 
 ### 3.5 Verified correctness
 
@@ -272,8 +277,10 @@ pairwise wants `"pool"`.)
 
 On cleanly separable tops — e.g. the Kaggle credit-card fraud data (~17 bps), whose
 top is well separated (AUROC ≈ 0.97) — weighted CE already catches ~84 % at 50 bps,
-and all losses land within noise. There is simply no contested region for a band loss
-to recover. **This is the honest common case for easy data.**
+and all losses land within noise. (These numbers are an informal, unpublished
+observation from ad-hoc runs; unlike §4.1–§4.4 they are not backed by an artifact in
+this repository.) There is simply no contested region for a band loss to recover.
+**This is the honest common case for easy data.**
 
 ## 5. Why it wins: adaptive hard-negative mining at the operating point
 
@@ -328,8 +335,9 @@ pointwise loss (oracle ×30 < ×10 in every cell; ×50 → 0.702, ×200 → 0.63
 PAUC's bounded contrast over an adaptively tracking band does not.
 
 The effect **transfers** across cue form (product, radial) and budget (50, 100 bps):
-concentrating cross-entropy's gradient closes **≥ 89 % of the CE→PAUC gap in all four
-cells**, and a label-free HNM-CE **matches or beats PAUC in three of the four.** So
+concentrating cross-entropy's gradient closes the CE→PAUC gap in all four cells —
+**≈ 89 % in the product/50-bps cell and past 100 % (overshooting PAUC) in the other
+three** — and a label-free HNM-CE **matches or beats PAUC in three of the four.** So
 the partial-AUC objective has no categorically higher ceiling here. Its distinct
 contribution is delivering the concentration **adaptively and stably, without a tuned
 up-weight factor and without decoy labels** — the band tracks the operating point as
@@ -378,7 +386,7 @@ HNM pipeline, you are most of the way there.
 - The operating point is **contested by hard negatives** the model must learn to push
   down — use `surrogate="pairwise"`.
 - You are at extreme imbalance but the pool (batch + queue, with DDP gather) holds far
-  more than `1/α` iid negatives.
+  more than `1/β` iid negatives (and far more than `1/α` too, if you set `α > 0`).
 
 **Prefer something else when:**
 
@@ -386,7 +394,8 @@ HNM pipeline, you are most of the way there.
   to beat, and the extra machinery buys little.
 - You care about the **whole** ranking → `SmoothAPLoss`; or a **single hard
   threshold** → `RecallAtQuantileLoss`.
-- The pool cannot supply enough iid negatives for a stable tail quantile at your `α`.
+- The pool cannot supply enough iid negatives for a stable band-edge quantile at your
+  `β` (or at your `α`, when `α > 0`).
 
 **Configuration heuristics:**
 
@@ -418,8 +427,9 @@ HNM pipeline, you are most of the way there.
   surrogate.
 - **`pos_numerator` is also regime-dependent** (`"live"` for trapezoid dilution;
   `"pool"` for pairwise), which is a real configuration burden.
-- **Tail-quantile sensitivity.** At very low `α` the band edge is defined by few
-  negatives; a small pool gives a biased, jittery threshold. Needs pool ≫ `1/α`.
+- **Tail-quantile sensitivity.** The band's smaller nonzero edge is defined by few
+  negatives when the pool is small, giving a biased, jittery threshold. Needs pool
+  ≫ `1/β` with the default `α=0` (and ≫ `1/α` when `α > 0`).
 - **No large-scale benchmark validation.** The evidence here is controlled synthetic
   studies plus a small real dataset; the loss has not been validated on large public
   benchmarks or against the deep-pAUC methods in the literature.

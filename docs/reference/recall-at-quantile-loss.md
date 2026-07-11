@@ -1,6 +1,6 @@
 # RecallAtQuantileLoss
 
-Differentiable Recall-at-Quantile loss with an optional memory queue. Optimizes recall above a score threshold set at the q-th quantile of the pooled distribution. Useful for alert/detection workloads.
+Differentiable Recall-at-Quantile loss with an optional memory queue. Optimizes recall above a score threshold set at the (1 − q) quantile of the pooled distribution, so the top q fraction of scores falls above it. Useful for alert/detection workloads.
 
 ::: imbalanced_losses.recall_loss.RecallAtQuantileLoss
 
@@ -55,7 +55,7 @@ for c in valid.nonzero(as_tuple=True)[0].tolist():
 
 ## Quantile selection guidance
 
-The threshold is the `(1 - quantile)` percentile of all pooled scores. For the threshold to fall in the negative score region under a perfect model, `quantile` must exceed the positive class fraction:
+The threshold is the `(1 - quantile)` quantile of all pooled scores. For the threshold to fall in the negative score region under a perfect model, `quantile` must exceed the positive class fraction:
 
 - 4 balanced classes (25% positives per class): use `quantile > 0.25` for sanity tests
 - Real-world imbalance (1% positives): `quantile=0.005` is well above the positive fraction

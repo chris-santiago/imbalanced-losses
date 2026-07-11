@@ -8,9 +8,11 @@ rather than the full AUC or a single-threshold recall.
 Band edges are estimated as score quantiles of the *iid negatives* only
 (stop-gradient), so they **approximate** true population FPR.  The
 approximation is reliable when the pooled iid-negative count substantially
-exceeds ``1/alpha``; at small counts the tail quantile is biased toward the
-maximum.  Check the ``band_neg_count`` diagnostic (and ``queue_size``) as an
-empirical quality indicator.  Classes whose iid-negative scores show
+exceeds the reciprocal of the band's smaller nonzero edge -- ``1/beta`` when
+``alpha=0`` (the default), ``1/alpha`` when ``alpha > 0``; at small counts
+the tail quantile is biased toward the maximum.  Check the
+``band_neg_count`` diagnostic (and ``queue_size``) as an empirical quality
+indicator.  Classes whose iid-negative scores show
 near-zero dispersion are automatically skipped (marked INVALID) because the
 sigmoid temperature cannot be calibrated; see the ``_degenerate_warned`` note
 in the class docstring.
@@ -91,8 +93,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     meaningful score range.
 
     The band-edge approximation of population FPR is reliable when the pooled
-    iid-negative count substantially exceeds ``1/alpha``.  Monitor
-    ``band_neg_count`` in diagnostics and set ``queue_size`` accordingly.
+    iid-negative count substantially exceeds the reciprocal of the band's
+    smaller nonzero edge: ``1/beta`` when ``alpha=0`` (the default),
+    ``1/alpha`` when ``alpha > 0``.  Monitor ``band_neg_count`` in
+    diagnostics and set ``queue_size`` accordingly.
 
     The recommended band convention is ``alpha ≈ 0, beta ≈ budget`` (where
     ``budget`` is the target FPR, e.g. ``beta=0.005`` for a 50 bps operating

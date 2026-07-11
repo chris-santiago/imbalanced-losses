@@ -27,7 +27,7 @@ loss = loss_fn(logits, targets.float())
 **What changes:**
 - Add `alpha` (class balance weight; `alpha=-1` disables it) and `gamma` (focusing exponent)
 - Targets must still be `float` in `[0, 1]`
-- `reduction` options are the same: `"mean"`, `"sum"`, `"none"`, plus `"mean_positive"`
+- `reduction` options are the same: `"mean"`, `"sum"`, `"none"` (`"mean_positive"` is a `SoftmaxFocalLoss`-only option)
 
 **What stays the same:**
 - Input and target shapes
@@ -97,9 +97,10 @@ loss_fn = LossWarmupWrapper(
 )
 
 # In your training loop:
+global_step = 0
 for epoch in range(total_epochs):
     loss_fn.on_train_epoch_start(epoch)
-    for step, (xb, yb) in enumerate(loader):
+    for xb, yb in loader:
         loss_fn.on_train_batch_start(global_step)
         loss = loss_fn(model(xb), yb.float().unsqueeze(1))  # [N, 1] float targets
         ...
@@ -120,9 +121,10 @@ loss_fn = LossWarmupWrapper(
 
 # CrossEntropyLoss and SmoothAPLoss share the same input format:
 # logits [N, C] float, targets [N] long — no conversion needed.
+global_step = 0
 for epoch in range(total_epochs):
     loss_fn.on_train_epoch_start(epoch)
-    for step, (xb, yb) in enumerate(loader):
+    for xb, yb in loader:
         loss_fn.on_train_batch_start(global_step)
         loss = loss_fn(model(xb), yb)
         ...
@@ -136,31 +138,36 @@ for epoch in range(total_epochs):
 ### Forgetting the epoch / step hooks
 
 `LossWarmupWrapper` tracks phase transitions in `on_train_epoch_start` and temperature decay
-in `on_train_batch_start`. Missing either call means the loss never transitions from warmup.
+in `on_train_batch_start`. Each hook has its own failure mode. In epoch mode, missing
+`on_train_epoch_start` means the loss never transitions from warmup. Missing
+`on_train_batch_start` still transitions, but silently disables temperature decay and the
+queue reset at the phase switch (the wrapper emits a one-time `UserWarning` when this happens).
 
 ```python
-# Wrong — loss stays in warmup forever
+# Wrong — loss stays in warmup forever, no temperature decay
 for epoch in range(total_epochs):
     for xb, yb in loader:
         loss = loss_fn(model(xb), yb)
 
 # Correct
+global_step = 0
 for epoch in range(total_epochs):
-    loss_fn.on_train_epoch_start(epoch)   # ← required
-    for step, (xb, yb) in enumerate(loader):
-        loss_fn.on_train_batch_start(global_step)  # ← required for step-based or temp decay
+    loss_fn.on_train_epoch_start(epoch)   # ← drives the phase transition (epoch mode)
+    for xb, yb in loader:
+        loss_fn.on_train_batch_start(global_step)  # ← drives temp decay + switch-time queue reset
         loss = loss_fn(model(xb), yb)
         global_step += 1
 ```
 
 ### Target dtype mismatch
 
-`SigmoidFocalLoss` and `SmoothAPLoss(num_classes=1)` expect **float** targets. `SoftmaxFocalLoss`
-and `SmoothAPLoss(num_classes > 1)` expect **long** integer targets. Swapping these silently
-produces wrong gradients or a runtime error.
+`SigmoidFocalLoss` expects **float** targets in `[0, 1]`; passing integer targets raises a
+runtime error. `SoftmaxFocalLoss` and `SmoothAPLoss(num_classes > 1)` expect **long** integer
+class indices. `SmoothAPLoss(num_classes=1)` is flexible: it accepts float or integer targets
+in `{0, 1}` and treats any non-zero value as positive.
 
 ```python
-# Binary — targets must be float
+# SigmoidFocalLoss — targets must be float
 targets_float = targets.float()                     # or .unsqueeze(1) for [N, 1]
 
 # Multiclass — targets must be long integer indices

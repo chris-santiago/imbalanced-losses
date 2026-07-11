@@ -42,8 +42,10 @@ If these stale entries remain in the queue, the AP loss computes ranks relative 
 
 ## Queue size vs. pool size limits
 
-The core AP computation is O(|P| × M) where M = batch + queue. At low positive rates this is closer to O(|P| × M) than O(M²), but M still has a practical upper limit of ~4096 for reasonable training step times on a single GPU. At a 0.5% positive rate with M=4096, you get ~20 positives — a comfortable signal.
+The core AP computation is O(|P| × M) by construction — only the positive rows of the pairwise comparison matrix are formed — where M = batch + queue. The positive rate does not change that complexity; it determines the savings factor relative to a naive O(M²) implementation (about 200× at a 0.5% positive rate). M still has a practical upper limit of ~4096 for reasonable training step times on a single GPU. At a 0.5% positive rate with M=4096, you get ~20 positives — a comfortable signal.
 
 ## DDP queue synchronization
 
 In distributed training, every worker calls `all_gather` before passing to the loss. This means every worker sees the same global batch and enqueues the same data. No explicit queue synchronization across workers is needed — they are identical by construction.
+
+One caveat on loss values (not queues): if `max_pool_size` subsampling triggers, each rank draws its own random subset (unseeded `torch.randperm` per rank), so per-rank loss values can differ slightly on those steps. The queues remain identical, because the full post-gather batch is enqueued, not the subsampled pool.

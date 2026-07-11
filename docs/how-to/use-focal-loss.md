@@ -115,7 +115,7 @@ $$\mathcal{L}_{\text{focal}} = -\alpha_t (1 - p_t)^\gamma \log p_t$$
 
 where $p_t$ is the model's predicted probability for the true class, $\alpha_t$ is a class-balance weight, and $\gamma \geq 0$ is the focusing exponent. At $\gamma = 0$ this reduces to standard weighted cross-entropy.
 
-The focusing term $(1 - p_t)^\gamma$ downweights examples the model classifies confidently and upweights examples it finds difficult. This is most beneficial when easy examples are numerous enough to dominate the gradient — the regime for which focal loss was designed (e.g. RetinaNet, where ~34% of anchors are positive after filtering). **At extreme positive rates (≪ 1%), this mechanism can backfire.**
+The focusing term $(1 - p_t)^\gamma$ downweights examples the model classifies confidently and upweights examples it finds difficult. This is most beneficial when easy examples are numerous enough to dominate the gradient. That is the regime focal loss was designed for: RetinaNet trains on all anchors with no sampling at an extreme foreground-background imbalance (roughly 1:1000), where the sheer mass of easy background anchors would otherwise swamp the loss. Crucially, every image in that setting still contributes a meaningful number of foreground anchors per batch, so the positive class retains substantial aggregate gradient even after focusing. **When per-batch positive counts fall to the single digits — e.g. positive rates ≪ 1% under random sampling — the same mechanism can backfire.**
 
 ### Why the focusing term hurts at very low positive rates
 
@@ -144,8 +144,10 @@ Treat $\gamma$ as a continuous hyperparameter whose optimal value approaches zer
 pos_rate = 0.0015
 alpha    = [1.0, 1.0 / pos_rate]    # [negative_weight, positive_weight]
 
-loss_fn = SoftmaxFocalLoss(alpha=alpha, gamma=0.0)   # equivalent to weighted CE
+loss_fn = SoftmaxFocalLoss(alpha=alpha, gamma=0.0)   # per-sample equivalent to weighted CE
 ```
+
+One caveat on the `gamma=0` equivalence: per-sample losses match `nn.CrossEntropyLoss(weight=alpha)`, but the default reductions differ. `SoftmaxFocalLoss(reduction="mean")` divides by the sample count, while `nn.CrossEntropyLoss(weight=...)` divides by the sum of the sample weights. The two losses (and their gradients) therefore differ by a batch-dependent scale factor. This does not change the optimum, but it interacts with the learning rate, so retune when switching between them.
 
 ## See also
 

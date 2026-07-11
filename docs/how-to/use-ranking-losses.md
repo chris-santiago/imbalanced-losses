@@ -37,13 +37,17 @@ Set `queue_size=0` to compute AP on the current batch only. Useful for debugging
 loss_fn = SmoothAPLoss(num_classes=4, queue_size=0)
 ```
 
-### Reset queue between training and validation
+### Reset the queue manually
 
-Call `reset_queue()` before running evaluation to avoid contaminating the queue with eval-time data:
+You do **not** need to reset the queue around validation — it is frozen while the model is in
+eval mode (see [Queue behavior during validation](#queue-behavior-during-validation)). Call
+`reset_queue()` when the queue's contents are genuinely stale: at the start of a new training
+phase (e.g. switching from pre-training to fine-tuning), or if you set
+`update_queue_in_eval=True` and want to drop eval-time entries before training resumes:
 
 ```python
 loss_fn.reset_queue()
-# then run validation loop
+# then start the new training phase
 ```
 
 ### Seq2seq / token-level targets
@@ -73,7 +77,7 @@ This is **not** proportional sampling. A dominant background class and a rare fo
 
 ### Queue size guidance
 
-The queue accumulates past batches to give the soft-rank estimator more context. At very low positive rates (e.g. 0.5%), a `queue_size` of at least 512–1024 gives stable AP estimates. For seq2seq, use `max_pool_size` to control the effective pool size rather than relying solely on `queue_size`.
+The queue accumulates past batches to give the soft-rank estimator more context. At very low positive rates (e.g. 0.5%), a `queue_size` of 512–1024 is a starting point, not a stability guarantee — a 1024-row pool at 0.5% holds only ~5 expected positives, so treat it as a floor to tune upward if per-batch AP estimates are noisy. For seq2seq, use `max_pool_size` to control the effective pool size rather than relying solely on `queue_size`.
 
 ---
 

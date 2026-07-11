@@ -82,7 +82,7 @@ with torch.no_grad():
 
 **Output:**
 ```
-BCE  AUCPR: 0.1822
+BCE  AUCPR: 0.2013
 ```
 
 The model learns but is dominated by the majority class — easy negatives suppress gradient signal to positives.
@@ -115,7 +115,7 @@ with torch.no_grad():
 
 **Output:**
 ```
-Focal AUCPR: 0.1874
+Focal AUCPR: 0.2097
 ```
 
 A modest improvement. Now let's go further by directly optimizing AP.
@@ -201,8 +201,8 @@ You trained the same model architecture with three different loss strategies and
 
 | Loss strategy | AUCPR |
 |---|---|
-| Vanilla BCE | 0.1822 |
-| Focal Loss | 0.1874 |
+| Vanilla BCE | 0.2013 |
+| Focal Loss | 0.2097 |
 | Smooth-AP with warmup | 0.4248 |
 
 ## Next steps

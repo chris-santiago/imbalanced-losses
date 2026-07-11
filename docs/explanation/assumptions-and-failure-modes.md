@@ -45,7 +45,7 @@ At very low positive rates, even after down-weighting easy negatives, the absolu
 
 **Label noise amplified by high gamma**
 
-As $\gamma$ increases, down-weighting of correctly-classified easy examples becomes more aggressive. A mislabeled negative (true negative, labeled positive) that the model correctly assigns a low score to is treated as a hard positive and receives a large gradient weight. Empirically, $\gamma > 3$ tends to increase sensitivity to label noise. Lin et al. found $\gamma = 2$ optimal across a range of detection benchmarks; values above 3 showed diminishing returns and increasing instability.
+As $\gamma$ increases, down-weighting of correctly-classified easy examples becomes more aggressive, so the *relative* gradient weight of mislabeled examples grows. A mislabeled negative (true negative, labeled positive) that the model correctly assigns a low score to is treated as a hard positive and receives a large gradient weight. Lin et al. found $\gamma = 2$ optimal in their ablations on COCO, with diminishing returns at higher values. As a heuristic (not a published threshold), prefer lower $\gamma$ when you suspect label noise in the positive class.
 
 **Optimizing for a ranking metric**
 
@@ -53,11 +53,11 @@ Focal loss minimizes a weighted log-loss, which is a proxy for calibrated probab
 
 **Calibration is required downstream**
 
-Focal loss distorts the predicted probability distribution. The down-weighting of easy examples pushes the model toward underconfident predictions on the majority class and overconfident predictions on hard examples. Do not use focal loss output probabilities as calibrated estimates without a calibration step (Platt scaling, isotonic regression, etc.).
+Focal loss is not a proper scoring rule: its minimizer is not the true conditional probability, so the predicted probabilities are systematically distorted. Published analyses (Mukhoti et al., NeurIPS 2020) find that focal loss lowers predicted confidence overall, which can incidentally *improve* calibration on networks that would otherwise be overconfident. But the direction and size of the distortion depend on the data and on $\gamma$, so it should not be relied on. Do not use focal loss output probabilities as calibrated estimates without a calibration step (Platt scaling, isotonic regression, etc.).
 
 **alpha/gamma interaction with severely imbalanced multi-class**
 
-`SoftmaxFocalLoss` with per-class `alpha` can produce unstable training when rare classes have very few samples. The model can "ignore" a rare class by assigning its alpha weight to a region of parameter space that is rarely visited — effectively the rare class receives no gradient updates across many batches. If a class appears fewer than once per ~20 batches, consider either oversampling or switching to `SmoothAPLoss`.
+`SoftmaxFocalLoss` with per-class `alpha` can produce unstable training when rare classes have very few samples. A class that is absent from most batches receives gradient updates too rarely for its `alpha` weight to compensate, however large that weight is set. As an unquantified heuristic, if a class is missing from the large majority of batches, consider either oversampling or switching to `SmoothAPLoss`, whose memory queue accumulates rare-class positives across batches.
 
 ---
 
@@ -92,9 +92,9 @@ The queue accumulates the original full batch (unaffected by the cap). A one-tim
 
 **Sizing `max_pool_size` with a dominant background class:** the subsampler gives every observed class an equal quota (`max_pool_size // (2 × n_classes)`), not a proportional one. A dominant class (e.g. 99% background) and a rare class get the same reserved count, so rare classes are over-represented in the subsampled pool. The effective positive count per class is `|P_c| ≈ max_pool_size // (2 × n_classes)` — much higher than `max_pool_size × positive_rate` would suggest. Size from the target `|P_c|`, not from memory alone: `max_pool_size ≈ target_|P_c| × 2 × n_classes`.
 
-**Temperature too low in early training**
+**Near-uniform scores in early training**
 
-When model scores are near-uniform (random initialization), all pairwise score differences are close to zero. At low temperature τ, $\sigma(\Delta s / \tau)$ saturates near 0.5 everywhere — soft ranks are all approximately $M/2$ and the loss is approximately 0.5 regardless of the model's output. Gradients nearly vanish. This is why cold-starting with focal loss via `LossWarmupWrapper` is recommended: it shapes the score space before AP loss is activated.
+When model scores are near-uniform (random initialization), all pairwise score differences are small relative to the temperature ($|\Delta s| \ll \tau$: the temperature is effectively too *high* for the score spread), so $\sigma(\Delta s / \tau) \approx 0.5$ for every pair. The soft ranks then carry no ordering information: each positive's $\text{rank}_\text{pos} / \text{rank}_\text{all}$ collapses toward the pool's positive fraction $|P|/M$, so the soft AP is approximately $|P|/M$ and the loss sits near $1 - |P|/M$ — close to 1.0 at low positive rates — regardless of the model's output. The per-pair gradient does not vanish (at the sigmoid midpoint it is $\sigma' / \tau \approx 0.25 / \tau$, which is *large* at small τ); the problem is that it is uninformative: contributions from the many near-tied pairs reflect noise rather than a meaningful ranking signal. This is why cold-starting with focal loss via `LossWarmupWrapper` is recommended: it spreads the score distribution before AP loss is activated, after which a temperature matched to the actual score spread gives informative soft ranks.
 
 **Temperature too low for gradient variance**
 
@@ -120,12 +120,12 @@ The ECCV 2020 paper demonstrated that the sigmoid soft rank converges to the tru
 
 ## RecallAtQuantileLoss
 
-This loss optimizes recall above a score threshold set at the q-th quantile of the pooled score distribution. It is an original design (not from published literature), motivated by fixed-capacity review settings.
+This loss optimizes recall above a score threshold set at the (1 − q) quantile of the pooled score distribution, so the top q fraction of scores falls above it. It is an original design (not from published literature), motivated by fixed-capacity review settings.
 
 ### When it works
 
 - You operate at a fixed precision point: only the top q-fraction of flagged items will be reviewed.
-- Quantile q > positive class fraction: this ensures the threshold θ typically falls in the negative score region under a well-trained model. If q = 0.01 and your positive rate is 2%, the threshold must be in the negative region for recall to be maximized — this is the natural operating regime.
+- Quantile q > positive class fraction: this ensures the threshold θ typically falls in the negative score region under a well-trained model. If q = 0.05 and your positive rate is 2%, the top 5% of scores can hold every positive with room to spare, so θ sits in the negative region — this is the natural operating regime.
 - The pool is large enough to estimate the quantile reliably. At q = 0.005, you need at least 1/0.005 = 200 pooled samples for the quantile estimate to correspond to at least one sample. In practice, 5–10× more samples (1000–2000) give a stable estimate.
 - Positive scores are dispersed above the threshold: gradients flow from positives that score below θ, pushing them above it. If all positives already score well above θ, the loss is near zero and training stalls (correctly — the objective is already met).
 
@@ -137,7 +137,7 @@ If q < positive_rate, then under a perfect model (all positives score above all 
 
 **Stop-gradient on the threshold**
 
-The quantile threshold θ is computed with `detach()` — no gradient flows through it. This is intentional: allowing gradients through θ would incentivize the model to push *all* scores below the threshold (to lower the threshold and trivially satisfy the objective). However, the stop-gradient means the loss has no signal if *all* positives already score above θ at a given step. In that case the per-positive sigmoids are all near 1.0, the loss is near 0.0, and gradients vanish — even if the threshold is poorly positioned. This is correct when recall is actually high, but it means the loss cannot push θ lower.
+The quantile threshold θ is computed with `detach()` — no gradient flows through it. This is intentional, for optimization stability: the gradient of an empirical quantile with respect to the scores is ill-defined at ties and otherwise concentrated entirely on the single sample (or interpolated pair) that defines it, so backpropagating through θ would inject a sparse, jumpy signal that shifts abruptly as the quantile-defining sample changes between steps. However, the stop-gradient means the loss has no signal if *all* positives already score above θ at a given step. In that case the per-positive sigmoids are all near 1.0, the loss is near 0.0, and gradients vanish — even if the threshold is poorly positioned. This is correct when recall is actually high, but it means the loss cannot push θ lower.
 
 **Threshold instability at score distribution boundaries**
 
@@ -168,7 +168,7 @@ This loss optimizes the normalized partial AUC over a false-positive-rate band `
 
 **Pool too small for the target FPR (tail-quantile bias)**
 
-The band edges `t_alpha` and `t_beta` are quantiles of the iid-negative pool. When the pool is small relative to `1/alpha`, the top-`alpha` tail is estimated from very few samples and is biased toward the maximum negative score. This is the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` rule — here you need pooled iid negatives >> `1/alpha`. Check `stats["band_neg_count"]` from `return_diagnostics=True`; if it is near zero, the band is starved.
+The band edges `t_alpha` and `t_beta` are quantiles of the iid-negative pool, and the pool must comfortably resolve the band's smaller nonzero edge. With the default `alpha=0`, `t_alpha = max(neg_iid)` needs no tail-quantile estimation and the binding requirement is on `t_beta`: pooled iid negatives >> `1/beta`. Only when `alpha > 0` does the top-`alpha` tail matter — a pool small relative to `1/alpha` estimates it from very few samples, biased toward the maximum negative score, so there you additionally need pooled iid negatives >> `1/alpha`. This is the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` rule. Check `stats["band_neg_count"]` from `return_diagnostics=True`; if it is near zero, the band is starved.
 
 **Degenerate iid-negative score dispersion**
 
@@ -222,7 +222,7 @@ If `temp_end / temp_start` is too small or `temp_decay_steps` is too short, the 
 
 **Queue poisoning at the phase switch**
 
-`LossWarmupWrapper` automatically resets the queue at the phase switch. However, if you manually bypass the wrapper (e.g., by directly calling `main_loss.forward()` during warmup), the queue accumulates warmup-era logits that are not reset. Always use the wrapper's `forward()` method to ensure correct queue management.
+`LossWarmupWrapper` resets the queue when it latches the phase switch in `on_train_batch_start` — regardless of how the queue was filled, so even warmup-era logits enqueued by calling `main_loss.forward()` directly are wiped at the switch. The real failure mode is never wiring `on_train_batch_start` into the training loop: the switch is never latched, so the queue reset never fires and the temperature schedule never runs. The wrapper emits a one-time `UserWarning` on the first main-phase forward if the hook was never called (when the wrapped loss exposes a `temperature` attribute, which all the queued losses in this library do). Call `on_train_batch_start(global_step)` every training step, in epoch mode as well as step mode.
 
 ---
 
@@ -232,16 +232,16 @@ The table below maps common failure symptoms to root causes and remedies.
 
 | Symptom | Most likely cause | Remedy |
 |---|---|---|
-| Loss stays near 0.5 from the start | Temperature too low for uniform scores | Use `LossWarmupWrapper`; start with high temperature |
+| Loss stuck near 1 − \|P\|/M (≈ 1.0 at low positive rates) from the start | Scores near-uniform relative to τ — soft ranks collapse to \|P\|/M, gradients noisy and uninformative | Warm up with `LossWarmupWrapper` to spread the scores; match temperature to the score spread |
 | Loss oscillates wildly | Temperature too low for current score scale | Increase temperature; check score range |
 | Rare class never improves | Pool contains zero positives for that class | Increase queue size; check per-class positive rate |
 | AP loss worse than CE | Cold start: scores too uniform when AP phase begins | Lengthen warmup; use `LossWarmupWrapper` |
 | RecallAtQuantile stalls | All positives already above threshold | Normal convergence; also verify quantile setting |
 | RecallAtQuantile unstable threshold | Pool too sparse near quantile | Increase queue size; check `(M * q) ≥ 10` |
-| PAUCAtBudget band empty (`band_neg_count` ≈ 0) | Pool too small relative to `1/alpha` | Increase `queue_size`; check pooled iid negatives >> `1/alpha` |
+| PAUCAtBudget band empty (`band_neg_count` ≈ 0) | Pool too small to resolve the band's smaller nonzero edge | Increase `queue_size`; check pooled iid negatives >> `1/beta` at `alpha=0` (>> `1/alpha` only when `alpha > 0`) |
 | PAUCAtBudget class skipped (degenerate dispersion) | iid-negative scores nearly constant | Model may be outputting uniform scores; check score range and warmup |
 | PAUCAtBudget gradient weak (`grad_pos_count` ≈ 1) | Few positives in effective pool | Increase batch size, use DDP all-gather, widen the band, or set `pos_numerator="live"` (trapezoid) |
 | Focal loss noisy despite tuning | High label noise in positive class | Reduce γ; inspect label quality |
 | DDP: loss diverges across workers | Missing all-gather | Set `gather_distributed=True` or use auto-detect |
-| Training spike after phase switch | Queue poisoning from warmup logits | Verify `LossWarmupWrapper` handles the switch; check queue reset |
+| Training spike after phase switch | Queue poisoning from warmup logits | Ensure `on_train_batch_start` is wired so the wrapper latches the switch and resets the queue |
 | Loss near zero but metrics poor | Score scale mismatch with temperature | Normalize logits or scale τ to match score range |

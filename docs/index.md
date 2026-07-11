@@ -34,7 +34,7 @@ uv sync
 | `SigmoidFocalLoss` | Binary / multi-label (sigmoid per logit, classes are independent); drop-in for `BCEWithLogitsLoss` |
 | `SoftmaxFocalLoss` | Mutually-exclusive multiclass (softmax couples all class logits); drop-in for `CrossEntropyLoss` |
 | `SmoothAPLoss` | Directly optimizes Average Precision |
-| `RecallAtQuantileLoss` | Optimizes recall above a fixed score threshold |
+| `RecallAtQuantileLoss` | Optimizes recall within a fixed alert fraction (top q% of scores) |
 | `PAUCAtBudgetLoss` | Optimizes partial AUC over an FPR band around a target operating point |
 | `LossWarmupWrapper` | Warmup on CE/BCE, then blend/anneal into a ranking loss |
 
@@ -46,7 +46,7 @@ uv sync
 | Binary, extreme imbalance (< 1% positives) | `SmoothAPLoss` |
 | Mutually-exclusive multiclass, mild-to-moderate imbalance | `SoftmaxFocalLoss` |
 | Multiclass with tail classes below ~1–2% of data | `SmoothAPLoss` |
-| Need a hard recall guarantee at a fixed score threshold | `RecallAtQuantileLoss` |
+| Maximize recall when only a fixed alert fraction (top q% of scores) can be reviewed | `RecallAtQuantileLoss` |
 | Optimize recall at a fixed false-alarm budget / operating point (e.g. fraud at 50 bps) | `PAUCAtBudgetLoss` |
 
 For a deeper breakdown, see [Why Imbalanced Losses?](explanation/why-imbalanced-losses.md).

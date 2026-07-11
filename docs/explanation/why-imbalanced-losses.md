@@ -2,7 +2,7 @@
 
 ## The failure mode of standard cross-entropy
 
-Cross-entropy and BCE minimize the expected log-loss over the training distribution. When the training distribution is heavily skewed — for example, 99% negative examples in fraud detection — the global minimum of BCE is a model that assigns low probability to the positive class everywhere. The loss on the 99% majority overwhelms any signal from the 1% minority.
+Cross-entropy and BCE minimize the expected log-loss over the training distribution. In principle nothing is wrong with that: BCE is a proper scoring rule, and an unconstrained model minimizing it would recover the true conditional probabilities. The failure is in the fit a real model can reach. With shared features and limited capacity, when the training distribution is heavily skewed — for example, 99% negative examples in fraud detection — the model that minimizes *average* log-loss trades minority-class accuracy for majority-class accuracy, because errors on the majority cost far more total loss.
 
 Even with good regularization, gradient updates from 990 negative examples per 10 positives tend to push the model toward predicting negative. The result is high accuracy (correctly predicting "negative" 99% of the time) but near-zero precision and recall on the class that matters.
 
@@ -48,6 +48,6 @@ Each loss makes assumptions about the data, the model, and the training regime. 
 
 **Focal loss** is fast (O(N)), requires no queue, and is a drop-in replacement. It does not directly optimize AP.
 
-**Ranking losses** directly optimize the metric of interest but require a minimum pool size to produce stable rank estimates. At very low positive rates (< 1%), without a memory queue the loss degenerates because a single batch may contain zero positives. The queue solves this; the core computation is O(|P| × M) where |P| is the positive count and M is the pool size. `PAUCAtBudgetLoss` additionally requires the pooled iid-negative count to substantially exceed `1/alpha` for the band-edge quantiles to be unbiased — the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` guideline.
+**Ranking losses** directly optimize the metric of interest but require a minimum pool size to produce stable rank estimates. At very low positive rates (< 1%), without a memory queue the loss degenerates because a single batch may contain zero positives. The queue solves this; the core computation is O(|P| × M) where |P| is the positive count and M is the pool size. `PAUCAtBudgetLoss` additionally requires the pooled iid-negative count to comfortably resolve the band's smaller nonzero edge for the band-edge quantiles to be unbiased: substantially more than `1/beta` iid negatives with the default `alpha=0` band, and more than `1/alpha` only when `alpha > 0` — the same flavor of requirement as `RecallAtQuantileLoss`'s `(M × q) ≥ 10` guideline.
 
 **LossWarmupWrapper** adds complexity but addresses the cold-start problem: ranking loss gradients are uninformative when model scores are near-uniform. BCE warmup first trains the model into a reasonable score space before switching.

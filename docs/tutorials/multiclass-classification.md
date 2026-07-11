@@ -63,7 +63,7 @@ print(f"Class counts: {counts}")
 **Output:**
 ```
 Train size: 7500
-Class counts: [3826, 1958, 955, 505, 256]
+Class counts: [3817, 1931, 1004, 498, 250]
 ```
 
 ## Step 2 — Define a simple model
@@ -124,7 +124,7 @@ print(f"CE  macro-AP: {ce_ap:.4f}")
 
 **Output:**
 ```
-CE  macro-AP: 0.9649
+CE  macro-AP: 0.9716
 ```
 
 ## Step 5 — Add per-class alpha with SoftmaxFocalLoss
@@ -148,8 +148,8 @@ print(f"Focal macro-AP: {focal_ap:.4f}")
 
 **Output:**
 ```
-alpha (normalized): ['0.067', '0.131', '0.268', '0.507', '1.000']
-Focal macro-AP: 0.9574
+alpha (normalized): ['0.065', '0.129', '0.249', '0.502', '1.000']
+Focal macro-AP: 0.9573
 ```
 
 The alpha values show class 4 (rarest) gets 15× the gradient weight of class 0. The overall
@@ -207,32 +207,32 @@ for epoch in range(TOTAL_EPOCHS):
     ap = compute_macro_ap(model, X_val, y_val_np)
     phase = "warmup" if loss_fn.in_warmup else ("blend" if loss_fn.in_blend else "AP")
     t = loss_fn.current_temperature
-    temp_str = f"  temp={t:.4f}" if t is not None else ""
+    temp_str = f"  temp={t:.4f}" if (t is not None and not loss_fn.in_warmup) else ""
     print(f"Epoch {epoch:2d} [{phase:6s}]  macro-AP={ap:.4f}{temp_str}")
 ```
 
 **Output:**
 ```
-Epoch  0 [warmup]  macro-AP=0.6294
-Epoch  1 [warmup]  macro-AP=0.7950
-Epoch  2 [warmup]  macro-AP=0.8635
-Epoch  3 [warmup]  macro-AP=0.9061
-Epoch  4 [warmup]  macro-AP=0.9282
-Epoch  5 [blend ]  macro-AP=0.9416  temp=0.0500
-Epoch  6 [blend ]  macro-AP=0.9489  temp=0.0499
-Epoch  7 [AP    ]  macro-AP=0.9505  temp=0.0498
-Epoch  8 [AP    ]  macro-AP=0.9505  temp=0.0497
-Epoch  9 [AP    ]  macro-AP=0.9510  temp=0.0496
-Epoch 10 [AP    ]  macro-AP=0.9523  temp=0.0495
-Epoch 11 [AP    ]  macro-AP=0.9499  temp=0.0494
-Epoch 12 [AP    ]  macro-AP=0.9466  temp=0.0493
-Epoch 13 [AP    ]  macro-AP=0.9485  temp=0.0491
-Epoch 14 [AP    ]  macro-AP=0.9411  temp=0.0490
-Epoch 15 [AP    ]  macro-AP=0.9467  temp=0.0489
-Epoch 16 [AP    ]  macro-AP=0.9472  temp=0.0488
-Epoch 17 [AP    ]  macro-AP=0.9451  temp=0.0487
-Epoch 18 [AP    ]  macro-AP=0.9426  temp=0.0486
-Epoch 19 [AP    ]  macro-AP=0.9452  temp=0.0485
+Epoch  0 [warmup]  macro-AP=0.6776
+Epoch  1 [warmup]  macro-AP=0.8200
+Epoch  2 [warmup]  macro-AP=0.8785
+Epoch  3 [warmup]  macro-AP=0.9097
+Epoch  4 [warmup]  macro-AP=0.9291
+Epoch  5 [blend ]  macro-AP=0.9406  temp=0.0446
+Epoch  6 [blend ]  macro-AP=0.9472  temp=0.0396
+Epoch  7 [AP    ]  macro-AP=0.9460  temp=0.0351
+Epoch  8 [AP    ]  macro-AP=0.9460  temp=0.0312
+Epoch  9 [AP    ]  macro-AP=0.9450  temp=0.0277
+Epoch 10 [AP    ]  macro-AP=0.9457  temp=0.0246
+Epoch 11 [AP    ]  macro-AP=0.9440  temp=0.0218
+Epoch 12 [AP    ]  macro-AP=0.9451  temp=0.0194
+Epoch 13 [AP    ]  macro-AP=0.9399  temp=0.0172
+Epoch 14 [AP    ]  macro-AP=0.9408  temp=0.0153
+Epoch 15 [AP    ]  macro-AP=0.9429  temp=0.0135
+Epoch 16 [AP    ]  macro-AP=0.9444  temp=0.0120
+Epoch 17 [AP    ]  macro-AP=0.9416  temp=0.0107
+Epoch 18 [AP    ]  macro-AP=0.9429  temp=0.0095
+Epoch 19 [AP    ]  macro-AP=0.9415  temp=0.0084
 ```
 
 ## What you built
@@ -241,9 +241,9 @@ You trained the same architecture with three loss strategies on a 5-class imbala
 
 | Loss strategy | Macro-AP |
 |---|---|
-| CrossEntropyLoss | 0.9649 |
-| SoftmaxFocalLoss (alpha + gamma) | 0.9574 |
-| SmoothAPLoss with warmup | 0.9523 |
+| CrossEntropyLoss | 0.9716 |
+| SoftmaxFocalLoss (alpha + gamma) | 0.9573 |
+| SmoothAPLoss with warmup | 0.9415 |
 
 **Why are the numbers close?** With the rarest class at ~3% frequency, this dataset sits in the
 *mild-to-moderate* imbalance range. `CrossEntropyLoss` is surprisingly competitive here
