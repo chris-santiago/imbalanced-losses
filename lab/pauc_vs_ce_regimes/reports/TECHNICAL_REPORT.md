@@ -67,18 +67,20 @@ temperature (`scale` a detached robust dispersion of the negatives), and let `t_
 *detached* negative-score quantiles at FPR α and β (`t_α > t_β`). The **pairwise** surrogate scores
 positives against the negatives `B` falling inside the band `[t_β, t_α]`,
 
-```
-pAUC_pairwise = (1 / |P||B|) · Σ_{i∈P} Σ_{j∈B} σ((s_i − s_j) / τ),     B = {j negative : t_β ≤ s_j ≤ t_α},
-```
+$$
+\mathrm{pAUC}_{\text{pairwise}} = \frac{1}{|P|\,|B|} \sum_{i \in P} \sum_{j \in B} \sigma\!\left(\frac{s_i - s_j}{\tau}\right), \qquad B = \{\, j \text{ negative} : t_\beta \le s_j \le t_\alpha \,\},
+$$
 
 so gradient flows to both the positives and the band negatives `B` (the latter is what makes it adaptive
 hard-negative mining, §3). The **trapezoid** surrogate instead integrates a soft TPR over a uniform FPR
 grid `α = f_0 < … < f_{K−1} = β` with detached thresholds `t_k` = the `(1 − f_k)` negative quantile,
 
-```
-TPR_k = (1 / |P|) · Σ_{i∈P} σ((s_i − t_k) / τ),
-pAUC_trapezoid = [ ½TPR_0 + Σ_{k=1}^{K−2} TPR_k + ½TPR_{K−1} ] / (K − 1),
-```
+$$
+\begin{aligned}
+\mathrm{TPR}_k &= \frac{1}{|P|} \sum_{i \in P} \sigma\!\left(\frac{s_i - t_k}{\tau}\right), \\[2pt]
+\mathrm{pAUC}_{\text{trapezoid}} &= \frac{1}{K-1}\left[\, \tfrac{1}{2}\mathrm{TPR}_0 + \sum_{k=1}^{K-2} \mathrm{TPR}_k + \tfrac{1}{2}\mathrm{TPR}_{K-1} \,\right].
+\end{aligned}
+$$
 
 which gives gradient through the positives only — the thresholds `t_k` are detached, so band negatives are
 never directly suppressed. This positives-only gradient path is why the trapezoid surrogate collapses in the
