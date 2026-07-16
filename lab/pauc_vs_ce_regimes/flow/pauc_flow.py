@@ -541,6 +541,7 @@ def train_arm(
             surrogate  str    'pairwise'|'trapezoid'             (default 'pairwise')
             band       tuple  (alpha_mult, beta_mult)            (default (0.5, 1.5))
             queue_size int                                       (default 8192)
+            budget_basis str  'fpr'|'population'                 (default 'fpr')
             temp       float  temperature (start, for warmup anneal)  (default 0.5)
             temp_end   float  annealed-to temperature            (default 0.1)
             warmup_frac float fraction of total steps for CE warmup  (default 0.30)
@@ -726,6 +727,7 @@ def _train_pauc(
     beta = beta_mult * budget
     surrogate = arm_spec.get("surrogate", "pairwise")
     queue_size = arm_spec.get("queue_size", 8192)
+    budget_basis = arm_spec.get("budget_basis", "fpr")
     temp_start = arm_spec.get("temp", 0.5)
     temp_end = arm_spec.get("temp_end", 0.1)
     warmup_frac = arm_spec.get("warmup_frac", 0.30)
@@ -744,6 +746,7 @@ def _train_pauc(
         surrogate=surrogate,
         pos_numerator="pool",
         queue_size=queue_size,
+        budget_basis=budget_basis,
     )
 
     if cold:

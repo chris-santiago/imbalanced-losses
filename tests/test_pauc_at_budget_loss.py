@@ -83,9 +83,11 @@ def _wide_binary_batch(n=400, pos_rate=0.2, seed=0):
 
 
 @pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
-def test_binary_forward_backward(surrogate):
+@pytest.mark.parametrize("budget_basis", ["fpr", "population"])
+def test_binary_forward_backward(surrogate, budget_basis):
     loss_fn = PAUCAtBudgetLoss(
-        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate,
+        budget_basis=budget_basis, queue_size=0,
     )
     logits, targets = _wide_binary_batch()
     logits.requires_grad_(True)
@@ -1583,3 +1585,142 @@ def test_live_and_pool_differ_with_queue_positives(surrogate):
     assert not torch.equal(grad_pool, grad_live), (
         "gradients on live positives must differ between pool and live modes"
     )
+
+
+# ---------------------------------------------------------------------------
+# budget_basis feature tests
+# ---------------------------------------------------------------------------
+
+
+def test_budget_basis_invalid_value():
+    with pytest.raises(ValueError, match="budget_basis"):
+        PAUCAtBudgetLoss(num_classes=1, budget_basis="bogus")
+
+
+def test_budget_basis_default_is_fpr():
+    loss_fn = PAUCAtBudgetLoss(num_classes=1)
+    assert loss_fn.budget_basis == "fpr"
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_budget_basis_fpr_parity(surrogate):
+    """
+    budget_basis="fpr" (explicit) must be byte-identical in loss AND gradient
+    to a default-constructed instance (budget_basis unset), on the same batch.
+    This is the backward-compat proof: the fpr path is untouched.
+    """
+    logits, targets = _wide_binary_batch()
+
+    fn_default = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0,
+    )
+    fn_fpr = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0,
+        budget_basis="fpr",
+    )
+
+    x_default = logits.detach().clone().requires_grad_(True)
+    x_fpr = logits.detach().clone().requires_grad_(True)
+
+    loss_default = fn_default(x_default, targets)
+    loss_fpr = fn_fpr(x_fpr, targets)
+
+    assert torch.equal(loss_default, loss_fpr), (
+        f"default and explicit budget_basis='fpr' must give identical loss: "
+        f"{loss_default.item()} vs {loss_fpr.item()}"
+    )
+
+    loss_default.backward()
+    loss_fpr.backward()
+    assert torch.equal(x_default.grad, x_fpr.grad), (
+        "default and explicit budget_basis='fpr' must give identical gradients"
+    )
+
+
+def test_budget_basis_population_thresholds_differ():
+    """
+    Hand-counted: 10 iid negatives with scores 0..9 and 3 iid positives with
+    scores 20, 21, 22 (well above the negatives), alpha=0.1, beta=0.5,
+    interpolation='higher':
+
+    fpr (negatives only, n=10):
+        t_alpha = quantile(0..9, 0.9, higher) = 9.0
+        t_beta  = quantile(0..9, 0.5, higher) = 5.0
+
+    population (full pooled population, n=13: 0..9, 20, 21, 22):
+        t_alpha = quantile(pop, 0.9, higher) = 21.0
+        t_beta  = quantile(pop, 0.5, higher) = 6.0
+
+    Including the high-scoring positives in the population reference shifts
+    both quantiles upward relative to the negatives-only reference at the
+    same alpha/beta.
+    """
+    neg_scores = torch.arange(10, dtype=torch.float32).unsqueeze(1)  # [10, 1]
+    pos_scores = torch.tensor([[20.0], [21.0], [22.0]])              # [3, 1]
+    logits = torch.cat([neg_scores, pos_scores], dim=0)
+    targets = torch.cat([
+        torch.zeros(10, dtype=torch.long),
+        torch.ones(3, dtype=torch.long),
+    ])
+
+    fn_fpr = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate="trapezoid", queue_size=0,
+        quantile_interpolation="higher", budget_basis="fpr",
+    )
+    fn_pop = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate="trapezoid", queue_size=0,
+        quantile_interpolation="higher", budget_basis="population",
+    )
+
+    _, stats_fpr = fn_fpr(logits, targets, return_diagnostics=True)
+    _, stats_pop = fn_pop(logits, targets, return_diagnostics=True)
+
+    assert stats_fpr["t_alpha"][0].item() == 9.0
+    assert stats_fpr["t_beta"][0].item() == 5.0
+    assert stats_pop["t_alpha"][0].item() == 21.0
+    assert stats_pop["t_beta"][0].item() == 6.0
+
+    assert stats_pop["t_alpha"][0].item() > stats_fpr["t_alpha"][0].item(), (
+        "population t_alpha must exceed fpr t_alpha when high-scoring "
+        "positives are included in the reference population"
+    )
+    assert stats_pop["t_beta"][0].item() > stats_fpr["t_beta"][0].item(), (
+        "population t_beta must exceed fpr t_beta when high-scoring "
+        "positives are included in the reference population"
+    )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_budget_basis_population_pairwise_finite(surrogate):
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate, queue_size=0,
+        budget_basis="population",
+    )
+    logits, targets = _wide_binary_batch()
+    logits.requires_grad_(True)
+    out = loss_fn(logits, targets)
+    assert out.ndim == 0
+    assert torch.isfinite(out)
+    assert 0.0 <= out.item() <= 1.0
+    out.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_budget_basis_population_requires_iid_negatives():
+    """population mode still needs iid negatives to anchor the operating point.
+
+    With zero negatives the class is marked INVALID (not silently computed off a
+    positives-only reference). Uses the trapezoid surrogate because the pairwise
+    surrogate would self-guard on the empty band regardless — only trapezoid
+    exercises the n_iid_neg guard itself.
+    """
+    torch.manual_seed(0)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.0, beta=0.5, surrogate="trapezoid",
+        budget_basis="population", queue_size=0,
+    )
+    logits = torch.randn(8, 1, requires_grad=True)
+    targets = torch.ones(8, dtype=torch.long)  # all positive -> no negatives
+    loss, per_class, valid = loss_fn(logits, targets, return_per_class=True)
+    assert not bool(valid[0]), "class with no iid negatives must be invalid"
+    assert torch.isfinite(loss), "no-negatives case must not produce nan/inf"

@@ -5,9 +5,12 @@ Optimizes the normalized partial AUC over a false-positive-rate band
 ``[alpha, beta]`` that brackets a target operating point (e.g. FPR ~ 0.005),
 rather than the full AUC or a single-threshold recall.
 
-Band edges are estimated as score quantiles of the *iid negatives* only
-(stop-gradient), so they **approximate** true population FPR.  The
-approximation is reliable when the pooled iid-negative count substantially
+Band edges are estimated as score quantiles of a reference population under
+stop-gradient; the ``budget_basis`` parameter selects that reference --
+*iid negatives* only (``'fpr'``, default) or the whole pooled iid population
+(positives+negatives, ``'population'``) -- so they **approximate** true
+population FPR (or a population-quantile alert budget).  The
+approximation is reliable when the pooled reference count substantially
 exceeds the reciprocal of the band's smaller nonzero edge -- ``1/beta`` when
 ``alpha=0`` (the default), ``1/alpha`` when ``alpha > 0``; at small counts
 the tail quantile is biased toward the maximum.  Check the
@@ -167,6 +170,25 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         the ~few live positives). Thresholds and ``tau_eff`` always use the full
         pooled iid negatives regardless of this setting. A class with no live
         positives in a step is skipped (invalid) under ``'live'``. Default: 'pool'.
+    budget_basis : {'fpr', 'population'}, optional
+        Reference population for the band-edge quantiles ``t_alpha``/``t_beta``
+        (and the ``tau_scale`` dispersion computed from that same reference).
+        ``'fpr'`` (default) uses the iid negatives only, so ``beta`` is the
+        fraction of negatives above the band -- true FPR semantics. ``'population'``
+        uses the whole pooled iid population (positives + negatives), so
+        ``beta`` is the fraction of the *population* above the band -- matching
+        a top-k alert budget spent over all scores rather than over negatives
+        alone. Two consequences of ``'population'``: with ``alpha=0``,
+        ``t_alpha = max`` over the whole population, which can be a positive's
+        own score rather than a negative's; and the pool-size reliability
+        heuristic (pool count should substantially exceed ``1/beta`` --
+        see ``band_neg_count`` above) is over the pooled *population* count,
+        not the negative count. ``surrogate='trapezoid'`` combined with
+        ``budget_basis='population'`` is approximately equivalent to
+        ``RecallAtQuantileLoss`` (band-averaged soft recall over population
+        score quantiles); it is supported here for completeness and documented
+        as a near-equivalent rather than a distinct recommended configuration.
+        Default: 'fpr' (backward-compatible).
     queue_size : int, optional
         Circular buffer size (rows). Larger queues stabilise the quantile-based
         band edges -- at low FPR you need many negatives for a meaningful tail
@@ -248,6 +270,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     _VALID_SURROGATES = ("trapezoid", "pairwise")
     _VALID_TAU_SCALES = ("iqr", "band")
     _VALID_POS_NUMERATORS = ("pool", "live")
+    _VALID_BUDGET_BASES = ("fpr", "population")
 
     # Floor on the detached dispersion to avoid div-by-zero when all iid
     # negative scores are (near) equal.
@@ -262,6 +285,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         n_knots: int = 2,
         tau_scale: Literal["iqr", "band"] = "iqr",
         pos_numerator: Literal["pool", "live"] = "pool",
+        budget_basis: Literal["fpr", "population"] = "fpr",
         queue_size: int = 1024,
         temperature: float = 0.1,
         reduction: Literal["mean", "sum", "none"] = "mean",
@@ -291,6 +315,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 f"pos_numerator must be one of {self._VALID_POS_NUMERATORS}, "
                 f"got '{pos_numerator}'"
             )
+        if budget_basis not in self._VALID_BUDGET_BASES:
+            raise ValueError(
+                f"budget_basis must be one of {self._VALID_BUDGET_BASES}, "
+                f"got '{budget_basis}'"
+            )
         if quantile_interpolation not in self._VALID_INTERPOLATIONS:
             raise ValueError(
                 f"quantile_interpolation must be one of {self._VALID_INTERPOLATIONS}, "
@@ -314,6 +343,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         self.n_knots = n_knots
         self.tau_scale = tau_scale
         self.pos_numerator = pos_numerator
+        self.budget_basis = budget_basis
         self.quantile_interpolation = quantile_interpolation
 
         # Warn once per instance when a class is skipped due to near-zero
@@ -448,10 +478,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             Normalized partial AUC estimate in [0, 1]. Zero (no gradient) for
             invalid classes.
         valid : bool
-            False if there are no positives, no iid negatives, the iid-negative
-            dispersion is near-zero (degenerate), or (pairwise) no band negatives.
-            When ``pos_numerator="live"``, also False if there are no live
-            positives for this class (no gradient signal this step).
+            False if there are no positives, no reference-population rows
+            (iid negatives under ``budget_basis="fpr"``, or the whole iid
+            population under ``budget_basis="population"``), the reference
+            dispersion is near-zero (degenerate), or (pairwise) no band
+            negatives. When ``pos_numerator="live"``, also False if there are
+            no live positives for this class (no gradient signal this step).
             Invalid classes are excluded from reduction.
         diag : dict
             Diagnostic scalars for this class (all detached) when
@@ -464,16 +496,28 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         Notes
         -----
-        Band edges ``t_alpha``/``t_beta`` and ``tau_eff`` are computed from the
-        DETACHED iid negatives regardless of ``pos_numerator`` — the queue
-        still stabilizes thresholds even when the numerator is restricted to
-        live positives.  In trapezoid mode gradient reaches the numerator
-        positives only; in pairwise mode it reaches numerator positives and
-        band negatives.
+        Band edges ``t_alpha``/``t_beta`` and ``tau_eff`` are computed from a
+        DETACHED reference population -- selected by ``self.budget_basis``
+        (iid negatives under ``"fpr"``, the whole iid population under
+        ``"population"``) -- regardless of ``pos_numerator``: the queue still
+        stabilizes thresholds even when the numerator is restricted to live
+        positives. The ``band_neg_count`` diagnostic always counts iid
+        negatives in the band, independent of ``budget_basis``, since its
+        semantics are population-level FPR. In trapezoid mode gradient
+        reaches the numerator positives only; in pairwise mode it reaches
+        numerator positives and band negatives (the band itself always
+        selects negatives, only the quantile reference population moves).
         """
         iid_neg = is_neg & is_iid
         n_pos = int(is_pos.sum())
         n_iid_neg = int(iid_neg.sum())
+        # Reference population for the band-edge quantiles: iid negatives only
+        # ("fpr", true FPR semantics) or the whole pooled iid population
+        # ("population", a top-k budget over all scores).  Either basis still
+        # needs iid negatives to anchor the operating point, so the guard is on
+        # them: in "fpr" mode this is exactly the pre-change n_iid_neg guard; in
+        # "population" mode it additionally rejects a positives-only reference.
+        ref_mask = is_iid if self.budget_basis == "population" else iid_neg
         if n_pos == 0 or n_iid_neg == 0:
             return scores.new_zeros(()), False, {}
 
@@ -487,8 +531,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             # "pool": use all pooled positives (pre-change behavior).
             pos_num = is_pos
 
-        neg = scores[iid_neg].detach()
-        t_alpha, t_beta, scale = self._band_thresholds_and_scale(neg)
+        ref = scores[ref_mask].detach()
+        t_alpha, t_beta, scale = self._band_thresholds_and_scale(ref)
 
         # Degeneracy guard: if the robust dispersion is ~zero, the sigmoid
         # temperature cannot be calibrated.  Mark as invalid rather than
@@ -496,22 +540,28 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         # or an exploding gradient).  Emit a one-time warning.
         if scale <= self._SCALE_EPS:
             if not self._degenerate_warned:
+                # The band edges + scale are computed over this reference set,
+                # which depends on budget_basis.
+                _ref_desc = (
+                    "the pooled iid population (positives + negatives)"
+                    if self.budget_basis == "population" else "the iid negatives"
+                )
                 _alpha_note = (
-                    "alpha=0 means t_alpha=max(neg_iid); dispersion is near-zero "
-                    "because iid negatives have equal (or near-equal) scores."
+                    f"alpha=0 means t_alpha=max of {_ref_desc}; dispersion is "
+                    f"near-zero because those scores are equal (or near-equal)."
                     if self.alpha == 0.0 else
-                    f"fewer than ~{1.0 / self.alpha:.4g} iid negatives are needed "
+                    f"fewer than ~{1.0 / self.alpha:.4g} reference rows are needed "
                     f"to resolve the tail quantile at alpha={self.alpha:.4g}."
                 )
                 warnings.warn(
-                    f"{type(self).__name__}: iid-negative score dispersion is "
-                    f"near-zero (scale={scale.item():.2e} <= _SCALE_EPS={self._SCALE_EPS:.2e}) "
-                    f"for at least one class. This typically means all iid negatives "
-                    f"have equal (or near-equal) scores, or the FPR band "
-                    f"[{self.alpha}, {self.beta}] is too narrow relative to the "
-                    f"available iid-negative count ({_alpha_note}) "
+                    f"{type(self).__name__}: reference-population score dispersion "
+                    f"is near-zero (scale={scale.item():.2e} <= _SCALE_EPS={self._SCALE_EPS:.2e}) "
+                    f"for at least one class. The band edges and scale are computed "
+                    f"over {_ref_desc}; this typically means those scores are equal "
+                    f"(or near-equal), or the band [{self.alpha}, {self.beta}] is too "
+                    f"narrow relative to the available reference count ({_alpha_note}) "
                     f"The affected class is skipped (marked INVALID). "
-                    f"To fix: increase queue_size or ensure iid negatives cover a "
+                    f"To fix: increase queue_size or ensure {_ref_desc} cover a "
                     f"meaningful score range. "
                     f"(This warning is shown once per instance.)",
                     UserWarning,
@@ -531,7 +581,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 device=scores.device, dtype=scores.dtype
             )
             t_k = torch.quantile(
-                neg, 1.0 - f_k, interpolation=self.quantile_interpolation
+                ref, 1.0 - f_k, interpolation=self.quantile_interpolation
             )  # [n_knots], detached
             p = scores[pos_num]  # gradient flows here (numerator positive set)
             # [n_pos_num, n_knots]; each row is the contribution vector for one positive.
@@ -556,7 +606,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 v = (contrib_mat.detach() * weights.unsqueeze(0)).sum(dim=1) / (self.n_knots - 1)
                 pauc_var = v.var(unbiased=False)
             # band_neg_count: iid negatives in the band [t_beta, t_alpha].
-            band_neg_count = int(((neg >= t_beta) & (neg <= t_alpha)).sum())
+            # Always counted over iid negatives (population-FPR semantics),
+            # regardless of budget_basis / ref.
+            neg_iid_scores = scores[iid_neg].detach()
+            band_neg_count = int(
+                ((neg_iid_scores >= t_beta) & (neg_iid_scores <= t_alpha)).sum()
+            )
             diag = {
                 "t_alpha": t_alpha.detach(),
                 "t_beta": t_beta.detach(),
@@ -585,7 +640,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             pauc_var = v.var(unbiased=False)
         # band_neg_count counts IID negatives in the band (consistent with
         # trapezoid), since the diagnostic semantics are population-level FPR.
-        band_neg_count = int(((neg >= t_beta) & (neg <= t_alpha)).sum())
+        # Always counted over iid negatives regardless of budget_basis / ref.
+        neg_iid_scores = scores[iid_neg].detach()
+        band_neg_count = int(
+            ((neg_iid_scores >= t_beta) & (neg_iid_scores <= t_alpha)).sum()
+        )
         diag = {
             "t_alpha": t_alpha.detach(),
             "t_beta": t_beta.detach(),

@@ -1,0 +1,46 @@
+# Budget-basis A/B: fpr-band vs population-band coverage@budget.
+#
+# PAUCAtBudgetLoss's [alpha, beta] band is defined relative to a budget_basis:
+# 'fpr' (default) sizes the band off the negative-only false-positive rate;
+# 'population' sizes it off the whole-population top-k, matching how
+# coverage() (pauc_flow.py) actually ranks and thresholds at eval time. The
+# two bases mainly diverge when positives fill a non-negligible share of the
+# budget (i.e. away from extreme imbalance, where fpr and population-rank
+# nearly coincide); this A/B isolates that divergence on the headline regime.
+#
+# pauc_pairwise (fpr basis) vs pauc_pairwise_pop (population basis) are
+# trained with identical overrides below — budget_basis is the ONLY
+# difference between them. weighted_ce is the reference baseline.
+#
+# data_axes: cue changes the data; budget is single (kept small to stay
+#   within the headline regime's runtime budget).
+#
+# band axis (both mults relative to budget): the fpr and population bases
+#   diverge MOST at the extreme top, where positives concentrate. [0.5, 1.5]
+#   (alpha=budget/2) is the older convention every headline/mechanism
+#   experiment ran the FPR arm on — kept for direct comparability with those
+#   published numbers, but it excludes that top region so the basis effect is
+#   muted there. [0.0, 1.0] (alpha=0, beta=budget) is the library's recommended
+#   default and the band where population-basis can actually differ (t_alpha is
+#   max(neg) under fpr vs max(pos+neg) under population). Running both isolates
+#   whether the basis matters and where.
+name: budget_basis_ab
+axes:
+  cue: [nonlinear_prod]
+  budget: [0.005]
+  band: [[0.5, 1.5], [0.0, 1.0]]
+data_axes: [cue]
+arms: [weighted_ce, pauc_pairwise, pauc_pairwise_pop]
+diagnostics: [metric_specificity]
+arm_overrides:
+  weighted_ce:
+    wd_sweep: [0.0]
+    early_stop: false
+  pauc_pairwise:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false
+  pauc_pairwise_pop:
+    wd_sweep: [0.0]
+    temp_sweep: [0.5]
+    early_stop: false
