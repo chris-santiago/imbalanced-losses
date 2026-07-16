@@ -24,9 +24,13 @@ long published lineage (see [References](#references)).
 
 For an alerting or review workload, the metric that matters is **coverage at a
 budget**: if you can action the top `b` fraction of scores (say the top 0.5 % —
-"50 bps"), what fraction of positives do you catch? Equivalently, recall at a fixed
-low false-positive rate. This is decided entirely at the **top of the score
-ranking**, and standard objectives do not optimize it directly:
+"50 bps"), what fraction of positives do you catch? At extreme imbalance this is
+approximately recall at a fixed low false-positive rate — the two coincide as
+positives become a negligible share of the population, but they are not the same
+quantity (the top-`b` budget is a fraction of *all* samples, FPR a fraction of
+*negatives*; see the technical report §1.3 for the small gap). This is decided
+entirely at the **top of the score ranking**, and standard objectives do not
+optimize it directly:
 
 - **Cross-entropy** optimizes calibrated per-sample likelihood. Its gradient is
   spread across the whole distribution and, at extreme imbalance, dominated by the
