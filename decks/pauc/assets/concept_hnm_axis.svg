@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 470" font-family="Helvetica,Arial,sans-serif">
+<text x="500.0" y="40.0" font-size="25" fill="#1a4a7a" text-anchor="middle" font-weight="bold">The band is a label-free hard-negative miner</text>
+<text x="500.0" y="70.0" font-size="17" fill="#6b7280" text-anchor="middle" font-weight="normal">pairwise surrogate pushes the in-band negatives (decoys) below the positives</text>
+<rect x="565.6" y="155.0" width="229.6" height="190.0" rx="0" fill="#f4d35e" stroke="none" stroke-width="1.5" fill-opacity="0.35"/>
+<line x1="565.6" y1="150.0" x2="565.6" y2="345.0" stroke="#b91c1c" stroke-width="1.8" stroke-dasharray="4,3"/>
+<text x="565.6" y="142.0" font-size="17" fill="#b91c1c" text-anchor="middle" font-weight="bold" font-family="SFMono-Regular,Menlo,monospace">t_β</text>
+<line x1="795.2" y1="150.0" x2="795.2" y2="345.0" stroke="#b91c1c" stroke-width="1.8" stroke-dasharray="4,3"/>
+<text x="795.2" y="142.0" font-size="17" fill="#b91c1c" text-anchor="middle" font-weight="bold" font-family="SFMono-Regular,Menlo,monospace">t_α = max(neg)</text>
+<line x1="90.0" y1="250.0" x2="918.0" y2="250.0" stroke="#333" stroke-width="2.5"/>
+<polygon points="918.0,250.0 909.0,254.9 909.0,245.1" fill="#333"/>
+<text x="914.0" y="276.0" font-size="16" fill="#333" text-anchor="end" font-weight="normal">higher score →</text>
+<circle cx="733.0" cy="206.7" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="802.8" cy="208.4" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="778.3" cy="202.0" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="676.4" cy="198.8" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="672.0" cy="200.5" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="678.9" cy="208.0" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="754.5" cy="191.8" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="690.4" cy="205.1" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<circle cx="797.8" cy="189.2" r="6" fill="#d97706" stroke="none" stroke-width="1.5"/>
+<text x="778.8" y="348.0" font-size="1" fill="#222" text-anchor="middle" font-weight="normal"></text>
+<circle cx="343.0" cy="295.9" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="506.7" cy="285.4" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="458.4" cy="292.7" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="165.5" cy="287.5" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="232.9" cy="308.5" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="180.5" cy="301.4" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="368.4" cy="295.2" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="331.0" cy="285.9" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="130.8" cy="290.2" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="385.4" cy="296.8" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="235.2" cy="301.6" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="292.2" cy="293.0" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="432.1" cy="305.0" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="206.5" cy="301.2" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="321.7" cy="310.3" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="405.5" cy="292.6" r="5.5" fill="#1a4a7a" stroke="none" stroke-width="1.5"/>
+<circle cx="790.6" cy="292.8" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="784.6" y1="292.8" x2="744.6" y2="292.8" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="744.6,292.8 751.6,289.0 751.6,296.7" fill="#b91c1c"/>
+<circle cx="661.6" cy="308.2" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="655.6" y1="308.2" x2="615.6" y2="308.2" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="615.6,308.2 622.6,304.3 622.6,312.0" fill="#b91c1c"/>
+<circle cx="600.5" cy="301.7" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="594.5" y1="301.7" x2="554.5" y2="301.7" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="554.5,301.7 561.5,297.9 561.5,305.6" fill="#b91c1c"/>
+<circle cx="574.6" cy="306.0" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="568.6" y1="306.0" x2="528.6" y2="306.0" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="528.6,306.0 535.6,302.2 535.6,309.9" fill="#b91c1c"/>
+<circle cx="741.1" cy="303.8" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="735.1" y1="303.8" x2="695.1" y2="303.8" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="695.1,303.8 702.1,299.9 702.1,307.6" fill="#b91c1c"/>
+<circle cx="766.6" cy="297.5" r="6" fill="#b91c1c" stroke="#7a0f1c" stroke-width="2"/>
+<line x1="760.6" y1="297.5" x2="720.6" y2="297.5" stroke="#b91c1c" stroke-width="2"/>
+<polygon points="720.6,297.5 727.6,293.7 727.6,301.4" fill="#b91c1c"/>
+<circle cx="862.9" cy="295.9" r="6" fill="#b91c1c" stroke="none" stroke-width="1.5"/>
+<circle cx="854.4" cy="293.1" r="6" fill="#b91c1c" stroke="none" stroke-width="1.5"/>
+<text x="327.8" y="366.0" font-size="16" fill="#1a4a7a" text-anchor="middle" font-weight="normal">bulk negatives</text>
+<text x="327.8" y="386.0" font-size="14" fill="#6b7280" text-anchor="middle" font-weight="normal" font-style="italic">no gradient (inert)</text>
+<text x="680.4" y="366.0" font-size="16" fill="#b91c1c" text-anchor="middle" font-weight="bold">in-band decoys</text>
+<text x="680.4" y="386.0" font-size="14" fill="#b91c1c" text-anchor="middle" font-weight="normal">← pushed down-rank (mined)</text>
+<text x="850.2" y="366.0" font-size="15" fill="#b91c1c" text-anchor="middle" font-weight="normal">escapees</text>
+<text x="850.2" y="386.0" font-size="13" fill="#6b7280" text-anchor="middle" font-weight="normal" font-style="italic">(α=0 fixes this)</text>
+<text x="762.4" y="180.0" font-size="16" fill="#d97706" text-anchor="middle" font-weight="bold">positives</text>
+</svg>
