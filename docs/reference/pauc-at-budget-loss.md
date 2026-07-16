@@ -77,6 +77,7 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 | `n_knots` | `2` | Trapezoid FPR knots; `2` is accurate for narrow bands, `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | Scale used for the scale-aware temperature: `"iqr"` (stable bulk statistic; pair with small `temperature`) or `"band"` (sized to the operating region; pair with `temperature` near 1.0) |
 | `pos_numerator` | `"pool"` | Positives in the soft-TPR numerator (and the pairwise positive set): `"pool"` (all pooled positives) or `"live"` (live-batch only). `"live"` gives an undiluted gradient when the queue swamps the few live positives at extreme imbalance — most beneficial for `"trapezoid"`; `"pairwise"` usually prefers `"pool"` to keep the positive×band-negative contrast populated |
+| `budget_basis` | `"fpr"` | What the band edges quantile *over*: `"fpr"` (iid negatives — `beta` is an FPR) or `"population"` (all pooled scores, positives + negatives — `beta` is a top-k alert-budget fraction). Prefer the default; `"population"` is within seed noise at `alpha=0` and doesn't beat it (see Band selection guidance) |
 | `temperature` | `0.1` | **Dimensionless** multiplier on `tau_eff = temperature * scale` — not raw logits. Larger = smoother/biased-to-0.5; smaller = sharper but risks saturation |
 | `queue_size` | `1024` | Larger queues stabilise the tail quantile; at low FPR you need many pooled negatives |
 | `reduction` | `"mean"` | `"none"` returns `[C]`; invalid classes are `nan` |
@@ -93,6 +94,8 @@ The older convention `[budget/2, 1.5·budget]` (e.g. `[0.0025, 0.0075]` for 50 b
 **Caveat:** this evidence is synthetic, at a single budget (50 bps), in the contested-top regime. The improvement is concentrated at `pos_rate ≪ budget`. Once `pos_rate ≥ budget`, coverage@budget is mechanically capped at `budget/pos_rate` and band choice is irrelevant.
 
 The band edges are estimated as score quantiles of the **iid negatives** and approximate *population* FPR only when the pooled iid-negative count is adequate. With `alpha=0`, the upper threshold is always the maximum negative score (no tail-quantile bias for `t_alpha`); only `t_beta` requires enough negatives to resolve `quantile(neg, 1 - beta)`. Use `queue_size` to accumulate enough negatives, and the `band_neg_count` diagnostic as the empirical check. A class whose iid-negative score dispersion is degenerate (≈ 0) is skipped (marked invalid) with a one-time warning.
+
+**FPR vs population band (`budget_basis`).** By default the band edges are quantiles of the iid negatives, so `beta` is a false-positive rate (`budget_basis="fpr"`). Set `budget_basis="population"` to quantile over the whole pooled population (positives + negatives) instead, making `beta` a top-k fraction over all scores — a deployment "alert budget" that matches how coverage@budget is measured. Prefer the default: on synthetic contested-top data (8 seeds) the two bases are within seed noise at the recommended `alpha=0` band (whose upper edge already spans every top negative), and `alpha=0` beats `"population"` at any other band. (`surrogate="trapezoid"` + `budget_basis="population"` is approximately `RecallAtQuantileLoss`.)
 
 ## Choosing among the ranking losses
 

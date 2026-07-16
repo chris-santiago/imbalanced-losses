@@ -196,6 +196,25 @@ This helps the `"trapezoid"` surrogate most. The `"pairwise"` surrogate usually
 prefers the default `"pool"`, since restricting its positive×band-negative contrast
 to the few live positives can starve it.
 
+### FPR vs population budget (`budget_basis`)
+
+By default `beta` is a false-positive rate — the band edges are quantiles of the
+negatives. Pass `budget_basis="population"` to instead make `beta` a fraction of the
+*whole population* (a top-k alert budget over all scores, matching an "action the top
+`beta·N` cases" workflow):
+
+```python
+loss_fn = PAUCAtBudgetLoss(num_classes=1, alpha=0.0, beta=0.005,
+                           budget_basis="population")
+```
+
+Prefer the default `"fpr"`. On synthetic contested-top data the two bases are within
+seed noise at the recommended `alpha=0` band (with `alpha=0` the upper edge already
+spans every top negative), and `alpha=0` beats `"population"` at any other band — see
+the [PAUC deep dive](../explanation/pauc-at-budget-deep-dive.md) for the ablation.
+(`surrogate="trapezoid"` + `budget_basis="population"` is approximately
+`RecallAtQuantileLoss`.)
+
 ### Check band health with diagnostics
 
 Pass `return_diagnostics=True` to get per-class statistics alongside the loss. Use `band_neg_count` to confirm the band is populated, and `grad_pos_count` to confirm positives are contributing gradients:

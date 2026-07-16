@@ -381,6 +381,21 @@ gradient-concentration mechanism.** Reach for the pairwise band when you want th
 concentration delivered adaptively and without labels; if you already have a working
 HNM pipeline, you are most of the way there.
 
+### 5.4 FPR vs population band basis (`budget_basis`)
+
+The band edges default to quantiles of the iid **negatives** (`budget_basis="fpr"`), so `β` is a false-positive rate. But the deployment metric — coverage@budget — is a top-k over the *whole population* (recall among the top `⌈budget·N⌉` of all scores, positives included). Setting `budget_basis="population"` aligns the loss's band with that metric by taking the edge quantiles over the pooled population (positives + negatives) instead of the negatives only. The band still selects only negatives for the pairwise contrast; only the reference set for the edges moves. (With `surrogate="trapezoid"`, `budget_basis="population"` is approximately `RecallAtQuantileLoss` — a band-averaged soft recall over population quantiles.)
+
+Whether that alignment helps is an empirical question, and the answer is **mostly no** — for the same reason the top-k and FPR *metric* estimators nearly coincide at extreme imbalance. On the nonlinear-product headline cell (8 seeds, the `budget_basis_ab` slice):
+
+| band | `fpr` | `population` | Δ (pop − fpr) |
+|---|---:|---:|---:|
+| `α=0, β=budget` (recommended) | 0.814 | 0.814 | ≈ 0 |
+| `α=budget/2, β=1.5·budget` (older) | 0.792 | 0.803 | +0.012 |
+
+With `α=0`, `t_α = max` spans every top negative regardless of basis, so the population edge changes nothing (Δ ≈ 0). The population basis gives a small lift only at the narrow high-`α` band, where it shifts the band upward toward the escaped top decoys (§5.3) — a weaker version of the band-escape fix that lowering `α` provides in full. `α=0` (either basis) still dominates both. (These are 8-seed point estimates; the +0.012 is plausibly within seed noise, and there is no bootstrap CI on the fpr-vs-population delta.)
+
+**Takeaway.** Keep the default `budget_basis="fpr"`. `"population"` is available for the alert-budget reading (`β` as a fraction of the whole population), but it does not beat the recommended `α=0` band — which already makes the basis moot.
+
 ## 6. When to use it (and when not)
 
 **Reach for `PAUCAtBudgetLoss` when:**
