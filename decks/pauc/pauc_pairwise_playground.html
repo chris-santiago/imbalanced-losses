@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pAUC pairwise-surrogate playground</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --ink:#1d2330; --muted:#6b7689;
+    --pos:#e8833a; --neg:#3b82c4; --band:#f4d35e; --bandneg:#d7263d;
+    --line:#cdd4df; --accent:#2b6cb0;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 22px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{margin:0;font-size:18px}
+  header p{margin:6px 0 0;color:var(--muted);max-width:900px}
+  header code{background:#eef1f5;padding:1px 5px;border-radius:4px;font-size:12.5px}
+  .wrap{display:grid;grid-template-columns:300px 1fr;gap:18px;padding:18px;align-items:start}
+  .sidebar{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;position:sticky;top:18px}
+  .main{display:flex;flex-direction:column;gap:16px;min-width:0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card h2{margin:0 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+  .card .sub{color:var(--muted);font-size:12.5px;margin:0 0 10px}
+  .ctl{margin-bottom:14px}
+  .ctl label{display:flex;justify-content:space-between;font-weight:600;margin-bottom:4px}
+  .ctl label .val{font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .group-title{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);
+    margin:18px 0 10px;border-top:1px solid var(--line);padding-top:12px}
+  .btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
+  button{font:inherit;font-weight:600;border:1px solid var(--line);background:#fff;color:var(--ink);
+    padding:7px 11px;border-radius:7px;cursor:pointer}
+  button:hover{background:#f0f3f7}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button.primary:hover{filter:brightness(1.06)}
+  .seg{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg-btn{flex:1;border:0;border-radius:0;background:#fff;padding:7px 0;font-weight:600;color:var(--muted)}
+  .seg-btn+.seg-btn{border-left:1px solid var(--line)}
+  .seg-btn.active{background:var(--accent);color:#fff}
+  table.cmp{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:4px}
+  table.cmp th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);padding:4px 8px;border-bottom:1px solid var(--line)}
+  table.cmp td{padding:6px 8px;border-bottom:1px solid #eef1f5}
+  table.cmp tr.active{background:rgba(43,108,176,.09)}
+  table.cmp tr.active td:first-child{font-weight:700;color:var(--accent)}
+  table.cmp .mut{color:var(--muted);font-size:11px}
+  .chk{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--ink);margin-top:8px;cursor:pointer}
+  .chk input{accent-color:var(--accent)}
+  .formula.degenerate{background:#fdecef;border-color:var(--bandneg);color:#9a1b2c}
+  .readouts{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}
+  .ro{background:#f3f6fa;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+  .ro .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+  .ro .v{font-size:18px;font-weight:700;font-variant-numeric:tabular-nums}
+  .ro.loss .v{color:var(--bandneg)}
+  canvas{display:block;width:100%;border-radius:8px;touch-action:none}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin-top:8px}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .dot{width:11px;height:11px;border-radius:50%}
+  .note{font-size:12px;color:var(--muted);margin-top:8px}
+  .formula{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;background:#f3f6fa;
+    border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-top:8px;overflow-x:auto}
+  .roc-row{display:grid;grid-template-columns:340px 1fr;gap:16px;align-items:start}
+  @media(max-width:880px){.wrap{grid-template-columns:1fr}.roc-row{grid-template-columns:1fr}.sidebar{position:static}}
+</style>
+</head>
+<body>
+<header>
+  <h1>pAUC pairwise-surrogate playground</h1>
+  <p>Interactive demo of the <code>PAUCAtBudgetLoss</code> pairwise surrogate. The loss optimizes
+  partial AUC over a false-positive-rate band <code>[α, β]</code> around an operating point. Drag any
+  point, or set the distributions, and watch the band, the per-point gradients, and
+  <code>loss = 1 − pAUC</code> respond. Gradients reveal the mechanism: positives are pushed up,
+  <b>band</b> negatives are pushed down (hard-negative mining at the operating point), and every other
+  negative is inert.</p>
+</header>
+
+<div class="wrap">
+  <aside class="sidebar">
+    <div class="group-title" style="margin-top:0;border:0;padding:0">Loss parameters</div>
+
+    <div class="ctl">
+      <label>β &nbsp;<span style="font-weight:400;color:var(--muted)">FPR budget (upper edge)</span><span class="val" id="betaV"></span></label>
+      <input type="range" id="beta" min="0.02" max="0.5" step="0.005" value="0.15">
+    </div>
+    <div class="ctl">
+      <label>α &nbsp;<span style="font-weight:400;color:var(--muted)">lower edge</span><span class="val" id="alphaV"></span></label>
+      <input type="range" id="alpha" min="0" max="0.5" step="0.005" value="0">
+    </div>
+    <div class="ctl">
+      <label>τ-scale&nbsp;<span style="font-weight:400;color:var(--muted)">dispersion for τ_eff</span></label>
+      <div class="seg" id="tauScaleSeg">
+        <button type="button" data-v="band" class="seg-btn active">band</button>
+        <button type="button" data-v="iqr" class="seg-btn">iqr</button>
+      </div>
+    </div>
+    <div class="ctl">
+      <label>temperature&nbsp;<span style="font-weight:400;color:var(--muted)">per τ-scale</span><span class="val" id="tempV"></span></label>
+      <input type="range" id="temp" min="0.01" max="2" step="0.01" value="1.0">
+    </div>
+
+    <div class="group-title">Distributions</div>
+    <div class="ctl">
+      <label>positive mean<span class="val" id="posMeanV"></span></label>
+      <input type="range" id="posMean" min="-2" max="6" step="0.1" value="2.6">
+    </div>
+    <div class="ctl">
+      <label>positive spread<span class="val" id="posStdV"></span></label>
+      <input type="range" id="posStd" min="0.2" max="2.5" step="0.05" value="1">
+    </div>
+    <div class="ctl">
+      <label>negative mean<span class="val" id="negMeanV"></span></label>
+      <input type="range" id="negMean" min="-2" max="6" step="0.1" value="0">
+    </div>
+    <div class="ctl">
+      <label>negative spread<span class="val" id="negStdV"></span></label>
+      <input type="range" id="negStd" min="0" max="2.5" step="0.05" value="1">
+    </div>
+    <div class="ctl">
+      <label># positives<span class="val" id="nPosV"></span></label>
+      <input type="range" id="nPos" min="3" max="60" step="1" value="18">
+    </div>
+    <div class="ctl">
+      <label># negatives<span class="val" id="nNegV"></span></label>
+      <input type="range" id="nNeg" min="10" max="200" step="1" value="80">
+    </div>
+
+    <div class="group-title">Actions</div>
+    <div class="ctl">
+      <label>learning rate<span class="val" id="lrV"></span></label>
+      <input type="range" id="lr" min="0.1" max="20" step="0.1" value="3">
+    </div>
+    <label class="chk"><input type="checkbox" id="normArrows"> normalize arrow lengths (visual only)</label>
+    <div class="btns" style="margin-top:10px">
+      <button class="primary" id="step">Gradient step</button>
+      <button id="run">▶ Run</button>
+      <button id="regen">Regenerate</button>
+      <button id="reset">Reset</button>
+    </div>
+    <p class="note">“Gradient step” / “Run” perform real SGD: each point moves by <code>lr × gradient</code>.
+    Arrows show the <b>true</b> gradient magnitude by default, so a small τ shows large arrows on
+    boundary pairs and near-zero on well-separated ones (vanishing gradients). Negatives that fall out
+    of the band stop moving (no longer hard negatives at the operating point); if the gradient vanishes
+    everywhere, Run stops — the surrogate has stalled.</p>
+  </aside>
+
+  <div class="main">
+    <div class="card">
+      <h2>Readouts</h2>
+      <div class="readouts">
+        <div class="ro loss"><div class="k">loss = 1 − pAUC</div><div class="v" id="roLoss">—</div></div>
+        <div class="ro"><div class="k">pAUC (surrogate)</div><div class="v" id="roPauc">—</div></div>
+        <div class="ro"><div class="k">band negatives</div><div class="v" id="roBand">—</div></div>
+        <div class="ro"><div class="k">τ_eff</div><div class="v" id="roTau">—</div></div>
+        <div class="ro"><div class="k">t_β … t_α</div><div class="v" id="roT" style="font-size:14px">—</div></div>
+        <div class="ro"><div class="k">pAUC (empirical)</div><div class="v" id="roEmp">—</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>τ-scale comparison&nbsp;<span style="text-transform:none;font-weight:400;color:var(--muted)">— band vs iqr</span></h2>
+      <p class="sub">Both modes select the <b>same</b> band negatives. Each applies its own
+      <b>calibrated temperature</b> (band ≈ 1.0, iqr ≈ 0.1 — the docstring pairing) to its dispersion
+      <code>scale</code>, so <code>τ_eff = temperature · scale</code> differs, changing the sigmoid
+      sharpness, the loss, and the gradients. The selected row drives the live demo.</p>
+      <table class="cmp">
+        <thead><tr><th>mode</th><th>scale</th><th>τ_eff</th><th>loss = 1 − pAUC</th></tr></thead>
+        <tbody>
+          <tr id="rowBand"><td>band <span class="mut">t_α − t_β</span></td><td id="cBandScale">—</td><td id="cBandTau">—</td><td id="cBandLoss">—</td></tr>
+          <tr id="rowIqr"><td>iqr <span class="mut">q75 − q25</span></td><td id="cIqrScale">—</td><td id="cIqrTau">—</td><td id="cIqrLoss">—</td></tr>
+        </tbody>
+      </table>
+      <p class="note" id="cmpNote"></p>
+    </div>
+
+    <div class="card">
+      <h2>Score axis &amp; gradients</h2>
+      <p class="sub">Negatives below the axis, positives above. The shaded band is
+      <code>[t_β, t_α]</code> mapped from the negative score quantiles. Ringed points are the
+      band negatives that enter the pairwise loss. Drag any point.</p>
+      <canvas id="scoreCanvas" height="300"></canvas>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--pos)"></span>positive</span>
+        <span><span class="dot" style="background:var(--neg)"></span>negative</span>
+        <span><span class="dot" style="background:var(--bandneg)"></span>band negative (in loss)</span>
+        <span><span class="dot" style="background:var(--band)"></span>FPR band [t_β,&nbsp;t_α]</span>
+        <span>→ descent gradient</span>
+      </div>
+      <div class="formula" id="formula"></div>
+    </div>
+
+    <div class="card">
+      <h2>ROC &amp; partial-AUC region</h2>
+      <p class="sub">Empirical ROC. The shaded vertical strip is the FPR band <code>[α, β]</code>; the
+      partial AUC the loss targets is the normalized area under the curve inside it.</p>
+      <div class="roc-row">
+        <canvas id="rocCanvas" width="340" height="340" style="width:340px;height:340px;border:1px solid var(--line)"></canvas>
+        <div>
+          <p class="note" style="margin-top:0">
+          The surrogate replaces the step indicator <code>1[pos &gt; neg]</code> with
+          <code>σ((pos − neg)/τ_eff)</code>, averaged over positives × band-negatives. As
+          <b>temperature → 0</b> the sigmoid sharpens toward the true step (and the surrogate pAUC
+          approaches the empirical partial AUC over the band), at the cost of vanishing gradients for
+          well-separated pairs. As <b>β</b> grows the band widens to include more negatives; as
+          <b>α</b> grows the band's upper edge drops below the top scores.</p>
+          <p class="note">Only negatives whose scores fall in <code>[t_β, t_α]</code> contribute. Move a
+          negative into or out of the band and watch <code>loss</code> and the gradient arrows snap.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const SMIN = -4, SMAX = 9;            // score-axis domain
+const clampScore = s => Math.max(SMIN, Math.min(SMAX, s));
+
+const DEFAULTS = {
+  beta:0.15, alpha:0, tauScale:'band',
+  tempBand:1.0, tempIqr:0.1,        // docstring calibration: band pairs with ~1.0, iqr with ~0.1
+  lr:3, normArrows:false,
+  posMean:2.6, posStd:1, negMean:0, negStd:1, nPos:18, nNeg:80
+};
+const state = Object.assign({}, DEFAULTS, {seed:12345, pos:[], neg:[]});
+const activeTemp = ()=> state.tauScale==='iqr' ? state.tempIqr : state.tempBand;
+
+/* ---------- RNG ---------- */
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);
+  t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gaussian(rng){let u=0,v=0;while(u===0)u=rng();while(v===0)v=rng();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+
+function regenerate(){
+  const rng = mulberry32(state.seed);
+  state.pos = Array.from({length:state.nPos},()=>({s:clampScore(state.posMean+state.posStd*gaussian(rng)),j:rng()}));
+  state.neg = Array.from({length:state.nNeg},()=>({s:clampScore(state.negMean+state.negStd*gaussian(rng)),j:rng()}));
+}
+
+/* ---------- math ---------- */
+// Defaults to interpolation='higher' to match the library (quantile_interpolation='higher').
+function quantile(sortedAsc,q,interp){
+  const n=sortedAsc.length; if(n===0)return 0;
+  if(q<=0)return sortedAsc[0]; if(q>=1)return sortedAsc[n-1];
+  const idx=q*(n-1), lo=Math.floor(idx), hi=Math.ceil(idx);
+  if(lo===hi)return sortedAsc[lo];
+  return interp==='linear' ? sortedAsc[lo]+(idx-lo)*(sortedAsc[hi]-sortedAsc[lo]) : sortedAsc[hi];
+}
+const sigmoid = z => 1/(1+Math.exp(-z));
+
+function compute(){
+  const negS = state.neg.map(n=>n.s);
+  const sorted = [...negS].sort((a,b)=>a-b);
+  const effAlpha = Math.min(state.alpha, Math.max(0, state.beta-0.005));
+  const tAlpha = quantile(sorted, 1-effAlpha);
+  const tBeta  = quantile(sorted, 1-state.beta);
+
+  // Band membership is the SAME for both tau_scale modes; only the dispersion
+  // `scale` (hence tau_eff = temp * scale) differs. band -> t_α − t_β; iqr -> q75 − q25.
+  // Raw (unclamped) dispersions for the degenerate check (mirrors _SCALE_EPS in the loss).
+  const rawScaleBand = tAlpha - tBeta;
+  const q25 = quantile(sorted, 0.25), q75 = quantile(sorted, 0.75);
+  const rawScaleIqr  = q75 - q25;
+  const useIqr  = state.tauScale==='iqr';
+  const degenerate = (useIqr ? rawScaleIqr : rawScaleBand) <= 1e-9; // loss marks the class INVALID here
+  const scaleBand = Math.max(rawScaleBand, 1e-3);
+  const scaleIqr  = Math.max(rawScaleIqr, 1e-3);
+  // per-mode temperature (band ~1.0, iqr ~0.1 per the docstring)
+  const tauBand = Math.max(state.tempBand*scaleBand, 1e-4);
+  const tauIqr  = Math.max(state.tempIqr *scaleIqr,  1e-4);
+  const tauEff  = useIqr ? tauIqr : tauBand;
+
+  const bandIdx=[];
+  state.neg.forEach((n,j)=>{ if(n.s>=tBeta-1e-9 && n.s<=tAlpha+1e-9) bandIdx.push(j); });
+  const B=bandIdx.length, P=state.pos.length;
+
+  const posForce=new Array(P).fill(0);
+  const negForce=new Array(state.neg.length).fill(0);
+  let pauc=1, paucBand=1, paucIqr=1;
+  if(B>0 && P>0 && !degenerate){
+    let sumB=0, sumI=0; const count=P*B;
+    for(let i=0;i<P;i++){
+      const p=state.pos[i].s;
+      for(let k=0;k<B;k++){
+        const j=bandIdx[k], b=state.neg[j].s;
+        const sigB=sigmoid((p-b)/tauBand); sumB+=sigB;   // loss under band-scale
+        const sigI=sigmoid((p-b)/tauIqr);  sumI+=sigI;   // loss under iqr-scale
+        const sig=useIqr?sigI:sigB;                      // active mode drives gradients
+        const sp=sig*(1-sig);     // σ'
+        posForce[i]+=sp; negForce[j]+=sp;
+      }
+    }
+    const norm=1/(count*tauEff);
+    for(let i=0;i<P;i++) posForce[i]*= norm;      // descent: positives move +
+    for(const j of bandIdx)  negForce[j]*= -norm; // descent: band negs move −
+    paucBand=sumB/count; paucIqr=sumI/count;
+    pauc=useIqr?paucIqr:paucBand;
+  }
+  const loss=1-pauc;
+
+  // empirical ROC + partial AUC over [effAlpha, beta]
+  const all=[...state.pos.map(p=>({s:p.s,pos:1})),...state.neg.map(n=>({s:n.s,pos:0}))]
+            .sort((a,b)=>b.s-a.s);
+  const nP=state.pos.length||1, nN=state.neg.length||1;
+  let tp=0,fp=0; const roc=[{f:0,t:0}];
+  for(const pt of all){ if(pt.pos)tp++; else fp++; roc.push({f:fp/nN,t:tp/nP}); }
+  let empArea=0; const a=effAlpha,b=state.beta;
+  for(let i=1;i<roc.length;i++){
+    let f0=roc[i-1].f, f1=roc[i].f; const tprStep=roc[i-1].t; // step curve: tpr held over [f0,f1)
+    const lo=Math.max(f0,a), hi=Math.min(f1,b);
+    if(hi>lo) empArea+=tprStep*(hi-lo);
+  }
+  const empPauc=(b>a)?empArea/(b-a):0;
+
+  return {tAlpha,tBeta,tauEff,scale:useIqr?scaleIqr:scaleBand,bandIdx,B,P,pauc,loss,
+          posForce,negForce,effAlpha,roc,empPauc,degenerate,
+          scaleBand,scaleIqr,tauBand,tauIqr,
+          paucBand,paucIqr,lossBand:1-paucBand,lossIqr:1-paucIqr,useIqr};
+}
+
+/* ---------- canvas setup ---------- */
+// cssH is the fixed logical height; never read it back from the (mutated) attribute,
+// or the device-pixel backing store compounds by dpr on every render and the canvas
+// eventually exceeds the browser's max size and silently breaks.
+function fit(canvas,cssH){
+  const dpr=window.devicePixelRatio||1;
+  const w=canvas.clientWidth;
+  canvas.width=Math.round(w*dpr); canvas.height=Math.round(cssH*dpr);
+  canvas.style.height=cssH+'px';
+  const ctx=canvas.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w,h:cssH};
+}
+
+const scoreCanvas=document.getElementById('scoreCanvas');
+const rocCanvas=document.getElementById('rocCanvas');
+
+const SPAD={l:46,r:24,t:18,b:30};
+const sx = (s,w)=> SPAD.l + (s-SMIN)/(SMAX-SMIN)*(w-SPAD.l-SPAD.r);
+const sInv=(px,w)=> SMIN + (px-SPAD.l)/(w-SPAD.l-SPAD.r)*(SMAX-SMIN);
+const AX=150; // axis y in css px
+const yPos=j=> AX-18 - j*92;
+const yNeg=j=> AX+18 + j*92;
+
+function drawScore(R){
+  const {ctx,w,h}=fit(scoreCanvas,300);
+  ctx.clearRect(0,0,w,h);
+
+  // band shading
+  const xB=sx(R.tBeta,w), xA=sx(R.tAlpha,w);
+  ctx.fillStyle='rgba(244,211,94,.35)';
+  ctx.fillRect(xB,SPAD.t,Math.max(1,xA-xB),h-SPAD.t-SPAD.b+2);
+  ctx.strokeStyle='rgba(214,38,61,.55)'; ctx.setLineDash([4,3]);
+  [[xB,'t_β'],[xA,'t_α']].forEach(([x,lab])=>{
+    ctx.beginPath();ctx.moveTo(x,SPAD.t);ctx.lineTo(x,h-SPAD.b);ctx.stroke();
+    ctx.setLineDash([]);ctx.fillStyle='#9a1b2c';ctx.font='11px monospace';
+    ctx.fillText(lab,x+3,SPAD.t+11);ctx.setLineDash([4,3]);
+  });
+  ctx.setLineDash([]);
+
+  // axis + ticks
+  ctx.strokeStyle='var(--line)';ctx.strokeStyle='#cdd4df';
+  ctx.beginPath();ctx.moveTo(SPAD.l,AX);ctx.lineTo(w-SPAD.r,AX);ctx.stroke();
+  ctx.fillStyle='#6b7689';ctx.font='11px sans-serif';ctx.textAlign='center';
+  for(let s=Math.ceil(SMIN);s<=SMAX;s++){const x=sx(s,w);
+    ctx.beginPath();ctx.moveTo(x,AX-3);ctx.lineTo(x,AX+3);ctx.stroke();
+    ctx.fillText(s,x,h-SPAD.b+14);}
+  ctx.textAlign='left';ctx.fillText('score →',w-SPAD.r-44,AX-6);
+
+  // gradient arrows: true magnitude (faithful) by default; per-frame normalized if toggled
+  let maxF=1e-9;
+  R.posForce.forEach(f=>maxF=Math.max(maxF,Math.abs(f)));
+  R.negForce.forEach(f=>maxF=Math.max(maxF,Math.abs(f)));
+  const ARROW=46;          // px for the largest arrow in normalized mode
+  const GAIN=900;          // px per unit of true gradient
+  const MAXLEN=72;         // clamp true-magnitude arrows so they stay on-canvas
+  const arrow=(x,y,f)=>{
+    if(Math.abs(f)<1e-12)return;
+    let dx = state.normArrows ? (f/maxF)*ARROW : f*GAIN;
+    if(Math.abs(dx)>MAXLEN) dx=Math.sign(dx)*MAXLEN;
+    const x2=x+dx;
+    ctx.strokeStyle='rgba(40,50,70,.55)';ctx.lineWidth=1.5;
+    ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x2,y);ctx.stroke();
+    const dir=Math.sign(dx);
+    ctx.beginPath();ctx.moveTo(x2,y);ctx.lineTo(x2-dir*5,y-3);ctx.lineTo(x2-dir*5,y+3);
+    ctx.closePath();ctx.fillStyle='rgba(40,50,70,.55)';ctx.fill();
+    ctx.lineWidth=1;
+  };
+
+  // negatives
+  const bandSet=new Set(R.bandIdx);
+  state.neg.forEach((n,j)=>{const x=sx(n.s,w),y=yNeg(n.j);
+    arrow(x,y,R.negForce[j]);
+    ctx.beginPath();ctx.arc(x,y,4.5,0,7);
+    ctx.fillStyle= bandSet.has(j)?'#d7263d':'#3b82c4';ctx.fill();
+    if(bandSet.has(j)){ctx.lineWidth=2;ctx.strokeStyle='#7a0f1c';ctx.stroke();ctx.lineWidth=1;}
+  });
+  // positives
+  state.pos.forEach((p,i)=>{const x=sx(p.s,w),y=yPos(p.j);
+    arrow(x,y,R.posForce[i]);
+    ctx.beginPath();ctx.arc(x,y,4.5,0,7);ctx.fillStyle='#e8833a';ctx.fill();
+  });
+
+  // side labels
+  ctx.fillStyle='#9aa3b2';ctx.font='11px sans-serif';
+  ctx.fillText('positives',SPAD.l,AX-96);
+  ctx.fillText('negatives',SPAD.l,AX+108);
+}
+
+function drawROC(R){
+  const {ctx,w,h}=fit(rocCanvas,340);
+  ctx.clearRect(0,0,w,h);
+  const pad={l:38,r:12,t:12,b:30};
+  const X=f=>pad.l+f*(w-pad.l-pad.r), Y=t=>h-pad.b-t*(h-pad.t-pad.b);
+
+  // FPR band strip
+  ctx.fillStyle='rgba(244,211,94,.4)';
+  ctx.fillRect(X(R.effAlpha),pad.t,Math.max(1,X(state.beta)-X(R.effAlpha)),h-pad.t-pad.b);
+
+  // frame + diagonal
+  ctx.strokeStyle='#cdd4df';ctx.strokeRect(pad.l,pad.t,w-pad.l-pad.r,h-pad.t-pad.b);
+  ctx.strokeStyle='#e2e7ee';ctx.beginPath();ctx.moveTo(X(0),Y(0));ctx.lineTo(X(1),Y(1));ctx.stroke();
+
+  // ROC step curve
+  ctx.strokeStyle='#2b6cb0';ctx.lineWidth=2;ctx.beginPath();
+  R.roc.forEach((p,i)=>{const x=X(p.f),y=Y(p.t);i?ctx.lineTo(x,y):ctx.moveTo(x,y);});
+  ctx.stroke();ctx.lineWidth=1;
+
+  // labels
+  ctx.fillStyle='#6b7689';ctx.font='11px sans-serif';ctx.textAlign='center';
+  ctx.fillText('FPR',w/2,h-8);
+  ctx.save();ctx.translate(12,h/2);ctx.rotate(-Math.PI/2);ctx.fillText('TPR',0,0);ctx.restore();
+  ctx.textAlign='left';ctx.fillText('α',X(R.effAlpha)-2,pad.t+10);ctx.fillText('β',X(state.beta)+2,pad.t+10);
+  ctx.textAlign='left';
+}
+
+/* ---------- render ---------- */
+function fmt(x,d=3){return (x>=0?' ':'')+x.toFixed(d);}
+function render(){
+  const R=compute();
+  const dash='—', d=R.degenerate;
+  document.getElementById('roLoss').textContent= d?dash:R.loss.toFixed(3);
+  document.getElementById('roPauc').textContent= d?dash:R.pauc.toFixed(3);
+  document.getElementById('roBand').textContent= R.B+' / '+state.neg.length;
+  document.getElementById('roTau').textContent = d?dash:R.tauEff.toFixed(3);
+  document.getElementById('roT').textContent   = R.tBeta.toFixed(2)+' … '+R.tAlpha.toFixed(2);
+  document.getElementById('roEmp').textContent = R.empPauc.toFixed(3);
+
+  // surface effAlpha when α is clamped below the slider value
+  document.getElementById('alphaV').textContent =
+    (Math.abs(R.effAlpha-state.alpha)>1e-6) ? `${state.alpha.toFixed(3)} → eff ${R.effAlpha.toFixed(3)}` : state.alpha.toFixed(3);
+
+  document.getElementById('formula').classList.toggle('degenerate', d);
+  document.getElementById('formula').textContent = d
+    ? `degenerate: negative dispersion ≈ 0 → the loss marks this class INVALID and skips it (τ can't be calibrated).`
+    : `pAUC = mean over ${R.P} pos × ${R.B} band-neg of  σ((pos − neg) / ${R.tauEff.toFixed(3)})   [τ-scale ${R.useIqr?'iqr':'band'}, temp ${activeTemp().toFixed(2)}]`
+      + (R.B===0 ? '   ⟵ band empty: no pairs, loss = 0' : '');
+
+  // τ-scale comparison (each mode uses its own calibrated temperature)
+  document.getElementById('cBandScale').textContent=R.scaleBand.toFixed(3);
+  document.getElementById('cBandTau').textContent= d?dash:R.tauBand.toFixed(3);
+  document.getElementById('cBandLoss').textContent= d?dash:R.lossBand.toFixed(3);
+  document.getElementById('cIqrScale').textContent=R.scaleIqr.toFixed(3);
+  document.getElementById('cIqrTau').textContent= d?dash:R.tauIqr.toFixed(3);
+  document.getElementById('cIqrLoss').textContent= d?dash:R.lossIqr.toFixed(3);
+  document.getElementById('rowBand').classList.toggle('active',!R.useIqr);
+  document.getElementById('rowIqr').classList.toggle('active',R.useIqr);
+  document.getElementById('cmpNote').textContent =
+    `Each mode uses its own calibrated temperature (band ${state.tempBand.toFixed(2)}, iqr ${state.tempIqr.toFixed(2)} — the docstring pairing), so this is apples-to-apples. `
+    + `Run gradient steps: band-scale τ shrinks as hard negatives are mined toward the bulk; iqr stays anchored to the IQR.`;
+
+  drawScore(R); drawROC(R);
+  return R;
+}
+
+/* ---------- one gradient-descent step (visualization) ---------- */
+function gradStep(){
+  const R=compute();
+  if(R.degenerate) return false;
+  let maxF=1e-9;
+  R.posForce.forEach(f=>maxF=Math.max(maxF,Math.abs(f)));
+  R.negForce.forEach(f=>maxF=Math.max(maxF,Math.abs(f)));
+  if(maxF<1e-8) return false;          // gradients vanished — surrogate has stalled
+  const MAXSTEP=0.4;                    // clamp a single point's move for stability
+  const move=f=>{let d=state.lr*f; return Math.abs(d)>MAXSTEP?Math.sign(d)*MAXSTEP:d;}; // real SGD: lr·grad
+  state.pos.forEach((p,i)=>{p.s=clampScore(p.s+move(R.posForce[i]));});
+  R.bandIdx.forEach(j=>{state.neg[j].s=clampScore(state.neg[j].s+move(R.negForce[j]));});
+  render();
+  return true;
+}
+
+/* ---------- controls wiring ---------- */
+const sliders=['beta','alpha','lr','posMean','posStd','negMean','negStd','nPos','nNeg'];
+const valFmt={beta:v=>v.toFixed(3),alpha:v=>v.toFixed(3),lr:v=>v.toFixed(1),
+  posMean:v=>v.toFixed(1),posStd:v=>v.toFixed(2),negMean:v=>v.toFixed(1),negStd:v=>v.toFixed(2),
+  nPos:v=>v|0,nNeg:v=>v|0};
+const valEl={beta:'betaV',alpha:'alphaV',lr:'lrV',posMean:'posMeanV',posStd:'posStdV',
+  negMean:'negMeanV',negStd:'negStdV',nPos:'nPosV',nNeg:'nNegV'};
+const distKeys=new Set(['posMean','posStd','negMean','negStd','nPos','nNeg']);
+
+function syncLabels(){
+  sliders.forEach(k=>{const el=document.getElementById(valEl[k]); if(el) el.textContent=valFmt[k](state[k]);});
+  document.getElementById('tempV').textContent=activeTemp().toFixed(2);
+}
+function loadTempSlider(){document.getElementById('temp').value=activeTemp();document.getElementById('tempV').textContent=activeTemp().toFixed(2);}
+
+sliders.forEach(k=>{
+  const el=document.getElementById(k);
+  el.value=state[k];
+  el.addEventListener('input',()=>{
+    state[k]=parseFloat(el.value);
+    if(k==='beta'){ // keep α ≤ β
+      const aEl=document.getElementById('alpha'); aEl.max=state.beta;
+      if(state.alpha>state.beta){state.alpha=state.beta;aEl.value=state.beta;}
+    }
+    syncLabels();
+    if(distKeys.has(k)) regenerate();
+    render();
+  });
+});
+
+// temperature edits the ACTIVE τ-scale's calibrated temperature
+document.getElementById('temp').addEventListener('input',e=>{
+  const v=parseFloat(e.target.value);
+  if(state.tauScale==='iqr') state.tempIqr=v; else state.tempBand=v;
+  document.getElementById('tempV').textContent=v.toFixed(2);
+  render();
+});
+document.getElementById('normArrows').addEventListener('change',e=>{state.normArrows=e.target.checked;render();});
+
+document.getElementById('regen').addEventListener('click',()=>{state.seed=(state.seed*1664525+1013904223)>>>0;regenerate();render();});
+document.getElementById('reset').addEventListener('click',()=>{
+  Object.assign(state,DEFAULTS);state.seed=12345;
+  sliders.forEach(k=>{const el=document.getElementById(k);if(el)el.value=state[k];});
+  document.getElementById('alpha').max=state.beta;
+  document.getElementById('normArrows').checked=state.normArrows;
+  document.querySelectorAll('#tauScaleSeg .seg-btn').forEach(x=>x.classList.toggle('active',x.dataset.v===state.tauScale));
+  loadTempSlider();
+  syncLabels();regenerate();render();
+});
+document.getElementById('step').addEventListener('click',gradStep);
+
+document.querySelectorAll('#tauScaleSeg .seg-btn').forEach(b=>{
+  b.addEventListener('click',()=>{
+    state.tauScale=b.dataset.v;
+    document.querySelectorAll('#tauScaleSeg .seg-btn').forEach(x=>x.classList.toggle('active',x===b));
+    loadTempSlider();   // show this mode's calibrated temperature
+    render();
+  });
+});
+
+let raf=null;
+const runBtn=document.getElementById('run');
+runBtn.addEventListener('click',()=>{
+  if(raf){cancelAnimationFrame(raf);raf=null;runBtn.textContent='▶ Run';return;}
+  runBtn.textContent='⏸ Stop';
+  const tick=()=>{const cont=gradStep();if(!cont){raf=null;runBtn.textContent='▶ Run';return;}raf=requestAnimationFrame(tick);};
+  raf=requestAnimationFrame(tick);
+});
+
+/* ---------- drag interaction ---------- */
+let drag=null;
+function pickPoint(mx,my,w){
+  let best=null,bd=14*14;
+  const test=(arr,xy,kind)=>arr.forEach((p,i)=>{const x=sx(p.s,w),y=xy(p.j);
+    const d=(x-mx)*(x-mx)+(y-my)*(y-my);if(d<bd){bd=d;best={kind,i};}});
+  test(state.pos,yPos,'pos');test(state.neg,yNeg,'neg');
+  return best;
+}
+function canvasXY(e){const r=scoreCanvas.getBoundingClientRect();
+  const t=e.touches?e.touches[0]:e;return {x:t.clientX-r.left,y:t.clientY-r.top,w:r.width};}
+function onDown(e){const {x,y,w}=canvasXY(e);drag=pickPoint(x,y,w);if(drag)e.preventDefault();}
+function onMove(e){if(!drag)return;const {x,w}=canvasXY(e);
+  const arr=drag.kind==='pos'?state.pos:state.neg;arr[drag.i].s=clampScore(sInv(x,w));render();e.preventDefault();}
+function onUp(){drag=null;}
+scoreCanvas.addEventListener('mousedown',onDown);
+window.addEventListener('mousemove',onMove);window.addEventListener('mouseup',onUp);
+scoreCanvas.addEventListener('touchstart',onDown,{passive:false});
+scoreCanvas.addEventListener('touchmove',onMove,{passive:false});
+window.addEventListener('touchend',onUp);
+
+window.addEventListener('resize',render);
+
+/* ---------- init ---------- */
+document.getElementById('alpha').max=state.beta;
+loadTempSlider();
+syncLabels();regenerate();render();
+</script>
+</body>
+</html>
