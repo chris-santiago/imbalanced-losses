@@ -7,6 +7,29 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 *No unreleased changes.*
 
+## 0.5.0 — 2026-07-16
+
+### Added
+
+- **`PAUCAtBudgetLoss` gains a `budget_basis` parameter** (`{"fpr", "population"}`,
+  default `"fpr"`). It selects what the band edges `t_alpha`/`t_beta` (and the
+  scale-aware temperature) are quantiles *of*. `"fpr"` (the default) uses the iid
+  negatives only, so `beta` is a false-positive rate — this path is byte-identical
+  to prior behavior. `"population"` uses the whole pooled population (positives +
+  negatives), so `beta` is a top-k fraction over *all* scores — the deployment
+  "alert budget" interpretation that matches a coverage@budget metric ranked over
+  the whole population. Only the quantile reference set moves; the pairwise band
+  still selects only negatives for the contrast. With `surrogate="trapezoid"`,
+  `budget_basis="population"` is approximately `RecallAtQuantileLoss`.
+
+  An 8-seed A/B on synthetic contested-top data found the two bases within seed
+  noise at the recommended `alpha=0` band — with `alpha=0` the upper edge already
+  spans every top negative, so which population defines the quantile is immaterial —
+  and `alpha=0` beats `"population"` at any other band. `"fpr"` therefore remains
+  the recommended default; `"population"` is a documented alternative for the
+  alert-budget reading, not a coverage win. See the `PAUCAtBudgetLoss` deep dive
+  (§5.4) for the ablation.
+
 ## 0.4.2 — 2026-06-25
 
 ### Fixed
