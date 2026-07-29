@@ -224,6 +224,18 @@ If `temp_end / temp_start` is too small or `temp_decay_steps` is too short, the 
 
 `LossWarmupWrapper` resets the queue when it latches the phase switch in `on_train_batch_start` — regardless of how the queue was filled, so even warmup-era logits enqueued by calling `main_loss.forward()` directly are wiped at the switch. The real failure mode is never wiring `on_train_batch_start` into the training loop: the switch is never latched, so the queue reset never fires and the temperature schedule never runs. The wrapper emits a one-time `UserWarning` on the first main-phase forward if the hook was never called (when the wrapped loss exposes a `temperature` attribute, which all the queued losses in this library do). Call `on_train_batch_start(global_step)` every training step, in epoch mode as well as step mode.
 
+**Hand-rolled temperature schedules do not survive a resume**
+
+`LossWarmupWrapper` is the only class in this library that persists training-progress state across a checkpoint. It saves its epoch, global step, phase-switch step and current temperature in `state_dict()` under the `_extra_state` key, so a resumed run continues the decay from the correct elapsed step and keeps the restored memory queue.
+
+Everything else is either a registered buffer (the memory queue, which round-trips correctly) or ephemeral by design (DDP gather resolution, one-time warning flags, per-call diagnostics).
+
+!!! warning "`temperature` set directly is not checkpointed"
+
+    The `temperature` attribute on `SmoothAPLoss`, `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` is a plain Python float, not a registered buffer, so it never appears in `state_dict()`. If you anneal it yourself rather than through `LossWarmupWrapper`, the value silently reverts to the constructor argument on every resume — a long run restarted from a checkpoint trains at the *starting* temperature with no warning.
+
+    Use `LossWarmupWrapper` for temperature scheduling, or re-apply your own schedule from the restored `global_step` immediately after loading. Tracked in [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
+
 ---
 
 ## Diagnostic summary
@@ -245,3 +257,4 @@ The table below maps common failure symptoms to root causes and remedies.
 | DDP: loss diverges across workers | Missing all-gather | Set `gather_distributed=True` or use auto-detect |
 | Training spike after phase switch | Queue poisoning from warmup logits | Ensure `on_train_batch_start` is wired so the wrapper latches the switch and resets the queue |
 | Loss near zero but metrics poor | Score scale mismatch with temperature | Normalize logits or scale τ to match score range |
+| Temperature back at its starting value after a resume | Schedule driven by hand; `temperature` is not in `state_dict()` ([#16](https://github.com/chris-santiago/imbalanced-losses/issues/16)) | Use `LossWarmupWrapper`, or re-apply the schedule from the restored `global_step` after loading |

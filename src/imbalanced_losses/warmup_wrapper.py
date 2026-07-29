@@ -411,6 +411,73 @@ class LossWarmupWrapper(nn.Module):
         if self._has_temperature:
             self.main_loss.temperature = temp  # type: ignore[union-attr]
 
+    # ── checkpoint compatibility ────────────────────────────────────────────
+
+    def get_extra_state(self) -> dict:
+        """
+        Serialise the phase/decay schedule state into the module's state dict.
+
+        The wrapper's scheduling state (epoch, step, phase-switch step) is
+        plain Python, so ``nn.Module.state_dict()`` would otherwise drop it.
+        PyTorch stores the returned mapping under the ``_extra_state`` key.
+
+        Returns
+        -------
+        dict
+            Schedule state.  ``temperature`` is included so that a resumed
+            run reports the correct value before the first
+            :meth:`on_train_batch_start` recomputes it; it is ``None`` when
+            ``main_loss`` has no ``temperature`` attribute.
+
+        Notes
+        -----
+        Without this, a resumed run finds ``_switch_step is None``, treats
+        the first post-resume batch as the phase switch, resets the
+        temperature to ``temp_start`` and wipes the (correctly restored)
+        memory queue.  See :meth:`on_train_batch_start`.
+        """
+        return {
+            "epoch": self._epoch,
+            "global_step": self._global_step,
+            "switch_step": self._switch_step,
+            "batch_hook_seen": self._batch_hook_seen,
+            "temperature": self.current_temperature,
+        }
+
+    def set_extra_state(self, state: dict) -> None:
+        """
+        Restore the phase/decay schedule state from a checkpoint.
+
+        Parameters
+        ----------
+        state : dict
+            Mapping produced by :meth:`get_extra_state`.  Missing keys fall
+            back to the current in-memory value so that partial or
+            future-versioned payloads degrade rather than raise during a
+            training restart.
+        """
+        self._epoch = state.get("epoch", self._epoch)
+        self._global_step = state.get("global_step", self._global_step)
+        self._switch_step = state.get("switch_step", self._switch_step)
+        self._batch_hook_seen = state.get("batch_hook_seen", self._batch_hook_seen)
+        temp = state.get("temperature")
+        if temp is not None:
+            self._apply_temperature(temp)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # Checkpoints written before the schedule state was persisted carry no
+        # _extra_state key.  Inject the freshly constructed state so strict-mode
+        # loading does not fail; such runs restart the temperature schedule,
+        # which matches the behaviour they were saved with.
+        extra_key = prefix + "_extra_state"
+        if extra_key not in state_dict:
+            state_dict[extra_key] = self.get_extra_state()
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
     # ── forward ─────────────────────────────────────────────────────────────
 
     def forward(self, logits, targets, **kwargs):

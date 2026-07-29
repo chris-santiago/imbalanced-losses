@@ -5,7 +5,21 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
-*No unreleased changes.*
+### Fixed
+
+- **`LossWarmupWrapper` now persists its phase and temperature-decay state in
+  `state_dict()`.** The wrapper's schedule state (`_epoch`, `_global_step`,
+  `_switch_step`, `_batch_hook_seen`) was plain Python, so `nn.Module.state_dict()`
+  silently dropped it. On resume the wrapper found no recorded phase-switch step,
+  treated the first post-resume batch as the switch, reset `main_loss.temperature`
+  back to `temp_start`, and called `reset_queue()` — wiping the memory queue the
+  checkpoint had just restored correctly. A mid-blend resume also restarted the
+  blend ramp, since `main_weight` reads the lost epoch/step counters. Any run
+  resumed from a checkpoint was therefore training with a restarted temperature
+  schedule and an empty queue, silently. State is now saved via
+  `get_extra_state`/`set_extra_state` under the standard `_extra_state` key.
+  Checkpoints written by earlier versions still load under `strict=True` (they
+  restart the schedule, exactly as they did before), so no action is required.
 
 ## 0.5.0 — 2026-07-16
 

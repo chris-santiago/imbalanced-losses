@@ -84,6 +84,8 @@ Use `"iqr"` for most cases. Switch to `"band"` when the band is very wide and yo
 
 The `LossWarmupWrapper` defaults (`temp_start=0.05`, `temp_end=0.005`) decay from the stable mid-training range into the late-training refinement range over the main phase. Raise `temp_start` toward 0.1–0.5 if the main phase begins with weakly separated scores.
 
+If you schedule temperature yourself rather than through the wrapper, note that `temperature` is a plain attribute and is **not** saved in `state_dict()` — it reverts to its constructor value on every resume. See [Assumptions and failure modes](assumptions-and-failure-modes.md#losswarmupwrapper) and [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
+
 ## Connection to the discontinuous rank
 
 You can verify the approximation quality by comparing `SmoothAPLoss` with a perfect model (all positives score above all negatives). At τ → 0 with perfect scores, the soft AP should approach 1.0 and the loss should approach 0.0. The tests in `test_smooth_ap_loss.py` confirm this numerically.

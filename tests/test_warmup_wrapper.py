@@ -18,6 +18,10 @@ Coverage
            kwargs forwarded to main_loss only, gradient flows through active loss
 - reset_queue_each_epoch: called each main-phase epoch, not during warmup
 - Integration with SmoothAPLoss: full epoch loop, backward pass
+- Checkpoint/resume: schedule state survives state_dict round-trip, temperature
+                     does not reset to temp_start, memory queue is not wiped on
+                     the first post-resume batch, blend ramp does not restart,
+                     legacy checkpoints without _extra_state load under strict=True
 """
 
 from __future__ import annotations
@@ -1313,3 +1317,189 @@ class TestBatchHookRequired:
             warnings.simplefilter("always")
             w(logits, targets)
         assert not [r for r in rec if "on_train_batch_start" in str(r.message)]
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointRoundTrip:
+    """
+    Regression: the wrapper's schedule state (``_epoch``, ``_global_step``,
+    ``_switch_step``, ``_batch_hook_seen``) is plain Python, so it was absent
+    from ``state_dict()``.  On resume ``_switch_step`` was ``None``, the first
+    post-resume batch was treated as the phase switch, and the wrapper reset
+    the temperature to ``temp_start`` *and* wiped the memory queue that the
+    checkpoint had correctly restored.  Fixed with
+    ``get_extra_state``/``set_extra_state``.
+    """
+
+    C = 4
+    B = 8
+
+    def _batch(self):
+        return torch.randn(self.B, self.C), torch.randint(0, self.C, (self.B,))
+
+    def _run(self, w, epochs, steps_per_epoch, start_epoch=0):
+        for e in range(start_epoch, start_epoch + epochs):
+            w.on_train_epoch_start(e)
+            for s in range(steps_per_epoch):
+                w.on_train_batch_start(e * steps_per_epoch + s)
+                w(*self._batch())
+
+    def test_switch_step_survives_round_trip(self):
+        # Regression: _switch_step was dropped, resetting the decay clock.
+        w = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000)
+        self._run(w, epochs=5, steps_per_epoch=20)
+        assert w._switch_step == 40
+
+        fresh = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000)
+        fresh.load_state_dict(w.state_dict())
+        assert fresh._switch_step == 40
+        assert fresh._epoch == 4
+        assert fresh._batch_hook_seen is True
+
+    def test_temperature_does_not_reset_to_temp_start_on_resume(self):
+        # Regression: first post-resume batch re-latched the phase switch and
+        # snapped temperature back to temp_start.
+        w = _make_wrapper(warmup_epochs=2, temp_start=0.1, temp_end=0.01,
+                          temp_decay_steps=1000)
+        self._run(w, epochs=5, steps_per_epoch=20)
+        decayed = w.current_temperature
+        assert decayed < 0.1  # sanity: decay actually progressed
+
+        fresh = _make_wrapper(warmup_epochs=2, temp_start=0.1, temp_end=0.01,
+                              temp_decay_steps=1000)
+        fresh.load_state_dict(w.state_dict())
+        assert fresh.current_temperature == pytest.approx(decayed)
+
+        # The next batch must continue the schedule, not restart it.
+        fresh.on_train_epoch_start(5)
+        fresh.on_train_batch_start(100)
+        assert fresh.current_temperature < 0.1
+        assert fresh.current_temperature == pytest.approx(
+            w.temp_start * math.exp(
+                min(1.0, (100 - 40) / 1000) * math.log(w.temp_end / w.temp_start)
+            )
+        )
+
+    def test_queue_not_wiped_on_first_batch_after_resume(self):
+        # Regression: the restored queue was zeroed by the spurious re-latch.
+        w = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000,
+                          main_loss=SmoothAPLoss(num_classes=self.C, queue_size=64))
+        self._run(w, epochs=5, steps_per_epoch=20)
+        saved = {
+            k: (v.clone() if torch.is_tensor(v) else v)
+            for k, v in w.state_dict().items()
+        }
+        assert saved["main_loss._queue._q_logits"].abs().sum() > 0
+
+        fresh = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000,
+                              main_loss=SmoothAPLoss(num_classes=self.C, queue_size=64))
+        fresh.load_state_dict(saved)
+        fresh.on_train_epoch_start(5)
+        fresh.on_train_batch_start(100)
+        assert fresh.main_loss._queue._q_logits.abs().sum() > 0
+
+    def test_blend_weight_does_not_restart_on_resume(self):
+        # Regression: main_weight reads _epoch, which was lost, so a resume
+        # mid-blend snapped the ramp back to its first step.
+        w = _make_wrapper(warmup_epochs=2, blend_epochs=4)
+        self._run(w, epochs=5, steps_per_epoch=5)
+        mid_blend = w.main_weight
+        assert 0.0 < mid_blend < 1.0  # sanity: actually mid-ramp
+
+        fresh = _make_wrapper(warmup_epochs=2, blend_epochs=4)
+        fresh.load_state_dict(w.state_dict())
+        assert fresh.main_weight == pytest.approx(mid_blend)
+
+    def test_step_mode_global_step_survives_round_trip(self):
+        # Sibling path: step mode latches _switch_step in on_train_batch_start
+        # and drives main_weight off _global_step.
+        w = LossWarmupWrapper(
+            warmup_loss=nn.CrossEntropyLoss(),
+            main_loss=SmoothAPLoss(num_classes=self.C, queue_size=0),
+            warmup_steps=30, blend_steps=20,
+            temp_start=0.1, temp_end=0.01, temp_decay_steps=1000,
+        )
+        for step in range(40):
+            w.on_train_batch_start(step)
+            w(*self._batch())
+        assert w._switch_step == 30
+        mid_blend = w.main_weight
+
+        fresh = LossWarmupWrapper(
+            warmup_loss=nn.CrossEntropyLoss(),
+            main_loss=SmoothAPLoss(num_classes=self.C, queue_size=0),
+            warmup_steps=30, blend_steps=20,
+            temp_start=0.1, temp_end=0.01, temp_decay_steps=1000,
+        )
+        fresh.load_state_dict(w.state_dict())
+        assert fresh._switch_step == 30
+        assert fresh._global_step == 39
+        assert fresh.main_weight == pytest.approx(mid_blend)
+
+    def test_saved_during_warmup_restores_warmup_phase(self):
+        # Boundary: checkpoint taken before the switch. _switch_step is None on
+        # both sides, but _epoch must survive or the warmup restarts.
+        w = _make_wrapper(warmup_epochs=3)
+        self._run(w, epochs=2, steps_per_epoch=5)
+        assert w.in_warmup
+
+        fresh = _make_wrapper(warmup_epochs=3)
+        fresh.load_state_dict(w.state_dict())
+        assert fresh._epoch == 1
+        assert fresh._switch_step is None
+        assert fresh.in_warmup
+
+    def test_legacy_checkpoint_without_extra_state_loads_strict(self):
+        # Guards the backward-compat shim: checkpoints written before this fix
+        # have no _extra_state key and must still load under strict=True.
+        w = _make_wrapper(warmup_epochs=2,
+                          main_loss=SmoothAPLoss(num_classes=self.C, queue_size=64))
+        self._run(w, epochs=5, steps_per_epoch=20)
+        legacy = {k: v for k, v in w.state_dict().items() if not k.endswith("_extra_state")}
+        assert not any(k.endswith("_extra_state") for k in legacy)
+
+        fresh = _make_wrapper(warmup_epochs=2,
+                              main_loss=SmoothAPLoss(num_classes=self.C, queue_size=64))
+        fresh.load_state_dict(legacy, strict=True)  # must not raise
+        assert fresh.main_loss._queue._q_logits.abs().sum() > 0
+
+    def test_torch_save_load_round_trip(self, tmp_path):
+        # Integration: the extra state must survive pickling under the
+        # weights_only=True default of torch.load.
+        w = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000)
+        self._run(w, epochs=5, steps_per_epoch=20)
+        path = tmp_path / "ckpt.pt"
+        torch.save(w.state_dict(), path)
+
+        fresh = _make_wrapper(warmup_epochs=2, temp_decay_steps=1000)
+        fresh.load_state_dict(torch.load(path, weights_only=True))
+        assert fresh._switch_step == 40
+        assert fresh.current_temperature == pytest.approx(w.current_temperature)
+
+    def test_round_trip_with_loss_lacking_temperature(self):
+        # Boundary: get_extra_state records temperature=None; set_extra_state
+        # must skip the write rather than raise.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            w = _make_wrapper(warmup_epochs=1, main_loss=_NoTempLoss())
+            self._run(w, epochs=3, steps_per_epoch=5)
+            assert w.get_extra_state()["temperature"] is None
+
+            fresh = _make_wrapper(warmup_epochs=1, main_loss=_NoTempLoss())
+            fresh.load_state_dict(w.state_dict())
+        assert fresh._switch_step == w._switch_step
+        assert fresh._epoch == 2
+
+    def test_no_warmup_fast_path_round_trip(self):
+        # Still-works: with warmup_epochs=0 the switch latches at init, so the
+        # original bug never fired here. Confirm the fix didn't change it.
+        w = _make_wrapper(warmup_epochs=0, temp_decay_steps=1000)
+        self._run(w, epochs=3, steps_per_epoch=10)
+        fresh = _make_wrapper(warmup_epochs=0, temp_decay_steps=1000)
+        fresh.load_state_dict(w.state_dict())
+        assert fresh._switch_step == 0
+        assert fresh.current_temperature == pytest.approx(w.current_temperature)

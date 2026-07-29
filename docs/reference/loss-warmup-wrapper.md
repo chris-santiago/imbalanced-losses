@@ -119,6 +119,27 @@ temp(t) = temp_start * (temp_end / temp_start) ^ min(1, elapsed / temp_decay_ste
 
 The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end` once `temp_decay_steps` steps have elapsed. The clock starts at the first main-phase batch, not at training epoch 0.
 
+## Checkpointing and resume
+
+`LossWarmupWrapper` persists its schedule state — the current epoch, global step, phase-switch step, and temperature — in `state_dict()` under the standard `_extra_state` key, via PyTorch's `get_extra_state`/`set_extra_state`. Resuming from a checkpoint restores the phase, continues the temperature decay from the correct elapsed step, resumes a blend ramp mid-way, and leaves the restored memory queue intact.
+
+Checkpoints written before this state was persisted still load under `strict=True`. They restart the temperature schedule on resume, which is the behavior they were saved with.
+
+!!! warning "Temperature set outside the wrapper is not checkpointed"
+
+    `LossWarmupWrapper` is the **only** class in this library that persists training-progress state. The `temperature` attribute on `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` is a plain Python float, not a registered buffer, so it is absent from `state_dict()`.
+
+    If you drive temperature yourself instead of using the wrapper:
+
+    ```python
+    loss = SmoothAPLoss(num_classes=10, queue_size=1024, temperature=0.05)
+    loss.temperature = my_anneal(global_step)   # not saved
+    ```
+
+    the value silently reverts to the constructor argument (`0.05` above) on every resume. Either use `LossWarmupWrapper` for temperature scheduling, or re-apply your schedule from the restored `global_step` after loading a checkpoint.
+
+    Tracked in [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
+
 ## Parameter reference
 
 | Parameter | Default | Description |
