@@ -5,6 +5,10 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
+*No unreleased changes.*
+
+## 0.5.1 — 2026-07-29
+
 ### Fixed
 
 - **`LossWarmupWrapper` now persists its phase and temperature-decay state in
@@ -20,6 +24,17 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
   `get_extra_state`/`set_extra_state` under the standard `_extra_state` key.
   Checkpoints written by earlier versions still load under `strict=True` (they
   restart the schedule, exactly as they did before), so no action is required.
+
+### Other
+
+- **Documented that `LossWarmupWrapper` is the only class in the library that
+  persists training-progress state.** The `temperature` attribute on
+  `SmoothAPLoss`, `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` is a plain float,
+  not a registered buffer, so a hand-rolled annealing schedule applied directly to
+  `loss.temperature` silently reverts to the constructor value on resume. Warning
+  admonitions added to the `LossWarmupWrapper` reference and the failure-modes
+  guide, with a matching row in the diagnostic summary table. Tracked in
+  [#16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
 
 ## 0.5.0 — 2026-07-16
 

@@ -408,7 +408,7 @@ wheels = [
 
 [[package]]
 name = "imbalanced-losses"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "torch" },
