@@ -101,8 +101,9 @@ loss  = 1 − pAUC
 ```
 
 Gradient flows through positives only; negatives enter solely via the detached
-thresholds. Cost is `O(|P| × n_knots)`. For a narrow band, `n_knots = 2` is accurate
-(trapezoid error scales as `(β − α)³ · TPR''`); use `n_knots ≥ 3` for wide bands.
+thresholds. The surrogate itself costs `O(|P| × n_knots)`. For a narrow band,
+`n_knots = 2` is accurate (trapezoid error scales as `(β − α)³ · TPR''`); use
+`n_knots ≥ 3` for wide bands.
 
 **Pairwise** (`surrogate="pairwise"`). Band-restricted Smooth-AP — compare positives
 against the negatives that land *inside* the band, which carry gradient:
@@ -112,8 +113,22 @@ pAUC = mean_{i ∈ P, j ∈ band} σ((s_i − s_j) / τ_eff)
 loss = 1 − pAUC
 ```
 
-Cost is `O(|P| × |band|)`. Because it *pushes the band negatives down*, it is the
-right tool when the operating point is contested by hard negatives.
+The surrogate costs `O(|P| × |band|)`. Because it *pushes the band negatives down*,
+it is the right tool when the operating point is contested by hard negatives.
+
+**Where the time actually goes.** Both surrogate costs above are dominated, at
+realistic queue sizes, by the `torch.quantile` call that resolves the thresholds:
+that sorts the reference population, `O(M log M)` per class, where `M` is the pooled
+reference count. The band itself holds only `(β − α)` of the reference mass, so
+`|band|` stays small by construction and the pairwise matrix is rarely the
+bottleneck. Since 0.5.2 every level a class needs — knots, band edges, and the IQR
+dispersion pair — is resolved in a *single* `torch.quantile` call rather than the
+four or five separate sorts used previously. At batch 4096 with a 32k queue on CPU
+that is worth roughly 3–3.7× for the trapezoid surrogate and 2–2.9× for pairwise;
+the exact ratio is machine-dependent, and the pairwise figure also depends on the
+positive rate, since its `O(|P| × |band|)` term does not shrink. The practical
+implication is that `queue_size`, not `n_knots` or the band width, sets the step
+time.
 
 ### 2.4 Scale-aware temperature
 

@@ -74,7 +74,7 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 | `alpha` | `0.0` | Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, including all top negatives. |
 | `beta` | `0.005` | Upper FPR band edge; set to your target operating-point FPR (e.g. `0.005` for 50 bps). |
 | `surrogate` | `"trapezoid"` | `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives (band negatives carry gradient) — for wide/volatile bands |
-| `n_knots` | `2` | Trapezoid FPR knots; `2` is accurate for narrow bands, `>= 3` for wide bands |
+| `n_knots` | `2` | Trapezoid FPR knots; `2` is accurate for narrow bands, `>= 3` for wide bands. Each knot resolves to an order statistic of the reference pool — see [Thresholds are order statistics](../explanation/assumptions-and-failure-modes.md#paucatbudgetloss) if you need thresholds stable across pool sizes |
 | `tau_scale` | `"iqr"` | Scale used for the scale-aware temperature: `"iqr"` (stable bulk statistic; pair with small `temperature`) or `"band"` (sized to the operating region; pair with `temperature` near 1.0) |
 | `pos_numerator` | `"pool"` | Positives in the soft-TPR numerator (and the pairwise positive set): `"pool"` (all pooled positives) or `"live"` (live-batch only). `"live"` gives an undiluted gradient when the queue swamps the few live positives at extreme imbalance — most beneficial for `"trapezoid"`; `"pairwise"` usually prefers `"pool"` to keep the positive×band-negative contrast populated |
 | `budget_basis` | `"fpr"` | What the band edges quantile *over*: `"fpr"` (iid negatives — `beta` is an FPR) or `"population"` (all pooled scores, positives + negatives — `beta` is a top-k alert-budget fraction). Prefer the default; `"population"` is within seed noise at `alpha=0` and doesn't beat it (see Band selection guidance) |
@@ -82,7 +82,7 @@ When `iid_mask=None` (the default) every negative is treated as iid — correct 
 | `queue_size` | `1024` | Larger queues stabilise the tail quantile; at low FPR you need many pooled negatives |
 | `reduction` | `"mean"` | `"none"` returns `[C]`; invalid classes are `nan` |
 | `ignore_index` | `-100` | Excluded from threshold estimation and the positive set |
-| `quantile_interpolation` | `"higher"` | Conservative default for the band edges |
+| `quantile_interpolation` | `"higher"` | Conservative default for the band edges. `"higher"`/`"lower"`/`"nearest"` select a single order statistic, so a threshold moves in discrete jumps; `"linear"` interpolates between neighbours and moves continuously, though it is not insensitive |
 | `max_pool_size` | `None` | Minimum-quota subsampling cap for very large pools (seq2seq) |
 
 ## Band selection guidance

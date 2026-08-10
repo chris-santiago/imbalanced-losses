@@ -190,6 +190,18 @@ The default `pos_numerator="pool"` averages the soft-TPR numerator over all pool
 
 `PAUCAtBudgetLoss` uses a dimensionless `temperature` (default `0.1`) multiplied by a robust scale of the iid negatives (`tau_eff = temperature * scale`). This is intentionally different from the raw-logit `temperature=0.01` of the other ranking losses. Do not reuse a temperature value tuned for `SmoothAPLoss` or `RecallAtQuantileLoss` directly — the units differ.
 
+**Thresholds are order statistics, so they move in discrete jumps**
+
+A band edge or knot threshold is a sample quantile: `torch.quantile` turns a level into a position `level × (n_ref − 1)` in the sorted reference pool, and under `quantile_interpolation="higher"` (the default), `"lower"`, or `"nearest"` it returns the order statistic at the rounded position. It does not return a smoothly-varying value. Two consequences are easy to miss.
+
+*The threshold depends on the pool size, not just on `beta`.* Because the position is `level × (n_ref − 1)`, a partially-filled queue resolves a different index than a full one. Early in training, or after `reset_queue()`, thresholds move for reasons unrelated to the model. This is one more argument for letting the queue fill before reading `t_alpha`/`t_beta` diagnostics too literally.
+
+*Near an index boundary the threshold is on a knife edge.* When `level × (n_ref − 1)` sits close to a rounding boundary, an arbitrarily small change in the level — a different `beta`, a different pool size, a different library version — flips the index, and the threshold jumps the whole gap to the adjacent sample. In a heavy-tailed or sparse region of the score distribution that gap can be large relative to `tau_eff`, so a jump can move the loss appreciably rather than negligibly.
+
+`quantile_interpolation="linear"` removes the *discontinuity* — it interpolates between the two neighbouring order statistics — but not the *sensitivity*: the interpolated position is still scaled by `(n_ref − 1)`, so in a region with a large gap between adjacent samples a small level change still produces a real threshold change. Treat it as a smoothing measure, not immunity.
+
+If you need thresholds that are stable across pool sizes, the practical lever is a large, consistently-full queue rather than a particular `quantile_interpolation`. Watch `band_neg_count` from `return_diagnostics=True`: a band whose negative count swings between steps is resolving different order statistics.
+
 ---
 
 ## LossWarmupWrapper

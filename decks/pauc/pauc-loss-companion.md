@@ -80,7 +80,7 @@ This is the most important mechanistic slide. Lean on the two parallel "right to
 
 **Details not on the slide**
 
-- Trapezoid cost is O(|P|·n_knots); pairwise is O(|P|·|band|). Neither is O(M²).
+- Trapezoid cost is O(|P|·n_knots); pairwise is O(|P|·|band|). Neither is O(M²). If asked what actually dominates: the threshold quantile, which sorts the reference pool at O(M log M) per class. Since 0.5.2 that is one sort per class rather than four or five, so queue size sets the step time, not n_knots or the band width.
 - n_knots=2 (trapezoid rule) is accurate for narrow bands; use ≥3 for wide bands.
 - The where-legend on the slide glosses σ as a soft 1[s_i > s_j]; if asked, it's a temperature-scaled sigmoid whose sharpness is set by τ_eff (next slide).
 
