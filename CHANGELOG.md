@@ -5,24 +5,42 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
+*No unreleased changes.*
+
+## 0.5.2 — 2026-08-10
+
 ### Other
 
 - **`PAUCAtBudgetLoss` resolves all of a class's quantiles in one sort.** The band
   edges, the trapezoid knots and the IQR dispersion quantiles were issued as four
   or five separate `torch.quantile` calls, each sorting the same reference
-  population independently. They are now concatenated into a single call, and the
+  population independently. They are now packed into a single call, and the
   trapezoid surrogate reuses the resolved vector as its knot thresholds instead of
-  recomputing them. Measured at batch 4096 with a 32k queue: trapezoid 12.33 ms →
-  3.99 ms (3.1×), pairwise 11.56 ms → 5.50 ms (2.1×). The gain scales with
-  `queue_size` and multiplies across classes, so it is largest exactly where the
-  loss was previously most expensive. Every resolved threshold is bitwise
-  unchanged, including at the order-statistic index ties where the
-  non-interpolating `quantile_interpolation` modes are most sensitive. No API
-  change, no numerical change.
+  recomputing them. Measured on CPU at batch 4096, `queue_size=32768`,
+  `num_classes=1`, positive rate 0.5%: trapezoid 12.33 ms → 3.99 ms (3.1×),
+  pairwise 11.56 ms → 5.50 ms (2.1×). An independent reproduction on different
+  hardware measured 3.7× and 2.9× at the same settings, so treat these as
+  conservative; the pairwise ratio in particular falls as the positive rate rises,
+  since its `O(|P| × |band|)` term does not shrink. The gain grows with
+  `queue_size` and with `num_classes`, so it is largest exactly where the loss was
+  previously most expensive. **No API change and no numerical change:** every
+  resolved threshold is bitwise unchanged, verified across 79 200 threshold-level
+  and 2 400 end-to-end configurations, including index-tie-dense pool sizes where
+  the non-interpolating `quantile_interpolation` modes are most sensitive to a
+  level change.
 - **README parameter table corrections.** `quantile_interpolation` was marked as
   `RecallAtQuantileLoss`-only although `PAUCAtBudgetLoss` has accepted it since
   0.5.0, and `budget_basis` was missing from the table entirely. Documentation
   only.
+- **Documented what dominates `PAUCAtBudgetLoss` step time, and how thresholds
+  move.** The deep-dive quoted only the surrogate costs and never mentioned the
+  threshold quantile, which sorts the reference pool at `O(M log M)` per class and
+  dominates both at realistic queue sizes — so the speedup above was
+  unexplainable from the docs. Also added a failure mode covering the fact that
+  thresholds are order statistics, not smoothly-varying values: the sampled
+  position is `level × (n_ref − 1)`, so a threshold depends on the pool size (a
+  partially-filled queue resolves a different index than a full one), and near a
+  rounding boundary it jumps a whole gap to the adjacent sample.
 
 ## 0.5.1 — 2026-07-29
 
