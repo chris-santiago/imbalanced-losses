@@ -239,13 +239,14 @@ loss_fn.reset_queue()
 | `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
 | `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
-| `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss only)* `torch.quantile` interpolation method |
+| `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss, PAUCAtBudgetLoss)* `torch.quantile` interpolation method |
 | `alpha` | `0.0` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, covering all top false-positives. |
 | `beta` | `0.005` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; set to your target operating-point FPR. |
 | `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives — for wide/volatile bands |
 | `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
 | `pos_numerator` | `"pool"` | *(PAUCAtBudgetLoss only)* Positives in the soft-TPR numerator: `"pool"` (all pooled) or `"live"` (live-batch only). `"live"` removes the memory queue's gradient dilution at extreme imbalance — most useful for the `"trapezoid"` surrogate; `"pairwise"` usually prefers `"pool"` to keep enough positives in the contrast |
+| `budget_basis` | `"fpr"` | *(PAUCAtBudgetLoss only)* Reference population for the band-edge quantiles: `"fpr"` (iid negatives only, so `beta` is true FPR) or `"population"` (all pooled scores, so `beta` is a top-k alert budget over the whole population) |
 
 **Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 

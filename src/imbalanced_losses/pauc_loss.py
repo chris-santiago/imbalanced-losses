@@ -402,48 +402,112 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     # Core algorithm
     # ------------------------------------------------------------------
 
-    def _band_thresholds_and_scale(
-        self, neg: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _band_levels(self, ref: torch.Tensor) -> tuple[torch.Tensor, int]:
         """
-        Compute detached band edges and the raw robust dispersion.
+        Every quantile level this class needs, laid out in one vector.
+
+        Layout, in order: the trapezoid knot levels (absent for the pairwise
+        surrogate), then the two band edges ``1 - alpha`` and ``1 - beta``,
+        then the IQR pair ``0.75, 0.25`` when ``tau_scale='iqr'``.  Packing
+        them together lets :meth:`_band_quantiles_and_scale` resolve all of
+        them with a single ``torch.quantile`` call, which sorts ``ref`` once
+        instead of once per level.
+
+        The knot levels are built by tensor subtraction from a ``linspace``
+        and the band edges from Python-float scalars.  That looks
+        inconsistent, and it is: it reproduces exactly how these two groups
+        were computed when they lived in separate calls, so consolidating
+        the sorts changes no value.  Unifying them is a real numerical
+        change and belongs in its own commit, not this one.
 
         Parameters
         ----------
-        neg : torch.Tensor, shape [n_iid_neg]
-            Detached iid-negative scores for one class.
+        ref : torch.Tensor, shape [n_ref]
+            Detached reference-population scores for one class.  Only its
+            dtype/device are used -- matching them keeps ``torch.quantile``
+            from raising on float64 scores.
 
         Returns
         -------
+        q : torch.Tensor, shape [n_knots + 2 (+2)]
+            Quantile levels in the layout above.
+        n_knots : int
+            How many leading entries are knot levels; ``0`` for the pairwise
+            surrogate.  The band edges are always at ``q[n_knots]`` and
+            ``q[n_knots + 1]``.
+
+        Notes
+        -----
+        The knot levels are **uniformly spaced** across ``[alpha, beta]``,
+        and that is load-bearing rather than incidental: the trapezoid
+        surrogate integrates the resolved thresholds with the composite
+        trapezoid weights ``[1/2, 1, ..., 1, 1/2] / (n_knots - 1)`` (see
+        :meth:`_compute_pauc`), which is only a valid quadrature on a
+        uniform grid.  A non-uniform grid -- log-spaced FPR knots, say --
+        would need matching weights there; changing this method alone would
+        silently produce a wrong pAUC.
+        """
+        dtype, device = ref.dtype, ref.device
+        parts = []
+        n_knots = 0
+        if self.surrogate == "trapezoid":
+            f_k = torch.linspace(
+                self.alpha, self.beta, self.n_knots, device=device, dtype=dtype
+            )
+            parts.append(1.0 - f_k)
+            n_knots = self.n_knots
+        parts.append(
+            torch.tensor(
+                [1.0 - self.alpha, 1.0 - self.beta], device=device, dtype=dtype
+            )
+        )
+        if self.tau_scale == "iqr":
+            parts.append(torch.tensor([0.75, 0.25], device=device, dtype=dtype))
+        return torch.cat(parts), n_knots
+
+    def _band_quantiles_and_scale(
+        self, ref: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Resolve every quantile this class needs in a single sort.
+
+        ``torch.quantile`` sorts its input once per call, so the knots, the
+        band edges and the IQR quantiles are issued as one call rather than
+        the four or five this used to take.  Every resolved value is bitwise
+        identical to what per-level calls produced.
+
+        Parameters
+        ----------
+        ref : torch.Tensor, shape [n_ref]
+            Detached reference-population scores for one class.
+
+        Returns
+        -------
+        t_k : torch.Tensor, shape [n_knots], or None
+            Per-knot thresholds for the trapezoid surrogate; ``None`` under
+            ``surrogate='pairwise'``, which has no knots.
         t_alpha : torch.Tensor, scalar
-            Lower-FPR band edge ``quantile(neg, 1 - alpha)`` (detached).
+            Lower-FPR band edge (detached).
         t_beta : torch.Tensor, scalar
-            Upper-FPR band edge ``quantile(neg, 1 - beta)`` (detached);
-            always ``t_beta <= t_alpha`` since ``alpha < beta``.
+            Upper-FPR band edge (detached); always ``t_beta <= t_alpha``
+            since ``alpha < beta``.
         scale : torch.Tensor, scalar
-            Raw (unclamped) robust dispersion of ``neg`` -- IQR or band
+            Raw (unclamped) robust dispersion of ``ref`` -- IQR or band
             width depending on ``tau_scale``.  The caller must test this
             against ``_SCALE_EPS`` before computing ``tau_eff``.
         """
-        t_alpha = torch.quantile(
-            neg, 1.0 - self.alpha, interpolation=self.quantile_interpolation
-        )
-        t_beta = torch.quantile(
-            neg, 1.0 - self.beta, interpolation=self.quantile_interpolation
-        )
+        q, n_knots = self._band_levels(ref)
+        v = torch.quantile(ref, q, interpolation=self.quantile_interpolation)
 
+        t_k = v[:n_knots] if n_knots else None
+        t_alpha = v[n_knots]
+        t_beta = v[n_knots + 1]
         if self.tau_scale == "iqr":
-            q75 = torch.quantile(
-                neg, 0.75, interpolation=self.quantile_interpolation
-            )
-            q25 = torch.quantile(
-                neg, 0.25, interpolation=self.quantile_interpolation
-            )
-            scale = q75 - q25
+            scale = v[n_knots + 2] - v[n_knots + 3]
         else:  # "band"
             scale = t_alpha - t_beta
 
-        return t_alpha, t_beta, scale
+        return t_k, t_alpha, t_beta, scale
 
     def _compute_pauc(
         self,
@@ -532,7 +596,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             pos_num = is_pos
 
         ref = scores[ref_mask].detach()
-        t_alpha, t_beta, scale = self._band_thresholds_and_scale(ref)
+        # One sort resolves the band edges, the trapezoid knots (when that
+        # surrogate is active) and the IQR bulk quantiles together.
+        t_k, t_alpha, t_beta, scale = self._band_quantiles_and_scale(ref)
 
         # Degeneracy guard: if the robust dispersion is ~zero, the sigmoid
         # temperature cannot be calibrated.  Mark as invalid rather than
@@ -574,15 +640,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         tau_eff = self.temperature * scale.clamp_min(self._SCALE_EPS)
 
         if self.surrogate == "trapezoid":
-            # FPR knots equally spaced over [alpha, beta]; threshold per knot.
-            # dtype must match scores so torch.quantile doesn't raise on float64.
-            f_k = torch.linspace(
-                self.alpha, self.beta, self.n_knots,
-                device=scores.device, dtype=scores.dtype
-            )
-            t_k = torch.quantile(
-                ref, 1.0 - f_k, interpolation=self.quantile_interpolation
-            )  # [n_knots], detached
+            # t_k came back from the single quantile call above, alongside the
+            # band edges and the IQR pair.
             p = scores[pos_num]  # gradient flows here (numerator positive set)
             # [n_pos_num, n_knots]; each row is the contribution vector for one positive.
             contrib_mat = torch.sigmoid(

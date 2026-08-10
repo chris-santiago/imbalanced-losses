@@ -5,7 +5,24 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
-*No unreleased changes.*
+### Other
+
+- **`PAUCAtBudgetLoss` resolves all of a class's quantiles in one sort.** The band
+  edges, the trapezoid knots and the IQR dispersion quantiles were issued as four
+  or five separate `torch.quantile` calls, each sorting the same reference
+  population independently. They are now concatenated into a single call, and the
+  trapezoid surrogate reuses the resolved vector as its knot thresholds instead of
+  recomputing them. Measured at batch 4096 with a 32k queue: trapezoid 12.33 ms →
+  3.99 ms (3.1×), pairwise 11.56 ms → 5.50 ms (2.1×). The gain scales with
+  `queue_size` and multiplies across classes, so it is largest exactly where the
+  loss was previously most expensive. Every resolved threshold is bitwise
+  unchanged, including at the order-statistic index ties where the
+  non-interpolating `quantile_interpolation` modes are most sensitive. No API
+  change, no numerical change.
+- **README parameter table corrections.** `quantile_interpolation` was marked as
+  `RecallAtQuantileLoss`-only although `PAUCAtBudgetLoss` has accepted it since
+  0.5.0, and `budget_basis` was missing from the table entirely. Documentation
+  only.
 
 ## 0.5.1 — 2026-07-29
 

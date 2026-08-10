@@ -1724,3 +1724,163 @@ def test_budget_basis_population_requires_iid_negatives():
     loss, per_class, valid = loss_fn(logits, targets, return_per_class=True)
     assert not bool(valid[0]), "class with no iid negatives must be invalid"
     assert torch.isfinite(loss), "no-negatives case must not produce nan/inf"
+
+
+# ---------------------------------------------------------------------------
+# Single-sort quantile consolidation
+# ---------------------------------------------------------------------------
+#
+# _band_quantiles_and_scale resolves the trapezoid knots, the band edges and
+# the IQR pair in ONE torch.quantile call instead of four or five. It is a
+# pure performance change: every resolved value must stay bitwise identical to
+# what the separate per-level calls produced.
+
+
+def _reference_band_quantiles(ref, alpha, beta, tau_scale, interp, surrogate, n_knots):
+    """The pre-consolidation algorithm: one ``torch.quantile`` call per level.
+
+    Deliberately naive and deliberately inconsistent — band edges from
+    Python-float levels, knots from a score-dtype ``linspace`` — because that
+    is exactly what the separate calls did. Shares no code with the
+    implementation, so it is a real oracle rather than a restatement.
+    """
+    t_alpha = torch.quantile(ref, 1.0 - alpha, interpolation=interp)
+    t_beta = torch.quantile(ref, 1.0 - beta, interpolation=interp)
+    if tau_scale == "iqr":
+        q75 = torch.quantile(ref, 0.75, interpolation=interp)
+        q25 = torch.quantile(ref, 0.25, interpolation=interp)
+        scale = q75 - q25
+    else:
+        scale = t_alpha - t_beta
+    t_k = None
+    if surrogate == "trapezoid":
+        f_k = torch.linspace(alpha, beta, n_knots, device=ref.device, dtype=ref.dtype)
+        t_k = torch.quantile(ref, 1.0 - f_k, interpolation=interp)
+    return t_k, t_alpha, t_beta, scale
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("alpha,beta", [(0.0, 0.005), (0.001, 0.05), (0.01, 0.25)])
+@pytest.mark.parametrize("tau_scale", ["iqr", "band"])
+@pytest.mark.parametrize(
+    "interp", ["higher", "linear", "lower", "nearest", "midpoint"]
+)
+@pytest.mark.parametrize("surrogate,n_knots", [("pairwise", 2), ("trapezoid", 2),
+                                               ("trapezoid", 5)])
+def test_single_sort_matches_per_level_calls(
+    dtype, alpha, beta, tau_scale, interp, surrogate, n_knots
+):
+    """The consolidated call reproduces the per-level calls bitwise."""
+    torch.manual_seed(0)
+    ref = torch.randn(4000, dtype=dtype)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=alpha, beta=beta, surrogate=surrogate,
+        n_knots=n_knots, tau_scale=tau_scale, quantile_interpolation=interp,
+    )
+    t_k, t_alpha, t_beta, scale = loss_fn._band_quantiles_and_scale(ref)
+    exp_k, exp_alpha, exp_beta, exp_scale = _reference_band_quantiles(
+        ref, alpha, beta, tau_scale, interp, surrogate, n_knots
+    )
+
+    assert torch.equal(t_alpha, exp_alpha), "t_alpha drifted"
+    assert torch.equal(t_beta, exp_beta), "t_beta drifted"
+    assert torch.equal(scale, exp_scale), "scale drifted"
+    if surrogate == "trapezoid":
+        assert torch.equal(t_k, exp_k), "knot thresholds drifted"
+    else:
+        assert t_k is None, "pairwise has no knots"
+
+
+@pytest.mark.parametrize("interp", ["higher", "lower", "nearest", "midpoint"])
+@pytest.mark.parametrize("n_ref", [500, 505, 508, 517, 523, 533])
+@pytest.mark.parametrize("beta,n_knots", [(0.25, 4), (0.5, 8), (0.125, 8)])
+def test_single_sort_matches_at_index_ties(interp, n_ref, beta, n_knots):
+    """Bitwise equality holds where the quantile index is on a knife edge.
+
+    Under the non-interpolating modes a level is turned into an order
+    statistic by ceil/floor/round of ``level * (n_ref - 1)``. When that
+    product lands exactly on an integer, a sub-ULP change in the level flips
+    the index and the threshold jumps a whole gap between adjacent order
+    statistics — a far larger change than a rounding bit. Random reference
+    sizes almost never hit that, so it is pinned explicitly here with a
+    contiguous ``n_ref`` range and round bands.
+    """
+    torch.manual_seed(n_ref)
+    ref = torch.randn(n_ref, dtype=torch.float32)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.0, beta=beta, surrogate="trapezoid",
+        n_knots=n_knots, tau_scale="iqr", quantile_interpolation=interp,
+    )
+    t_k, t_alpha, t_beta, scale = loss_fn._band_quantiles_and_scale(ref)
+    exp_k, exp_alpha, exp_beta, exp_scale = _reference_band_quantiles(
+        ref, 0.0, beta, "iqr", interp, "trapezoid", n_knots
+    )
+    assert torch.equal(t_k, exp_k), (
+        f"knot thresholds diverged at an index tie (n_ref={n_ref}, "
+        f"beta={beta}, n_knots={n_knots}, interpolation={interp})"
+    )
+    assert torch.equal(t_alpha, exp_alpha)
+    assert torch.equal(t_beta, exp_beta)
+    assert torch.equal(scale, exp_scale)
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+@pytest.mark.parametrize("tau_scale", ["iqr", "band"])
+@pytest.mark.parametrize("num_classes", [1, 4])
+def test_one_quantile_call_per_class(monkeypatch, surrogate, tau_scale, num_classes):
+    """Each class costs at most one torch.quantile call, i.e. one sort.
+
+    This is the entire point of the change, and it is the only thing in the
+    suite that detects a regression to per-level calls: splitting them back
+    out leaves every output bitwise identical and only restores the cost.
+    """
+    calls = []
+    real_quantile = torch.quantile
+
+    def counting_quantile(*args, **kwargs):
+        calls.append(1)
+        return real_quantile(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "quantile", counting_quantile)
+
+    torch.manual_seed(0)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=num_classes, alpha=0.0, beta=0.2, surrogate=surrogate,
+        tau_scale=tau_scale, queue_size=0,
+    )
+    logits = torch.randn(256, num_classes, requires_grad=True)
+    if num_classes == 1:
+        targets = (torch.rand(256) < 0.2).long()
+    else:
+        targets = torch.randint(0, num_classes, (256,))
+
+    loss, per_class, valid = loss_fn(logits, targets, return_per_class=True)
+    assert int(valid.sum()) > 0, "test setup must produce at least one valid class"
+    # Unconditional invariant: a class cannot issue more than one sort. A class
+    # rejected by the degeneracy guard issues one and is not valid, so this
+    # bound holds without a false positive.
+    assert len(calls) <= num_classes, (
+        f"expected at most one torch.quantile call per class ({num_classes}), "
+        f"got {len(calls)}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.backends.mps.is_available(), reason="requires an MPS device"
+)
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+def test_runs_on_mps(surrogate):
+    """The loss survives .to(device) and runs forward/backward on an accelerator."""
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.0, beta=0.05, surrogate=surrogate,
+        n_knots=4, queue_size=128,
+    ).to("mps")
+    logits = torch.randn(256, 1, device="mps", requires_grad=True)
+    targets = (torch.rand(256, device="mps") < 0.2).long()
+
+    out = loss_fn(logits, targets)
+    out.backward()
+
+    assert out.device.type == "mps"
+    assert torch.isfinite(out), "loss must be finite on MPS"
+    assert torch.isfinite(logits.grad).all(), "gradients must be finite on MPS"
