@@ -1746,8 +1746,11 @@ def _reference_band_quantiles(ref, alpha, beta, tau_scale, interp, surrogate, n_
     ``linspace`` — exactly what the separate calls did — and the endpoint
     knots are the band edges themselves, which is the pinning invariant
     (knot 0 = t_alpha, knot n_knots-1 = t_beta) rather than the historical
-    two-route arithmetic. Shares no code with the implementation, so it is a
-    real oracle rather than a restatement.
+    two-route arithmetic. Independent of the implementation for the
+    consolidation property (interior knots, edges, IQR are re-derived by
+    per-level calls); the endpoint pinning is encoded deliberately, so for
+    those two elements this restates the invariant rather than re-deriving
+    it — the direction test below covers what that restatement cannot.
     """
     t_alpha = torch.quantile(ref, 1.0 - alpha, interpolation=interp)
     t_beta = torch.quantile(ref, 1.0 - beta, interpolation=interp)
@@ -1767,7 +1770,19 @@ def _reference_band_quantiles(ref, alpha, beta, tau_scale, interp, surrogate, n_
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("alpha,beta", [(0.0, 0.005), (0.001, 0.05), (0.01, 0.25)])
+@pytest.mark.parametrize(
+    "alpha,beta",
+    [
+        (0.0, 0.005),
+        (0.001, 0.05),
+        (0.01, 0.25),
+        # Non-dyadic bands, where the knot and edge float32 routes diverge:
+        # these lock the pinning and the consolidation jointly across
+        # dtypes, tau_scale and all five interpolation modes.
+        (0.0, 0.9),
+        (1 / 3, 0.9),
+    ],
+)
 @pytest.mark.parametrize("tau_scale", ["iqr", "band"])
 @pytest.mark.parametrize(
     "interp", ["higher", "linear", "lower", "nearest", "midpoint"]
@@ -1898,8 +1913,10 @@ def test_knot_endpoint_levels_share_band_edge_bits(
     [
         # Each cell is a measured v0.5.2 divergence witness: on an
         # arange(n_ref) pool the endpoint knot and the band edge resolved
-        # different (adjacent) order statistics. The first cell is the
-        # defaults witness — t_k[-1] resolved 2.0 while t_beta resolved 1.0.
+        # measurably different thresholds — adjacent order statistics under
+        # higher/lower/nearest, shifted midpoints/interpolants under
+        # midpoint/linear. The first cell is the defaults witness — t_k[-1]
+        # resolved 2.0 while t_beta resolved 1.0.
         ("higher", 11, 0.0, 0.9),
         ("higher", 22, 0.0, 3 / 7),
         ("higher", 101, 0.0, 0.85),
@@ -1927,6 +1944,43 @@ def test_endpoint_knot_thresholds_equal_band_edges(interp, n_ref, alpha, beta):
     assert torch.equal(t_k[-1], t_beta), (
         f"t_k[-1]={t_k[-1].item()} != t_beta={t_beta.item()} "
         f"(interp={interp}, n_ref={n_ref}, alpha={alpha}, beta={beta})"
+    )
+
+
+@pytest.mark.parametrize(
+    "interp,n_ref,alpha,beta,edge",
+    [
+        ("higher", 11, 0.0, 0.9, "beta"),
+        ("nearest", 6, 0.0, 0.9, "beta"),
+        ("midpoint", 11, 0.0, 0.9, "beta"),
+        ("linear", 5, 0.0, 0.85, "beta"),
+        ("lower", 7, 1 / 3, 0.9, "alpha"),
+    ],
+)
+def test_band_edges_keep_the_python_float_route(interp, n_ref, alpha, beta, edge):
+    """t_alpha/t_beta still resolve the per-level Python-float levels.
+
+    The pinning has a direction: the knots move to the edges, never the
+    edges to the knots. The bit-equality tests above are direction-blind by
+    construction (they compare the two outputs to each other), so they stay
+    green if the pinning is reversed — which would silently shift
+    t_alpha/t_beta away from every previously published value. These cells
+    are chosen so the two float32 routes resolve measurably different
+    thresholds; building the edges from the knot route fails here.
+    """
+    ref = torch.arange(n_ref, dtype=torch.float32)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
+        n_knots=2, quantile_interpolation=interp,
+    )
+    _, t_alpha, t_beta, _ = loss_fn._band_quantiles_and_scale(ref)
+    level = 1.0 - (alpha if edge == "alpha" else beta)
+    expected = torch.quantile(ref, level, interpolation=interp)
+    resolved = t_alpha if edge == "alpha" else t_beta
+    assert torch.equal(resolved, expected), (
+        f"t_{edge}={resolved.item()} != per-level Python-float route "
+        f"{expected.item()} (interp={interp}, n_ref={n_ref}, alpha={alpha}, "
+        f"beta={beta})"
     )
 
 

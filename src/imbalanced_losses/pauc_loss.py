@@ -413,17 +413,20 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         them with a single ``torch.quantile`` call, which sorts ``ref`` once
         instead of once per level.
 
-        The interior knot levels are built by tensor subtraction from a
-        ``linspace``, the band edges from Python-float scalars.  For
-        non-dyadic ``alpha``/``beta`` those two routes round differently in
-        float32 (``1.0f - float32(0.9)`` and ``float32(1 - 0.9)`` differ by
-        a few ULPs), and under the non-interpolating quantile modes that is
-        enough to select an adjacent order statistic -- so the endpoint
-        knots used to disagree with the band edges at the same nominal
-        level.  The endpoint knot levels are therefore overwritten
-        with the band edges' exact bits, which makes that disagreement
-        unrepresentable: ``t_k[0] == t_alpha`` and ``t_k[-1] == t_beta``
-        hold by construction.
+        The knot levels are all built by tensor subtraction from a
+        ``linspace`` and the band edges from Python-float scalars; the
+        first and last knot levels are then overwritten with the edges'
+        exact bits.  Without that overwrite the two routes round
+        differently in float32 for non-dyadic ``alpha``/``beta``
+        (``1.0f - float32(0.9)`` and ``float32(1 - 0.9)`` differ by a few
+        ULPs), and under the non-interpolating quantile modes that is
+        enough to select an adjacent order statistic -- the endpoint knots
+        used to disagree with the band edges at the same nominal level.
+        Pinning makes the disagreement unrepresentable: ``t_k[0] ==
+        t_alpha`` and ``t_k[-1] == t_beta`` hold by construction.  The
+        direction is deliberate: the knots move to the edges, never the
+        edges to the knots, so ``t_alpha``/``t_beta`` keep the Python-float
+        route they have always resolved.
 
         Parameters
         ----------
@@ -451,6 +454,17 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         uniform grid.  A non-uniform grid -- log-spaced FPR knots, say --
         would need matching weights there; changing this method alone would
         silently produce a wrong pAUC.
+
+        The endpoint pinning does not disturb this: it moves the endpoint
+        levels by at most a few float32 ULPs, and the composite-trapezoid
+        weights are those of the nominal uniform grid either way.  One
+        degenerate corner is accepted: for a band narrower than one ULP at
+        the level's magnitude, the pinned sequence can be locally
+        non-monotone (interior levels rounding between the two edge
+        levels), where the un-pinned sequence collapsed to a single value.
+        Such a band resolves essentially one threshold and sits far below
+        any useful band width, so it is documented rather than defended
+        against.
         """
         dtype, device = ref.dtype, ref.device
         edges = torch.tensor(
