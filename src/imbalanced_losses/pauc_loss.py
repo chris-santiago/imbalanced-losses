@@ -458,17 +458,14 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         silently produce a wrong pAUC.
 
         The endpoint pinning does not disturb this: it moves each endpoint
-        level by at most half a float32 ULP at magnitude one (5.96e-8, the
-        measured maximum gap between the two arithmetic routes), and the
+        level by at most half a float32 ULP at magnitude one (2^-24), far
+        below the knot spacing of any meaningful band, and the
         composite-trapezoid weights are those of the nominal uniform grid
-        either way.  One degenerate corner is accepted: when the spacing
-        between adjacent knot levels is below that displacement (a band
-        narrower than ~6e-8 * (n_knots - 1)), a pinned endpoint can land
-        past its neighbouring interior level and the sequence becomes
-        locally non-monotone.  Such a band resolves essentially one
-        threshold and sits orders of magnitude below any useful band
-        width, so it is documented -- and pinned by a test -- rather than
-        defended against.
+        either way.  For a degenerate band narrower than
+        ~6e-8 * (n_knots - 1) the pinned sequence can become locally
+        non-monotone -- an accepted corner, locked by
+        ``test_sub_ulp_band_keeps_pinning_and_stays_non_monotone`` and
+        discussed in the pAUC deep-dive (docs/explanation).
         """
         dtype, device = ref.dtype, ref.device
         edges = torch.tensor(

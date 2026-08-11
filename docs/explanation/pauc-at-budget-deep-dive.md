@@ -130,6 +130,20 @@ positive rate, since its `O(|P| × |band|)` term does not shrink. The practical
 implication is that `queue_size`, not `n_knots` or the band width, sets the step
 time.
 
+**Endpoint knots and band edges are the same bits.** The first and last
+trapezoid knot levels are pinned to the band edges' exact float32 bits, so
+`t_k[0] == t_alpha` and `t_k[-1] == t_beta` hold by construction on every pool,
+device and `quantile_interpolation` mode. Through 0.5.2 the knots and the edges
+computed the same nominal level (`1 − β`) by two arithmetic routes whose float32
+results differ for non-dyadic `β`, and an ULP-scale level gap can resolve an
+adjacent order statistic: the trapezoid could integrate an endpoint threshold
+that disagreed with the `t_beta` defining the band. The pinning displacement is
+at most half a float32 ULP at magnitude one (`2^-24` ≈ 6e-8), far below any
+level spacing that matters. For a degenerate band narrower than
+`~6e-8 × (n_knots − 1)` the pinned level sequence can become locally
+non-monotone; that corner is documented and test-locked rather than defended
+against, since such a band resolves essentially one threshold.
+
 ### 2.4 Scale-aware temperature
 
 ```

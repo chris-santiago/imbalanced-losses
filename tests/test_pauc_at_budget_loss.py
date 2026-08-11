@@ -1891,7 +1891,7 @@ def test_knot_endpoint_levels_share_band_edge_bits(
     holds for every pool, pool size, device and interpolation mode by
     construction — no sweep over those axes is needed.
     """
-    ref = torch.randn(64, dtype=dtype, generator=torch.Generator().manual_seed(0))
+    ref = torch.zeros(64, dtype=dtype)
     loss_fn = PAUCAtBudgetLoss(
         num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
         n_knots=n_knots, tau_scale=tau_scale,
