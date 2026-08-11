@@ -27,7 +27,9 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
   band (`alpha=0.0, beta=0.005`), dyadic bands (`0.125`/`0.25`/`0.5`), float64
   scores, and the pairwise surrogate are all byte-identical to 0.5.2. Where a
   config is affected, each endpoint knot threshold moves by at most one
-  adjacent order statistic of the reference pool; the resulting loss/gradient
+  adjacent order statistic of the reference pool (the level itself moves by
+  under 6e-8, so this holds for any pool below ~10 million samples — far
+  beyond the ≤4096-sample pools the loss is designed for); the resulting loss/gradient
   change is bounded by that inter-sample gap, which can be material where
   adjacent reference scores are far apart (see "Thresholds are order
   statistics" in the failure-modes guide).

@@ -426,7 +426,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         t_alpha`` and ``t_k[-1] == t_beta`` hold by construction.  The
         direction is deliberate: the knots move to the edges, never the
         edges to the knots, so ``t_alpha``/``t_beta`` keep the Python-float
-        route they have always resolved.
+        route they have always resolved.  At the default ``n_knots=2`` the
+        two writes replace both knot levels, so the ``linspace`` contributes
+        only its length.
 
         Parameters
         ----------
@@ -455,16 +457,18 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         would need matching weights there; changing this method alone would
         silently produce a wrong pAUC.
 
-        The endpoint pinning does not disturb this: it moves the endpoint
-        levels by at most a few float32 ULPs, and the composite-trapezoid
-        weights are those of the nominal uniform grid either way.  One
-        degenerate corner is accepted: for a band narrower than one ULP at
-        the level's magnitude, the pinned sequence can be locally
-        non-monotone (interior levels rounding between the two edge
-        levels), where the un-pinned sequence collapsed to a single value.
-        Such a band resolves essentially one threshold and sits far below
-        any useful band width, so it is documented rather than defended
-        against.
+        The endpoint pinning does not disturb this: it moves each endpoint
+        level by at most half a float32 ULP at magnitude one (5.96e-8, the
+        measured maximum gap between the two arithmetic routes), and the
+        composite-trapezoid weights are those of the nominal uniform grid
+        either way.  One degenerate corner is accepted: when the spacing
+        between adjacent knot levels is below that displacement (a band
+        narrower than ~6e-8 * (n_knots - 1)), a pinned endpoint can land
+        past its neighbouring interior level and the sequence becomes
+        locally non-monotone.  Such a band resolves essentially one
+        threshold and sits orders of magnitude below any useful band
+        width, so it is documented -- and pinned by a test -- rather than
+        defended against.
         """
         dtype, device = ref.dtype, ref.device
         edges = torch.tensor(

@@ -1891,7 +1891,7 @@ def test_knot_endpoint_levels_share_band_edge_bits(
     holds for every pool, pool size, device and interpolation mode by
     construction — no sweep over those axes is needed.
     """
-    ref = torch.randn(64, dtype=dtype)
+    ref = torch.randn(64, dtype=dtype, generator=torch.Generator().manual_seed(0))
     loss_fn = PAUCAtBudgetLoss(
         num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
         n_knots=n_knots, tau_scale=tau_scale,
@@ -1974,13 +1974,45 @@ def test_band_edges_keep_the_python_float_route(interp, n_ref, alpha, beta, edge
         n_knots=2, quantile_interpolation=interp,
     )
     _, t_alpha, t_beta, _ = loss_fn._band_quantiles_and_scale(ref)
-    level = 1.0 - (alpha if edge == "alpha" else beta)
+    # dtype-explicit q states the edge route directly instead of relying on
+    # torch's scalar-to-input-dtype conversion to reproduce it.
+    level = torch.tensor(
+        1.0 - (alpha if edge == "alpha" else beta), dtype=ref.dtype
+    )
     expected = torch.quantile(ref, level, interpolation=interp)
     resolved = t_alpha if edge == "alpha" else t_beta
     assert torch.equal(resolved, expected), (
         f"t_{edge}={resolved.item()} != per-level Python-float route "
         f"{expected.item()} (interp={interp}, n_ref={n_ref}, alpha={alpha}, "
         f"beta={beta})"
+    )
+
+
+def test_sub_ulp_band_keeps_pinning_and_stays_non_monotone():
+    """The accepted degenerate corner stays exactly as documented.
+
+    For a band narrower than the pinning displacement (~6e-8 per knot
+    interval) the pinned level sequence is allowed to be locally
+    non-monotone — the _band_levels Notes documents this as accepted rather
+    than defended against. This locks both halves of that disposition: the
+    pinning invariant must hold even here, and the non-monotonicity must
+    remain observable. A future clamp/sort "monotonicity fix" fails the
+    second assertion and must revisit the documented trade-off (and the
+    quadrature reasoning) together with this test, instead of silently
+    changing resolved thresholds.
+    """
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.9, beta=0.9 + 1e-8, surrogate="trapezoid",
+        n_knots=3,
+    )
+    q, k = loss_fn._band_levels(torch.zeros(8))
+    assert torch.equal(q[0], q[k]) and torch.equal(q[k - 1], q[k + 1]), (
+        "pinning must hold even on a sub-ULP band"
+    )
+    assert not bool((q[:k].diff() <= 0).all()), (
+        "expected the documented locally non-monotone level sequence on a "
+        "sub-ULP band; if monotonicity enforcement was added, update the "
+        "_band_levels Notes and this test together"
     )
 
 
