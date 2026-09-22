@@ -265,6 +265,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - AP for each class via one-vs-rest decomposition.
@@ -281,6 +282,11 @@ class SmoothAPLoss(_QueuedRankingLoss):
             not used by Smooth-AP.
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; not used by Smooth-AP.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Accepted for interface parity with the transport
+            rail; not yet consumed here -- the weighted Smooth-AP
+            arithmetic lands in a later change.
 
         Returns
         -------

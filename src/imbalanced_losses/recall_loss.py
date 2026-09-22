@@ -296,6 +296,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - recall for each class via one-vs-rest decomposition.
@@ -312,6 +313,11 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             not used by Recall-at-Quantile.
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; not used by Recall-at-Quantile.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Accepted for interface parity with the transport
+            rail; not yet consumed here -- the weighted recall
+            arithmetic lands in a later change.
 
         Returns
         -------

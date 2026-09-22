@@ -287,3 +287,88 @@ class TestSubsamplePoolIsLiveAlignment:
             assert live2[row].item() == is_live[orig_idx].item(), (
                 f"is_live misaligned at row {row} (orig_idx={orig_idx})"
             )
+
+
+class TestSubsamplePoolSampleWeightAlignment:
+    """Tests for the optional sample_weight parameter (per-sample weight transport)."""
+
+    def test_noop_returns_five_tuple_when_all_flags_provided_small_pool(self):
+        """When pool <= max_size with is_iid, is_live, and sample_weight, 5-tuple is returned."""
+        logits, targets = _make_pool(32, 4)
+        is_iid  = torch.ones(32, dtype=torch.bool)
+        is_live = torch.ones(32, dtype=torch.bool)
+        weight  = torch.rand(32)
+        result = subsample_pool(
+            logits, targets, max_size=64, is_iid=is_iid, is_live=is_live, sample_weight=weight
+        )
+        assert isinstance(result, tuple) and len(result) == 5
+        l2, t2, iid2, live2, weight2 = result
+        assert l2 is logits
+        assert t2 is targets
+        assert iid2 is is_iid
+        assert live2 is is_live
+        assert weight2 is weight
+
+    def test_sample_weight_aligned_with_selected_rows(self):
+        """sample_weight[i] in output must match sample_weight[orig_i] for the same row."""
+        n, c = 200, 4
+        torch.manual_seed(90)
+        logits  = torch.arange(n * c, dtype=torch.float).reshape(n, c)
+        targets = torch.arange(n) % c
+        is_iid  = torch.ones(n, dtype=torch.bool)
+        is_live = torch.ones(n, dtype=torch.bool)
+        sample_weight = torch.arange(n, dtype=torch.float) * 0.1
+
+        l2, t2, iid2, live2, weight2 = subsample_pool(
+            logits, targets, max_size=50,
+            is_iid=is_iid, is_live=is_live, sample_weight=sample_weight,
+        )
+
+        assert l2.size(0) == 50
+        assert weight2.size(0) == 50
+
+        for row in range(l2.size(0)):
+            orig_idx = int(l2[row, 0].item()) // c
+            assert weight2[row].item() == pytest.approx(sample_weight[orig_idx].item()), (
+                f"Row {row}: expected sample_weight[{orig_idx}]="
+                f"{sample_weight[orig_idx].item()}, got {weight2[row].item()}"
+            )
+
+    def test_sample_weight_shape_matches_output_logits(self):
+        """Output sample_weight must have same row count as output logits/targets."""
+        logits, targets = _make_pool(300, 5, seed=9)
+        is_iid  = torch.ones(300, dtype=torch.bool)
+        is_live = torch.ones(300, dtype=torch.bool)
+        sample_weight = torch.rand(300)
+        l2, t2, iid2, live2, weight2 = subsample_pool(
+            logits, targets, max_size=80,
+            is_iid=is_iid, is_live=is_live, sample_weight=sample_weight,
+        )
+        assert weight2.shape == (l2.size(0),)
+        assert weight2.shape == t2.shape
+
+    def test_sample_weight_none_keeps_four_tuple(self):
+        """sample_weight=None must not change the existing 4-tuple arity."""
+        logits, targets = _make_pool(200, 4, seed=10)
+        is_iid  = torch.ones(200, dtype=torch.bool)
+        is_live = torch.ones(200, dtype=torch.bool)
+        result = subsample_pool(logits, targets, max_size=50, is_iid=is_iid, is_live=is_live)
+        assert len(result) == 4
+
+    def test_sample_weight_without_is_iid_is_not_supported_by_signature(self):
+        """
+        sample_weight is only threaded when is_iid (and is_live) are also
+        provided, mirroring is_live's dependency on is_iid.  Without them,
+        the 2-tuple path is preserved.
+        """
+        logits, targets = _make_pool(200, 4, seed=11)
+        result = subsample_pool(logits, targets, max_size=50, sample_weight=torch.rand(200))
+        assert len(result) == 2
+
+    def test_existing_callers_unaffected(self):
+        """Callers not passing sample_weight must still receive a 4-tuple."""
+        logits, targets = _make_pool(200, 4, seed=12)
+        is_iid  = torch.ones(200, dtype=torch.bool)
+        is_live = torch.ones(200, dtype=torch.bool)
+        result = subsample_pool(logits, targets, max_size=50, is_iid=is_iid, is_live=is_live)
+        assert len(result) == 4

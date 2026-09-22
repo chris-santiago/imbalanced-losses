@@ -747,6 +747,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         iid_mask: torch.Tensor | None = None,
         return_per_class: bool = False,
         return_diagnostics: bool = False,
+        *,
+        sample_weight: torch.Tensor | None = None,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, dict]
@@ -781,6 +783,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
             When ``False`` (default), behavior is bit-identical to the
             base-class forward.
+        sample_weight : torch.Tensor, shape [N], optional
+            Per-observation weight, forwarded to the base-class forward
+            unchanged on both the fast and diagnostics paths.  See
+            ``_QueuedRankingLoss.forward`` for the full contract.
 
         Returns
         -------
@@ -836,7 +842,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         if not return_diagnostics:
             # Fast path: no diagnostics needed — bit-identical to base forward.
             return super().forward(
-                logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+                logits, targets, iid_mask=iid_mask, return_per_class=return_per_class,
+                sample_weight=sample_weight,
             )
 
         valid_mask = targets != self.ignore_index
@@ -850,7 +857,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         # --- delegate to base forward (runs _compute_per_class as side effect) --
         base_out = super().forward(
-            logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+            logits, targets, iid_mask=iid_mask, return_per_class=return_per_class,
+            sample_weight=sample_weight,
         )
 
         # --- assemble stats dict from _last_diag --------------------------------
@@ -909,6 +917,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - pAUC for each class via one-vs-rest decomposition.
@@ -925,6 +934,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; threaded into ``_compute_pauc`` so
             ``pos_numerator="live"`` can restrict the numerator positive set.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Accepted for interface parity with the transport
+            rail; not yet consumed here -- the weighted pAUC arithmetic
+            lands in a later change.
 
         Returns
         -------

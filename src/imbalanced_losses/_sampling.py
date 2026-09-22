@@ -17,7 +17,13 @@ def subsample_pool(
     max_size: int,
     is_iid: torch.Tensor | None = None,
     is_live: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    sample_weight: torch.Tensor | None = None,
+) -> (
+    tuple[torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
     """
     Minimum-quota subsample of a ranking pool to at most *max_size* rows.
 
@@ -53,6 +59,15 @@ def subsample_pool(
         When provided alongside *is_iid*, it is indexed by the same selected
         rows and returned as the fourth element.  When ``None`` (default),
         it does not affect the return arity.
+    sample_weight : torch.Tensor, shape [M], optional
+        Per-row weight.  When provided alongside *is_iid* and *is_live*, it
+        is indexed by the same ``final_idx`` as every other returned tensor
+        and returned as the fifth element.  When ``None`` (default), it
+        does not affect the return arity.  Providing *sample_weight*
+        without both *is_iid* and *is_live* is not supported by this
+        signature (mirrors *is_live*'s dependency on *is_iid*): the arity
+        is governed strictly by which of the earlier optional tensors were
+        also supplied.
 
     Returns
     -------
@@ -63,6 +78,9 @@ def subsample_pool(
     is_live_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
         Only returned when *is_live* is not ``None``.  Always follows
         *is_iid_sub* in position.
+    sample_weight_sub : torch.Tensor, shape [min(M, max_size)]
+        Only returned when *sample_weight* is not ``None``.  Always follows
+        *is_live_sub* in position.
 
     Notes
     -----
@@ -87,7 +105,9 @@ def subsample_pool(
             return logits, targets
         if is_live is None:
             return logits, targets, is_iid
-        return logits, targets, is_iid, is_live
+        if sample_weight is None:
+            return logits, targets, is_iid, is_live
+        return logits, targets, is_iid, is_live, sample_weight
 
     device = targets.device
     classes, inverse = targets.unique(return_inverse=True)
@@ -123,4 +143,12 @@ def subsample_pool(
         return logits[final_idx], targets[final_idx]
     if is_live is None:
         return logits[final_idx], targets[final_idx], is_iid[final_idx]
-    return logits[final_idx], targets[final_idx], is_iid[final_idx], is_live[final_idx]
+    if sample_weight is None:
+        return logits[final_idx], targets[final_idx], is_iid[final_idx], is_live[final_idx]
+    return (
+        logits[final_idx],
+        targets[final_idx],
+        is_iid[final_idx],
+        is_live[final_idx],
+        sample_weight[final_idx],
+    )
