@@ -5,6 +5,10 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
+*No unreleased changes.*
+
+## 0.6.0 — 2026-09-22
+
 ### Added
 
 - **Every loss accepts an optional `sample_weight` argument on `forward()`, moving the objective from an item-level count to a value-level sum.** `SigmoidFocalLoss`, `SoftmaxFocalLoss`, `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` all take a trailing keyword-only `sample_weight`: a non-negative, finite per-observation weight (shape `[N]` for the ranking losses, `targets.shape` for `SoftmaxFocalLoss`, and for `SigmoidFocalLoss` a shape whose dim 0 equals `inputs.size(0)` and whose trailing dims broadcast to `inputs`). A negative, `NaN`, or `inf` entry raises `ValueError`; the weight is detached and cast to the loss dtype, so a `float64` weight never promotes a `float32` loss. The motivating case is a dollar-weighted objective, for example optimizing recall at a fixed alert budget by review value rather than review count, but the mechanism is general to any per-observation weight. See the new [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/) how-to for a worked example.
@@ -15,38 +19,12 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
   **Private API note:** the private `_compute_per_class` hook on `_QueuedRankingLoss` gained a `sample_weight` argument, and the private `_MemoryQueue.merge` / `subsample_pool` helpers now exchange a `PooledBatch` named tuple instead of variable-arity tuples. Out-of-library subclasses that override `_compute_per_class` (unsupported, per the spec) need the new parameter.
 
-  **Follow-ups (logged, not built):** weighted budgets/quantiles (`RecallAtQuantileLoss`'s threshold and `PAUCAtBudgetLoss`'s band edges remain unweighted order statistics), weight-aware `subsample_pool` selection (currently uniform-random regardless of weight), and a weighted `pauc_var` diagnostic.
+  **Follow-ups (logged, not built):** weighted budgets/quantiles (`RecallAtQuantileLoss`'s threshold and `PAUCAtBudgetLoss`'s band edges remain unweighted order statistics), weight-aware `subsample_pool` selection (currently uniform-random regardless of weight), and a weighted `pauc_var` diagnostic. Weighted budgets are tracked in [#18](https://github.com/chris-santiago/imbalanced-losses/issues/18).
 
 ### Fixed
 
 - **`LossWarmupWrapper` no longer silently drops keyword arguments (including `sample_weight`) on the blend path.** `**kwargs` passed to the wrapper's `forward()` (`return_per_class`, `sample_weight`, or any other forwarded argument) previously reached `main_loss` only once `main_weight == 1.0` (the pure main-loss phase); during warmup-ended and blend-phase steps they were silently discarded. They now reach `main_loss` in all three phases. **This is an observable behavior change for callers that passed keyword arguments during blend:** `iid_mask` now shapes the blend-phase thresholds it was silently excluded from, and a call with `return_per_class=True` (or `return_diagnostics=True`) during blend now returns the tuple it returns in the main phase instead of a bare scalar; if you relied on the old silent drop, stop passing those arguments during blend. Calls that pass no keyword arguments are unchanged. `warmup_loss` is unaffected by this fix: it only ever receives `sample_weight`, and only when its own `forward` declares a parameter of that name or declares `**kwargs` (checked once at construction), so third-party warmup losses that don't accept it keep training unweighted with no error.
-- **`PAUCAtBudgetLoss`: the trapezoid endpoint knots now resolve to exactly the
-  band-edge thresholds.** The first/last knot levels and the band edges are the
-  same nominal quantiles (`1 - alpha`, `1 - beta`), but were computed by two
-  arithmetic routes: float32 tensor subtraction from a `linspace` for the
-  knots, Python-double subtraction then a cast for the edges. For non-dyadic
-  `alpha`/`beta` (e.g. `0.9`, `0.85`, `1/3`) the two float32 results differ by
-  an ULP-scale amount, and under the non-interpolating
-  `quantile_interpolation` modes (including the default `"higher"`) that is
-  enough to select an adjacent order statistic. The threshold the trapezoid
-  integrated at its endpoint could therefore disagree with the `t_alpha` /
-  `t_beta` that define the band (at the defaults with `beta=0.9` on an
-  11-sample pool, the last knot resolved a different sample than `t_beta`).
-  The endpoint knot levels are now pinned to the band edges' exact bits, which
-  makes the disagreement unrepresentable for every pool, pool size, device and
-  interpolation mode. **Scope of the numerical change:** only
-  float32 + `surrogate="trapezoid"` + a non-dyadic band edge is affected.
-  `t_alpha`/`t_beta` (including the `return_diagnostics` values), the default
-  band (`alpha=0.0, beta=0.005`), dyadic bands (`0.125`/`0.25`/`0.5`), float64
-  scores, and the pairwise surrogate are all byte-identical to 0.5.2. Where a
-  config is affected, each endpoint knot threshold moves by at most one
-  adjacent order statistic of the reference pool: the level itself moves by
-  at most `2^-24` (about 6e-8), so the sampled rank shifts by less than one
-  for any pool `torch.quantile` accepts (it refuses inputs above `2^24`
-  elements). The resulting loss/gradient change is bounded by that
-  inter-sample gap, which can be material where adjacent reference scores
-  are far apart (see "Thresholds are order statistics" in the failure-modes
-  guide).
+- **`PAUCAtBudgetLoss`: the trapezoid endpoint knots now resolve to exactly the band-edge thresholds.** The first/last knot levels and the band edges are the same nominal quantiles (`1 - alpha`, `1 - beta`), but were computed by two arithmetic routes: float32 tensor subtraction from a `linspace` for the knots, Python-double subtraction then a cast for the edges. For non-dyadic `alpha`/`beta` (e.g. `0.9`, `0.85`, `1/3`) the two float32 results differ by an ULP-scale amount, and under the non-interpolating `quantile_interpolation` modes (including the default `"higher"`) that is enough to select an adjacent order statistic. The threshold the trapezoid integrated at its endpoint could therefore disagree with the `t_alpha` / `t_beta` that define the band (at the defaults with `beta=0.9` on an 11-sample pool, the last knot resolved a different sample than `t_beta`). The endpoint knot levels are now pinned to the band edges' exact bits, which makes the disagreement unrepresentable for every pool, pool size, device and interpolation mode. **Scope of the numerical change:** only float32 + `surrogate="trapezoid"` + a non-dyadic band edge is affected. `t_alpha`/`t_beta` (including the `return_diagnostics` values), the default band (`alpha=0.0, beta=0.005`), dyadic bands (`0.125`/`0.25`/`0.5`), float64 scores, and the pairwise surrogate are all byte-identical to 0.5.2. Where a config is affected, each endpoint knot threshold moves by at most one adjacent order statistic of the reference pool: the level itself moves by at most `2^-24` (about 6e-8), so the sampled rank shifts by less than one for any pool `torch.quantile` accepts (it refuses inputs above `2^24` elements). The resulting loss/gradient change is bounded by that inter-sample gap, which can be material where adjacent reference scores are far apart (see "Thresholds are order statistics" in the failure-modes guide).
 
 ## 0.5.2 — 2026-08-10
 
