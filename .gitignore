@@ -91,6 +91,9 @@ Thumbs.db
 *.pt
 *.pth
 *.ckpt
+# ...except versioned test fixtures, which are checked-in test assets, not
+# generated/local model artifacts.
+!tests/fixtures/*.pt
 
 # Misc
 tmp/
