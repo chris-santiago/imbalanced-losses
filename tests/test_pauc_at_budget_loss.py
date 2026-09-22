@@ -1731,18 +1731,26 @@ def test_budget_basis_population_requires_iid_negatives():
 # ---------------------------------------------------------------------------
 #
 # _band_quantiles_and_scale resolves the trapezoid knots, the band edges and
-# the IQR pair in ONE torch.quantile call instead of four or five. It is a
-# pure performance change: every resolved value must stay bitwise identical to
-# what the separate per-level calls produced.
+# the IQR pair in ONE torch.quantile call instead of four or five. The
+# consolidation itself is a pure performance change, checked per level by the
+# oracle below. One deliberate numerical exception sits on top of it: the
+# endpoint knot levels are pinned to the band edges' exact bits (see the
+# knot-endpoint consistency section), so the oracle pins its endpoint knots
+# the same way instead of reproducing the historical two-route arithmetic.
 
 
 def _reference_band_quantiles(ref, alpha, beta, tau_scale, interp, surrogate, n_knots):
-    """The pre-consolidation algorithm: one ``torch.quantile`` call per level.
+    """Per-level oracle: one ``torch.quantile`` call per level.
 
-    Deliberately naive and deliberately inconsistent — band edges from
-    Python-float levels, knots from a score-dtype ``linspace`` — because that
-    is exactly what the separate calls did. Shares no code with the
-    implementation, so it is a real oracle rather than a restatement.
+    Band edges from Python-float levels, interior knots from a score-dtype
+    ``linspace`` — exactly what the separate calls did — and the endpoint
+    knots are the band edges themselves, which is the pinning invariant
+    (knot 0 = t_alpha, knot n_knots-1 = t_beta) rather than the historical
+    two-route arithmetic. Independent of the implementation for the
+    consolidation property (interior knots, edges, IQR are re-derived by
+    per-level calls); the endpoint pinning is encoded deliberately, so for
+    those two elements this restates the invariant rather than re-deriving
+    it — the direction test below covers what that restatement cannot.
     """
     t_alpha = torch.quantile(ref, 1.0 - alpha, interpolation=interp)
     t_beta = torch.quantile(ref, 1.0 - beta, interpolation=interp)
@@ -1756,11 +1764,25 @@ def _reference_band_quantiles(ref, alpha, beta, tau_scale, interp, surrogate, n_
     if surrogate == "trapezoid":
         f_k = torch.linspace(alpha, beta, n_knots, device=ref.device, dtype=ref.dtype)
         t_k = torch.quantile(ref, 1.0 - f_k, interpolation=interp)
+        t_k[0] = t_alpha
+        t_k[-1] = t_beta
     return t_k, t_alpha, t_beta, scale
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("alpha,beta", [(0.0, 0.005), (0.001, 0.05), (0.01, 0.25)])
+@pytest.mark.parametrize(
+    "alpha,beta",
+    [
+        (0.0, 0.005),
+        (0.001, 0.05),
+        (0.01, 0.25),
+        # Non-dyadic bands, where the knot and edge float32 routes diverge:
+        # these lock the pinning and the consolidation jointly across
+        # dtypes, tau_scale and all five interpolation modes.
+        (0.0, 0.9),
+        (1 / 3, 0.9),
+    ],
+)
 @pytest.mark.parametrize("tau_scale", ["iqr", "band"])
 @pytest.mark.parametrize(
     "interp", ["higher", "linear", "lower", "nearest", "midpoint"]
@@ -1822,6 +1844,176 @@ def test_single_sort_matches_at_index_ties(interp, n_ref, beta, n_knots):
     assert torch.equal(t_alpha, exp_alpha)
     assert torch.equal(t_beta, exp_beta)
     assert torch.equal(scale, exp_scale)
+
+
+# ---------------------------------------------------------------------------
+# Knot-endpoint / band-edge level consistency
+# ---------------------------------------------------------------------------
+#
+# The first and last trapezoid knot levels and the band-edge levels are the
+# same nominal quantiles, 1 - alpha and 1 - beta. They used to be computed by
+# two arithmetic routes — float32 tensor subtraction from a linspace for the
+# knots, Python-double subtraction then a cast for the edges — whose float32
+# images differ for non-dyadic alpha/beta (0.9, 0.85, 1/3, ...). Under the
+# non-interpolating quantile modes an ULP-scale level difference can select
+# an adjacent order statistic, so the endpoint knot and the band edge disagreed
+# at the same nominal level: at the library defaults (interpolation="higher")
+# with beta=0.9 on an 11-sample pool, the last knot resolved 2.0 while t_beta
+# resolved 1.0. _band_levels now pins the endpoint knot levels to the band
+# edges' exact bits, which makes the disagreement unrepresentable. Each
+# previously-affected knot threshold moves by at most one adjacent order
+# statistic of the reference pool; t_alpha/t_beta themselves are unchanged.
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("tau_scale", ["iqr", "band"])
+@pytest.mark.parametrize("n_knots", [2, 5])
+@pytest.mark.parametrize(
+    "alpha,beta",
+    [
+        (0.0, 0.9),
+        (0.0, 0.85),
+        (0.0, 1 / 3),
+        (0.0, 3 / 7),
+        (0.0, 0.95),
+        (1 / 3, 0.9),
+        (0.0, 0.005),  # default band: the two routes' bits already coincide
+        (0.25, 0.5),  # dyadic: exactly representable, both routes agree
+    ],
+)
+def test_knot_endpoint_levels_share_band_edge_bits(
+    dtype, tau_scale, n_knots, alpha, beta
+):
+    """Structural invariant: the endpoint knot levels ARE the band-edge levels.
+
+    This is the fix itself: torch.quantile cannot resolve two bitwise-equal
+    levels to different thresholds, so endpoint-knot/band-edge agreement
+    holds for every pool, pool size, device and interpolation mode by
+    construction — no sweep over those axes is needed.
+    """
+    ref = torch.zeros(64, dtype=dtype)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
+        n_knots=n_knots, tau_scale=tau_scale,
+    )
+    q, k = loss_fn._band_levels(ref)
+    assert k == n_knots
+    assert torch.equal(q[0], q[n_knots]), (
+        f"first knot level {q[0].item()!r} != 1-alpha edge level "
+        f"{q[n_knots].item()!r}"
+    )
+    assert torch.equal(q[n_knots - 1], q[n_knots + 1]), (
+        f"last knot level {q[n_knots - 1].item()!r} != 1-beta edge level "
+        f"{q[n_knots + 1].item()!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "interp,n_ref,alpha,beta",
+    [
+        # Each cell is a measured v0.5.2 divergence witness: on an
+        # arange(n_ref) pool the endpoint knot and the band edge resolved
+        # measurably different thresholds — adjacent order statistics under
+        # higher/lower/nearest, shifted midpoints/interpolants under
+        # midpoint/linear. The first cell is the defaults witness — t_k[-1]
+        # resolved 2.0 while t_beta resolved 1.0.
+        ("higher", 11, 0.0, 0.9),
+        ("higher", 22, 0.0, 3 / 7),
+        ("higher", 101, 0.0, 0.85),
+        ("nearest", 6, 0.0, 0.9),
+        ("midpoint", 11, 0.0, 0.9),
+        ("lower", 7, 0.0, 1 / 3),
+        ("linear", 5, 0.0, 0.85),
+        ("lower", 7, 1 / 3, 0.9),  # alpha-side: t_k[0] vs t_alpha
+        ("midpoint", 7, 1 / 3, 0.9),
+        ("linear", 5, 1 / 3, 0.9),
+    ],
+)
+def test_endpoint_knot_thresholds_equal_band_edges(interp, n_ref, alpha, beta):
+    """The resolved endpoint-knot thresholds equal the band-edge thresholds."""
+    ref = torch.arange(n_ref, dtype=torch.float32)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
+        n_knots=2, quantile_interpolation=interp,
+    )
+    t_k, t_alpha, t_beta, _ = loss_fn._band_quantiles_and_scale(ref)
+    assert torch.equal(t_k[0], t_alpha), (
+        f"t_k[0]={t_k[0].item()} != t_alpha={t_alpha.item()} "
+        f"(interp={interp}, n_ref={n_ref}, alpha={alpha}, beta={beta})"
+    )
+    assert torch.equal(t_k[-1], t_beta), (
+        f"t_k[-1]={t_k[-1].item()} != t_beta={t_beta.item()} "
+        f"(interp={interp}, n_ref={n_ref}, alpha={alpha}, beta={beta})"
+    )
+
+
+@pytest.mark.parametrize(
+    "interp,n_ref,alpha,beta,edge",
+    [
+        ("higher", 11, 0.0, 0.9, "beta"),
+        ("nearest", 6, 0.0, 0.9, "beta"),
+        ("midpoint", 11, 0.0, 0.9, "beta"),
+        ("linear", 5, 0.0, 0.85, "beta"),
+        ("lower", 7, 1 / 3, 0.9, "alpha"),
+    ],
+)
+def test_band_edges_keep_the_python_float_route(interp, n_ref, alpha, beta, edge):
+    """t_alpha/t_beta still resolve the per-level Python-float levels.
+
+    The pinning has a direction: the knots move to the edges, never the
+    edges to the knots. The bit-equality tests above are direction-blind by
+    construction (they compare the two outputs to each other), so they stay
+    green if the pinning is reversed — which would silently shift
+    t_alpha/t_beta away from every previously published value. These cells
+    are chosen so the two float32 routes resolve measurably different
+    thresholds; building the edges from the knot route fails here.
+    """
+    ref = torch.arange(n_ref, dtype=torch.float32)
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=alpha, beta=beta, surrogate="trapezoid",
+        n_knots=2, quantile_interpolation=interp,
+    )
+    _, t_alpha, t_beta, _ = loss_fn._band_quantiles_and_scale(ref)
+    # dtype-explicit q states the edge route directly instead of relying on
+    # torch's scalar-to-input-dtype conversion to reproduce it.
+    level = torch.tensor(
+        1.0 - (alpha if edge == "alpha" else beta), dtype=ref.dtype
+    )
+    expected = torch.quantile(ref, level, interpolation=interp)
+    resolved = t_alpha if edge == "alpha" else t_beta
+    assert torch.equal(resolved, expected), (
+        f"t_{edge}={resolved.item()} != per-level Python-float route "
+        f"{expected.item()} (interp={interp}, n_ref={n_ref}, alpha={alpha}, "
+        f"beta={beta})"
+    )
+
+
+def test_sub_ulp_band_keeps_pinning_and_stays_non_monotone():
+    """The accepted degenerate corner stays exactly as documented.
+
+    For a band narrower than the pinning displacement (~6e-8 per knot
+    interval) the pinned level sequence is allowed to be locally
+    non-monotone — the _band_levels Notes documents this as accepted rather
+    than defended against. This locks both halves of that disposition: the
+    pinning invariant must hold even here, and the non-monotonicity must
+    remain observable. A future clamp/sort "monotonicity fix" fails the
+    second assertion and must revisit the documented trade-off (and the
+    quadrature reasoning) together with this test, instead of silently
+    changing resolved thresholds.
+    """
+    loss_fn = PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.9, beta=0.9 + 1e-8, surrogate="trapezoid",
+        n_knots=3,
+    )
+    q, k = loss_fn._band_levels(torch.zeros(8))
+    assert torch.equal(q[0], q[k]) and torch.equal(q[k - 1], q[k + 1]), (
+        "pinning must hold even on a sub-ULP band"
+    )
+    assert not bool((q[:k].diff() <= 0).all()), (
+        "expected the documented locally non-monotone level sequence on a "
+        "sub-ULP band; if monotonicity enforcement was added, update the "
+        "_band_levels Notes and this test together"
+    )
 
 
 @pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])

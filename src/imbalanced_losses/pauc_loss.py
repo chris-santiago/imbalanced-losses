@@ -413,12 +413,22 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         them with a single ``torch.quantile`` call, which sorts ``ref`` once
         instead of once per level.
 
-        The knot levels are built by tensor subtraction from a ``linspace``
-        and the band edges from Python-float scalars.  That looks
-        inconsistent, and it is: it reproduces exactly how these two groups
-        were computed when they lived in separate calls, so consolidating
-        the sorts changes no value.  Unifying them is a real numerical
-        change and belongs in its own commit, not this one.
+        The knot levels are all built by tensor subtraction from a
+        ``linspace`` and the band edges from Python-float scalars; the
+        first and last knot levels are then overwritten with the edges'
+        exact bits.  Without that overwrite the two routes round
+        differently in float32 for non-dyadic ``alpha``/``beta``
+        (``1.0f - float32(0.9)`` and ``float32(1 - 0.9)`` differ by a few
+        ULPs), and under the non-interpolating quantile modes that is
+        enough to select an adjacent order statistic -- the endpoint knots
+        used to disagree with the band edges at the same nominal level.
+        Pinning makes the disagreement unrepresentable: ``t_k[0] ==
+        t_alpha`` and ``t_k[-1] == t_beta`` hold by construction.  The
+        direction is deliberate: the knots move to the edges, never the
+        edges to the knots, so ``t_alpha``/``t_beta`` keep the Python-float
+        route they have always resolved.  At the default ``n_knots=2`` the
+        two writes replace both knot levels, so the ``linspace`` contributes
+        only its length.
 
         Parameters
         ----------
@@ -446,21 +456,33 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         uniform grid.  A non-uniform grid -- log-spaced FPR knots, say --
         would need matching weights there; changing this method alone would
         silently produce a wrong pAUC.
+
+        The endpoint pinning does not disturb this: it moves each endpoint
+        level by at most half a float32 ULP at magnitude one (2^-24), far
+        below the knot spacing of any meaningful band, and the
+        composite-trapezoid weights are those of the nominal uniform grid
+        either way.  For a degenerate band narrower than
+        ~6e-8 * (n_knots - 1) the pinned sequence can become locally
+        non-monotone -- an accepted corner, locked by
+        ``test_sub_ulp_band_keeps_pinning_and_stays_non_monotone`` and
+        discussed in the pAUC deep-dive (docs/explanation).
         """
         dtype, device = ref.dtype, ref.device
+        edges = torch.tensor(
+            [1.0 - self.alpha, 1.0 - self.beta], device=device, dtype=dtype
+        )
         parts = []
         n_knots = 0
         if self.surrogate == "trapezoid":
             f_k = torch.linspace(
                 self.alpha, self.beta, self.n_knots, device=device, dtype=dtype
             )
-            parts.append(1.0 - f_k)
+            knot_levels = 1.0 - f_k
+            knot_levels[0] = edges[0]
+            knot_levels[-1] = edges[1]
+            parts.append(knot_levels)
             n_knots = self.n_knots
-        parts.append(
-            torch.tensor(
-                [1.0 - self.alpha, 1.0 - self.beta], device=device, dtype=dtype
-            )
-        )
+        parts.append(edges)
         if self.tau_scale == "iqr":
             parts.append(torch.tensor([0.75, 0.25], device=device, dtype=dtype))
         return torch.cat(parts), n_knots
@@ -473,8 +495,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         ``torch.quantile`` sorts its input once per call, so the knots, the
         band edges and the IQR quantiles are issued as one call rather than
-        the four or five this used to take.  Every resolved value is bitwise
-        identical to what per-level calls produced.
+        the four or five this used to take.  The endpoint knot levels carry
+        the band edges' exact bits (see :meth:`_band_levels`), so
+        ``t_k[0] == t_alpha`` and ``t_k[-1] == t_beta`` always hold.
 
         Parameters
         ----------

@@ -5,7 +5,35 @@ are available on the [GitHub releases page](https://github.com/chris-santiago/im
 
 ## Unreleased
 
-*No unreleased changes.*
+### Fixed
+
+- **`PAUCAtBudgetLoss`: the trapezoid endpoint knots now resolve to exactly the
+  band-edge thresholds.** The first/last knot levels and the band edges are the
+  same nominal quantiles (`1 - alpha`, `1 - beta`), but were computed by two
+  arithmetic routes: float32 tensor subtraction from a `linspace` for the
+  knots, Python-double subtraction then a cast for the edges. For non-dyadic
+  `alpha`/`beta` (e.g. `0.9`, `0.85`, `1/3`) the two float32 results differ by
+  an ULP-scale amount, and under the non-interpolating
+  `quantile_interpolation` modes (including the default `"higher"`) that is
+  enough to select an adjacent order statistic. The threshold the trapezoid
+  integrated at its endpoint could therefore disagree with the `t_alpha` /
+  `t_beta` that define the band (at the defaults with `beta=0.9` on an
+  11-sample pool, the last knot resolved a different sample than `t_beta`).
+  The endpoint knot levels are now pinned to the band edges' exact bits, which
+  makes the disagreement unrepresentable for every pool, pool size, device and
+  interpolation mode. **Scope of the numerical change:** only
+  float32 + `surrogate="trapezoid"` + a non-dyadic band edge is affected.
+  `t_alpha`/`t_beta` (including the `return_diagnostics` values), the default
+  band (`alpha=0.0, beta=0.005`), dyadic bands (`0.125`/`0.25`/`0.5`), float64
+  scores, and the pairwise surrogate are all byte-identical to 0.5.2. Where a
+  config is affected, each endpoint knot threshold moves by at most one
+  adjacent order statistic of the reference pool: the level itself moves by
+  at most `2^-24` (about 6e-8), so the sampled rank shifts by less than one
+  for any pool `torch.quantile` accepts (it refuses inputs above `2^24`
+  elements). The resulting loss/gradient change is bounded by that
+  inter-sample gap, which can be material where adjacent reference scores
+  are far apart (see "Thresholds are order statistics" in the failure-modes
+  guide).
 
 ## 0.5.2 — 2026-08-10
 
