@@ -26,6 +26,35 @@ The memory queue assumes the model's score distribution changes slowly relative 
 
 ---
 
+## `sample_weight` (all losses)
+
+Every loss accepts an optional `sample_weight` forward-time keyword argument that re-weights the objective so a sample's contribution is proportional to its weight rather than counting as one unit (dollar-weighted recall at a fixed alert budget is the canonical use). `None` (the default) leaves every loss bitwise unchanged.
+
+### When it works
+
+- You have a real per-observation value (dollar amount, priority tier) that should scale the sample's contribution to the loss, distinct from any class-level weighting.
+- You need the weight to survive the full training pipeline unmodified: the memory queue, DDP all-gather, `ignore_index` filtering, and `max_pool_size` subsampling all carry it correctly for the ranking losses, and DDP all-gather carries it for the focal losses.
+
+### When it breaks down
+
+**A zero-weight positive is not the same as a removed positive**
+
+In the ranking losses (`SmoothAPLoss`, `RecallAtQuantileLoss`, `PAUCAtBudgetLoss`), weighting is objective-only: `sample_weight` scales a positive's contribution to the loss value, but it does not remove that positive's row from the pool. Thresholds, ranks, and band membership are computed the same way regardless of weight. This is by design: thresholds stay count-based order statistics so a caller can't destabilize `t_alpha`/`t_beta`/`tau_eff` by weighting them. A zero-weight positive therefore contributes zero numerator and denominator mass to the objective, but it still occupies its place in `SmoothAPLoss`'s ranks, `RecallAtQuantileLoss`'s threshold pool, and `PAUCAtBudgetLoss`'s band membership. The loss is consequently **not**, in general, equal to the loss computed with that row deleted from the batch, because deleting the row would also change the pool size the ranks and thresholds are computed against. A class whose positives are all zero-weight follows the same path as a class with zero positives under the active reduction.
+
+**Whole-tensor-zero is treated as a misconfiguration, not silent data**
+
+If the entire `sample_weight` tensor supplied on a call is zero, that is very likely a wiring bug (e.g. an unfilled weight column, a broadcasting mistake) rather than an intentional "skip this batch." Each loss emits a one-time `UserWarning` per instance the first time this happens, then falls through to the same degenerate handling as zero positive weight mass (ranking: invalid class, no gradient contribution; focal: denominator floors to `1`). The warning does not repeat on subsequent calls with the same instance, so check training logs early in a run if you suspect a weight tensor is never actually populated.
+
+**`max_pool_size` subsampling is weight-blind**
+
+When a ranking loss's pool exceeds `max_pool_size`, `subsample_pool` selects rows uniformly at random within each class's quota. It does not look at `sample_weight` when deciding what to keep or drop. A handful of very high-weight rows can be discarded at exactly the same rate as low-weight rows in the same class. This is a known limitation (weight-aware subsampling is a logged follow-up, not yet built): if your weights are highly skewed and `max_pool_size` triggers often, either raise `max_pool_size` to reduce how often subsampling fires, or monitor whether high-value rows are being systematically underrepresented in your effective training signal.
+
+**Negative weights raise; the pAUC diagnostics stay unweighted**
+
+`sample_weight` must be non-negative. A negative value anywhere in the tensor raises `ValueError` at `forward`, since it is caller-visible misuse rather than a degenerate-but-valid state. Separately, `PAUCAtBudgetLoss`'s `return_diagnostics=True` statistics (`pauc_var`, `band_neg_count`, `grad_pos_count`) are computed exactly as they are unweighted. They describe the pool's ranking geometry, not the weighted objective, and a weighted `pauc_var` is a logged follow-up.
+
+---
+
 ## Focal Loss
 
 `SigmoidFocalLoss` and `SoftmaxFocalLoss` are modified cross-entropy losses. They inherit CE's theoretical framework and fail in the same ways CE fails, plus some additional failure modes specific to the focal modifier.

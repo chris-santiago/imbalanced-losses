@@ -22,11 +22,13 @@ import warnings
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from _golden_sample_weight import (
     DTYPES,
     FIXTURE_PATH,
     SEED,
+    _make_logits,
     build_grid,
     run_entry,
 )
@@ -92,6 +94,97 @@ class TestUnweightedBitwise:
 
         # Every fixture entry for this dtype was exercised, and nothing more.
         assert checked_keys == expected_keys_for_dtype
+
+
+def _init_single_process_group() -> None:
+    """Initialize a single-process gloo group if not already done."""
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="gloo",
+            init_method="tcp://127.0.0.1:29502",
+            world_size=1,
+            rank=0,
+        )
+
+
+def _destroy_process_group() -> None:
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+class TestUnweightedBitwiseDDPSingleProcess:
+    """
+    Replays the golden grid a second time with the real DDP gather call
+    sites forced active (``_gather_resolved = True``) under a single-process
+    ``gloo`` group, and asserts bitwise identity against the same fixture
+    ``TestUnweightedBitwise`` uses.
+
+    Spec S9 (``.claude/output/specs/2026-09-22-sample-weight-design.md``)
+    lists "the DDP single-process path" among the bitwise-identity cases,
+    but the golden grid itself is captured with no process group
+    initialized at all, so ``_should_gather()`` resolves to ``False`` and
+    ``all_gather_with_grad`` / ``all_gather_no_grad`` are never called during
+    capture. Forcing ``_gather_resolved = True`` here makes every forward
+    call the real (unmocked) gather helpers; at ``world_size == 1`` both
+    return their input unchanged (see ``distributed.py``), so the replay
+    must still match the fixture bit-for-bit. This does not regenerate the
+    fixture -- it replays the exact same grid and inputs as
+    ``TestUnweightedBitwise``, only with gathering forced on.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_str)
+    def test_replay_matches_fixture_with_gather_forced(self, golden, dtype):
+        configs = build_grid()
+        dtype_str = _dtype_str(dtype)
+
+        for config_index, config in enumerate(configs):
+            loss_fn = config.loss_cls(**config.loss_kwargs).to(dtype)
+            loss_fn.train()
+            # Force the real (unmocked) DDP gather call sites to run on every
+            # forward, instead of the auto-detect result (False, since the
+            # golden grid's own capture never initializes a process group).
+            loss_fn._gather_resolved = True
+
+            for step_index, step in enumerate(config.steps):
+                logits = _make_logits(config_index, step_index, dtype, config.logits_shape)
+                logits.requires_grad_(True)
+                targets = step.targets.to(dtype) if config.float_targets else step.targets
+
+                forward_kwargs: dict[str, object] = {}
+                if step.iid_mask is not None:
+                    forward_kwargs["iid_mask"] = step.iid_mask
+                if config.return_per_class:
+                    forward_kwargs["return_per_class"] = True
+
+                out = loss_fn(logits, targets, **forward_kwargs)
+                if isinstance(out, tuple):
+                    loss_val, per_class = out[0], out[1]
+                else:
+                    loss_val, per_class = out, None
+
+                backward_target = loss_val if loss_val.ndim == 0 else loss_val.sum()
+                backward_target.backward()
+
+                prefix = f"{config.name}|dtype={dtype_str}|step={step_index}"
+                assert torch.equal(loss_val.detach(), golden[f"{prefix}|loss"]), (
+                    f"{prefix}|loss: DDP single-process (gather forced, world_size=1) "
+                    f"replay diverged from the golden fixture."
+                )
+                assert torch.equal(logits.grad.detach(), golden[f"{prefix}|grad"]), (
+                    f"{prefix}|grad: DDP single-process (gather forced, world_size=1) "
+                    f"replay diverged from the golden fixture."
+                )
+                if per_class is not None:
+                    assert torch.equal(per_class.detach(), golden[f"{prefix}|per_class"]), (
+                        f"{prefix}|per_class: DDP single-process (gather forced, "
+                        f"world_size=1) replay diverged from the golden fixture."
+                    )
 
 
 class _RecordingRankingLoss(_QueuedRankingLoss):

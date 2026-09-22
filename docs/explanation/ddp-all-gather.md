@@ -53,6 +53,14 @@ This means `drop_last=True` in `DistributedSampler` is no longer required for co
 
 Both `all_gather_with_grad` and `all_gather_no_grad` check `world_size` and return the input unchanged when running on a single GPU. There is no overhead in single-GPU training.
 
+## `sample_weight` is a fourth gathered tensor
+
+Every ranking loss (`_QueuedRankingLoss.forward`) gathers up to four tensors, in this order: `logits` (with grad, via `all_gather_with_grad`), `targets` (no grad), `iid_mask` (no grad, transported as `uint8`), and `sample_weight` (no grad, transported as its native float dtype; it is not cast to `uint8` the way `iid_mask` is). The fourth gather runs only when `sample_weight` is supplied on that call; each of the first three tensors is always gathered when `gather_distributed` resolves to `True`, regardless of whether a weight is present. An unweighted step therefore issues the same six collectives (three tensors × sizes-then-data) it always has; a weighted step adds one more no-grad gather for the weight, for eight total.
+
+**All ranks must agree on whether `sample_weight` is supplied on a given step.** The all-gather collectives are matched in order and count across ranks. `dist.all_gather` is a synchronous barrier, so if rank 0 calls the loss with `sample_weight` and rank 1 does not, rank 0 issues a collective rank 1 never joins. Depending on the backend this either hangs (NCCL/gloo waiting on a call that never comes) or, worse, silently pairs mismatched collectives from adjacent forward passes, corrupting both ranks' data. This is a caller contract, not something the library detects or mocks: build the weight tensor the same way on every rank each step (a `torch.ones(N)` fallback where no real weight exists is safer than making the argument conditional on batch content).
+
+Focal losses (`SigmoidFocalLoss`, `SoftmaxFocalLoss`) follow the same rule at a smaller scale: they always gather `inputs` and `targets`, and gather `sample_weight` only when it is supplied, under the same all-ranks-agree requirement.
+
 ## Queue synchronization under DDP
 
 Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same full global batch. After any number of training steps, all workers have identical queues — no additional synchronization is needed. This would not hold if each worker enqueued only its local shard.

@@ -262,7 +262,6 @@ def _make_gather_mock(rank_tensors: list[torch.Tensor]):
     *rank_tensors* are the **original, unpadded** tensors — the helper
     derives the size tensors and padded tensors internally.
     """
-    world_size = len(rank_tensors)
     sizes = [torch.tensor([t.size(0)], dtype=torch.int64) for t in rank_tensors]
 
     max_rows = max(t.size(0) for t in rank_tensors)
@@ -455,9 +454,10 @@ def _make_pauc_gather_mock(
     logits_ranks: list[torch.Tensor],
     targets_ranks: list[torch.Tensor],
     iid_ranks: list[torch.Tensor],
+    weight_ranks: list[torch.Tensor] | None = None,
 ):
     """
-    Build a side_effect for dist.all_gather that handles six interleaved
+    Build a side_effect for dist.all_gather that handles the interleaved
     calls per forward pass (2 calls per tensor: sizes then data):
       1. sizes gather for logits (int64)
       2. data gather for logits (padded float32)
@@ -466,15 +466,24 @@ def _make_pauc_gather_mock(
       5. sizes gather for iid_mask (int64; gathered as uint8)
       6. data gather for iid_mask (padded uint8)
 
-    Both the equal-size fast path and the variable-size path make all 6 calls;
-    _gather_sizes is always called first regardless of whether ranks differ in
-    size.  The equal-size fast path skips padding in the data gather, but does
-    NOT skip the sizes gather.  The mock routes calls via:
-      group = call_idx // 2  (which tensor group: logits, targets, iid_mask)
+    When *weight_ranks* is supplied, a 4th group is appended -- the
+    sample_weight gather, immediately after iid_mask and matching its
+    position in ``_QueuedRankingLoss.forward`` (float32, no uint8 cast):
+      7. sizes gather for sample_weight (int64)
+      8. data gather for sample_weight (padded float32)
+
+    This makes 6 total calls on an unweighted step and 8 on a weighted one.
+    Both the equal-size fast path and the variable-size path make every call
+    in the active group set; _gather_sizes is always called first regardless
+    of whether ranks differ in size. The equal-size fast path skips padding
+    in the data gather, but does NOT skip the sizes gather. The mock routes
+    calls via:
+      group = call_idx // 2  (which tensor group: logits, targets, iid_mask[, weight])
       phase = call_idx %  2  (0 = sizes call, 1 = data call)
     """
-    world_size = len(logits_ranks)
     all_tensors = [logits_ranks, targets_ranks, [m.to(torch.uint8) for m in iid_ranks]]
+    if weight_ranks is not None:
+        all_tensors.append(weight_ranks)
 
     # Pre-compute sizes and padded tensors for each group.
     groups = []
@@ -705,6 +714,168 @@ class TestPAUCGatherDistributed:
 
 
 # ---------------------------------------------------------------------------
+# Task 6: sample_weight DDP-gather
+#
+# Verify that sample_weight rides the 4th collective group (after logits,
+# targets, iid_mask), that the collective count is exactly 8 on a weighted
+# step and 6 on an unweighted one, and that a 3-rank unequal-size weighted
+# forward (including a zero-row rank whose [0] weight pads/trims like any
+# other tensor) produces the same loss as running the concatenated pool
+# through a single, non-gathering instance -- the gather is pure transport.
+# ---------------------------------------------------------------------------
+
+
+class TestPAUCGatherWeightedDistributed:
+    """
+    Verify PAUCAtBudgetLoss gathers sample_weight alongside logits/targets/
+    iid_mask, with the exact collective count the spec commits to (spec
+    section 9: 'with weights supplied, the multi-rank mock sees exactly one
+    additional no-grad gather in the iid_mask position ... with no weights,
+    the collective count is unchanged').
+    """
+
+    NUM_CLASSES = 1
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    def _loss_kwargs(self):
+        return dict(
+            num_classes=self.NUM_CLASSES, alpha=0.1, beta=0.5,
+            surrogate="trapezoid", queue_size=0,
+            gather_distributed=True, quantile_interpolation="linear",
+        )
+
+    def _build_two_rank_data(self, seed):
+        """Two 20-row iid ranks (16 negatives + 4 positives each), weighted."""
+        g = torch.Generator().manual_seed(seed)
+
+        def _one_rank():
+            neg = torch.rand(16, 1, generator=g) * 2.0 - 1.0
+            pos = torch.randn(4, 1, generator=g) + 3.0
+            logits = torch.cat([neg, pos], dim=0)
+            targets = torch.cat([
+                torch.zeros(16, dtype=torch.long), torch.ones(4, dtype=torch.long)
+            ])
+            iid = torch.ones(20, dtype=torch.bool)
+            weight = torch.rand(20, generator=g) * 2.0 + 0.5
+            return logits, targets, iid, weight
+
+        return _one_rank(), _one_rank()
+
+    def test_weighted_step_issues_eight_collectives(self):
+        """A weighted step gathers logits, targets, iid_mask, and weight (8 calls)."""
+        from unittest.mock import patch
+
+        (r0_l, r0_t, r0_iid, r0_w), (r1_l, r1_t, r1_iid, r1_w) = self._build_two_rank_data(400)
+        mock = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid], [r0_w, r1_w])
+
+        loss_fn = PAUCAtBudgetLoss(**self._loss_kwargs())
+        loss_fn._gather_resolved = True
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock) as mock_gather:
+            loss_fn(r0_l.detach().requires_grad_(True), r0_t, iid_mask=r0_iid, sample_weight=r0_w)
+
+        assert mock_gather.call_count == 8, (
+            f"expected 8 collectives (logits, targets, iid_mask, weight x "
+            f"sizes+data) on a weighted step, got {mock_gather.call_count}. "
+            f"A wrong count here silently desyncs the mock's group routing "
+            f"(group_idx % len(groups)) rather than failing loudly."
+        )
+
+    def test_unweighted_step_issues_six_collectives(self):
+        """An unweighted step issues no additional collective (6 calls, unchanged)."""
+        from unittest.mock import patch
+
+        (r0_l, r0_t, r0_iid, _), (r1_l, r1_t, r1_iid, _) = self._build_two_rank_data(401)
+        mock = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
+
+        loss_fn = PAUCAtBudgetLoss(**self._loss_kwargs())
+        loss_fn._gather_resolved = True
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock) as mock_gather:
+            loss_fn(r0_l.detach().requires_grad_(True), r0_t, iid_mask=r0_iid)
+
+        assert mock_gather.call_count == 6, (
+            f"expected 6 collectives (logits, targets, iid_mask x sizes+data) "
+            f"on an unweighted step, got {mock_gather.call_count}. A wrong "
+            f"count here silently desyncs the mock's group routing "
+            f"(group_idx % len(groups)) rather than failing loudly."
+        )
+
+    def test_three_rank_unequal_size_weighted_matches_concatenated_pool(self):
+        """
+        3 ranks with unequal sizes -- including a zero-row rank -- pad and
+        trim the weight correctly, and the DDP-gathered weighted loss equals
+        the same loss computed directly on the manually concatenated pool.
+        Gradient flows only to the local rank's (rank 0) logits.
+        """
+        from unittest.mock import patch
+
+        (r0_l, r0_t, r0_iid, r0_w), (r1_l, r1_t, r1_iid, r1_w) = self._build_two_rank_data(402)
+
+        # Rank 2 contributes zero rows -- an explicitly supported DDP shape
+        # (e.g. the last, unequal batch of an epoch). Its [0] weight must
+        # pad to the other ranks' size for the collective and trim back to
+        # empty, same as its [0] logits/targets/iid_mask.
+        r2_l = torch.zeros(0, self.NUM_CLASSES)
+        r2_t = torch.zeros(0, dtype=torch.long)
+        r2_iid = torch.zeros(0, dtype=torch.bool)
+        r2_w = torch.zeros(0)
+
+        logits_ranks = [r0_l, r1_l, r2_l]
+        targets_ranks = [r0_t, r1_t, r2_t]
+        iid_ranks = [r0_iid, r1_iid, r2_iid]
+        weight_ranks = [r0_w, r1_w, r2_w]
+        assert len({t.size(0) for t in logits_ranks}) > 1, "ranks must have unequal sizes"
+
+        loss_kwargs = self._loss_kwargs()
+
+        # -- DDP path: rank 0's local view, gathered against ranks 1 and 2. --
+        mock = _make_pauc_gather_mock(logits_ranks, targets_ranks, iid_ranks, weight_ranks)
+        loss_ddp = PAUCAtBudgetLoss(**loss_kwargs)
+        loss_ddp._gather_resolved = True
+
+        r0_l_grad = r0_l.detach().requires_grad_(True)
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            loss_from_ddp = loss_ddp(r0_l_grad, r0_t, iid_mask=r0_iid, sample_weight=r0_w)
+
+        assert torch.isfinite(loss_from_ddp), "loss should be finite after weighted DDP gather"
+        loss_from_ddp.backward()
+        assert r0_l_grad.grad is not None, "gradient should flow to local-rank logits"
+        assert r0_l_grad.grad.shape == r0_l.shape
+        assert torch.isfinite(r0_l_grad.grad).all()
+
+        # -- Single-process reference: the same rows, already concatenated in
+        # rank order, run through the identical loss with gathering disabled.
+        pool_logits = torch.cat(logits_ranks, dim=0)
+        pool_targets = torch.cat(targets_ranks, dim=0)
+        pool_iid = torch.cat(iid_ranks, dim=0)
+        pool_weight = torch.cat(weight_ranks, dim=0)
+
+        loss_pool_fn = PAUCAtBudgetLoss(**{**loss_kwargs, "gather_distributed": False})
+        loss_from_pool = loss_pool_fn(
+            pool_logits, pool_targets, iid_mask=pool_iid, sample_weight=pool_weight
+        )
+
+        assert torch.equal(loss_from_ddp.detach(), loss_from_pool), (
+            f"DDP-gathered weighted loss ({loss_from_ddp.item():.8f}) must equal the "
+            f"loss computed directly on the concatenated single-process pool "
+            f"({loss_from_pool.item():.8f}) -- the gather is pure transport and must "
+            f"not change the weighted arithmetic."
+        )
+
+
+# ---------------------------------------------------------------------------
 # is_live plumbing under mocked DDP gather (pos_numerator="live")
 #
 # Verifies that after a mocked multi-rank gather:
@@ -755,7 +926,6 @@ class TestPAUCIsLiveDistributed:
 
         (r0_l, r0_t, r0_iid), (r1_l, r1_t, r1_iid) = self._build_two_rank_data()
         local_rank = 0
-        mock = _make_pauc_gather_mock([r0_l, r1_l], [r0_t, r1_t], [r0_iid, r1_iid])
 
         fn_pool = PAUCAtBudgetLoss(
             num_classes=1, alpha=0.1, beta=0.5,

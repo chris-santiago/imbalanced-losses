@@ -129,6 +129,7 @@ loss.backward()
 - `mean_positive` reduction (softmax only) — normalizes by positive count for detection tasks
 - `alpha` — scalar (sigmoid) or per-class tensor (softmax) class reweighting
 - `label_smoothing` (softmax only) — forwarded directly to `F.cross_entropy`
+- `sample_weight` — optional per-observation weight passed to `forward()`; replaces the count-based denominator with weight mass. `None` (default) leaves the loss and its gradient bitwise unchanged.
 
 **Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`, `PAUCAtBudgetLoss`):
 - **Memory queue** — circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
@@ -140,6 +141,7 @@ loss.backward()
 - **Eval queue freeze** — `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue
 - **Reductions** — `'mean'` (default), `'sum'`, or `'none'` (per-class tensor; degenerate classes are `nan`)
 - **Per-class logging** — `return_per_class=True` returns `(loss, per_class, valid_mask)` without a second forward pass
+- **`sample_weight`** — optional per-observation weight passed to `forward()`; only positives' weights enter the objective (thresholds, ranks, and the pAUC band never see it). Persists through the memory queue, DDP gather, `ignore_index` filtering, and `max_pool_size` subsampling. `None` (default) leaves the loss and its gradient bitwise unchanged. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/).
 
 ## Installation
 
@@ -226,6 +228,8 @@ loss_fn.reset_queue()
 | `label_smoothing` | `0.0` | *(SoftmaxFocalLoss only)* Forwarded to `F.cross_entropy` |
 | `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
 
+**`sample_weight` (forward-time, not a constructor parameter):** every focal loss accepts an optional trailing keyword argument, `sample_weight`, non-negative and shaped like `targets` (`SoftmaxFocalLoss`) or broadcastable to `inputs` (`SigmoidFocalLoss`). When supplied, the reduction denominator becomes weight mass instead of a count (e.g. `mean` divides by `sum(sample_weight * valid_mask)` rather than the valid count); `mean_positive` keeps its numerator over all valid elements and normalizes only by positive weight mass. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`.
+
 ### Ranking losses
 
 | Parameter | Default | Description |
@@ -251,6 +255,8 @@ loss_fn.reset_queue()
 **Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 
 **Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate. For `PAUCAtBudgetLoss` with the recommended `alpha=0, beta=budget`, only `t_beta = quantile(neg, 1 - beta)` requires adequate pool coverage (`~1/beta` iid negatives); `t_alpha = max(neg_iid)` requires no tail-quantile estimation. Check the `band_neg_count` diagnostic.
+
+**`sample_weight` (forward-time, not a constructor parameter):** every ranking loss accepts an optional trailing keyword argument, `sample_weight`, shape `[N]` float, non-negative, on the logits device. It rides the same rail as `iid_mask`: DDP gather, memory-queue persistence across steps and checkpoints, `ignore_index` filtering, and `max_pool_size` subsampling all carry it correctly. Only positives' weights enter the objective (a queue row's weight is the weight it was enqueued with, default `1`); thresholds, ranks, and the pAUC band are never weighted, so a zero-weight positive contributes nothing to the loss but still occupies its place in ranks and band membership. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/) for a worked dollar-weighted example.
 
 ## `LossWarmupWrapper` — BCE/CE warmup + loss blending + geometric temperature decay
 
@@ -313,13 +319,13 @@ class MyModel(pl.LightningModule):
         return loss
 ```
 
-`**kwargs` (e.g. `return_per_class=True`) are forwarded to `main_loss` only when `main_weight == 1.0`; silently ignored during warmup and blend phases.
+`**kwargs` (e.g. `return_per_class=True`, `sample_weight=...`) are forwarded to `main_loss` in every phase: warmup-ended, blend, and main alike. `warmup_loss` only ever receives `sample_weight`, and only when its `forward` declares a parameter of that name (checked once at construction). Every other keyword argument reaches `main_loss` exclusively, and third-party warmup losses that do not accept `sample_weight` keep working unweighted.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)` |
+| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)`, optionally `sample_weight` |
 | `main_loss` | required | Loss used after warmup; must accept `(logits, targets, **kwargs)` |
 | `warmup_epochs` | `0` | Epochs to use `warmup_loss`; `0` skips warmup entirely |
 | `temp_start` | `0.05` | Temperature at phase switch |
