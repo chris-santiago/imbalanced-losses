@@ -537,6 +537,19 @@ class _RecordingWarmupLossWithWeight(nn.Module):
         return logits.sum() * 0.0
 
 
+class _RecordingWarmupLossVarKeyword(nn.Module):
+    """Warmup-loss stub whose ``forward`` declares ``**kwargs`` rather than
+    naming ``sample_weight`` explicitly."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, logits, targets, **kwargs):
+        self.calls.append(dict(kwargs))
+        return logits.sum() * 0.0
+
+
 class _RecordingWarmupLossNoWeight(nn.Module):
     """Warmup-loss stub whose ``forward`` does not declare ``sample_weight``."""
 
@@ -625,6 +638,48 @@ class TestSampleWeightForwarding:
         sw = torch.rand(self.B)
         loss = w(logits, targets, sample_weight=sw)
         assert loss.ndim == 0
+
+    def test_reaches_warmup_loss_that_declares_var_keyword(self):
+        # A warmup loss that accepts **kwargs can route what it understands;
+        # classifying it as "does not accept sample_weight" would train the
+        # warmup phase unweighted with no signal to the user.
+        warmup = _RecordingWarmupLossVarKeyword()
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(warmup.calls) == 1
+        assert torch.equal(warmup.calls[0]["sample_weight"], sw)
+
+    def test_var_keyword_warmup_loss_receives_every_kwarg(self):
+        # Routing is not coupled to one argument name: a **kwargs warmup
+        # loss gets the whole set, exactly as main_loss does.
+        warmup = _RecordingWarmupLossVarKeyword()
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        w(logits, targets, sample_weight=torch.rand(self.B), return_per_class=True)
+        assert set(warmup.calls[0]) == {"sample_weight", "return_per_class"}
+
+    def test_named_kwarg_other_than_sample_weight_is_forwarded(self):
+        # Nothing in the wrapper is specific to sample_weight: any keyword
+        # the warmup loss declares by name reaches it.
+        class _WarmupWithFlag(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls: list[dict] = []
+
+            def forward(self, logits, targets, *, return_per_class=False):
+                self.calls.append({"return_per_class": return_per_class})
+                return logits.sum() * 0.0
+
+        warmup = _WarmupWithFlag()
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        w(logits, targets, return_per_class=True, sample_weight=torch.rand(self.B))
+        assert warmup.calls[0] == {"return_per_class": True}
 
     def test_reaches_library_warmup_loss_that_declares_it(self):
         # Integration: a real library loss used as warmup_loss is weighted.

@@ -228,7 +228,7 @@ loss_fn.reset_queue()
 | `label_smoothing` | `0.0` | *(SoftmaxFocalLoss only)* Forwarded to `F.cross_entropy` |
 | `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
 
-**`sample_weight` (forward-time, not a constructor parameter):** every focal loss accepts an optional trailing keyword argument, `sample_weight`, non-negative and shaped like `targets` (`SoftmaxFocalLoss`) or broadcastable to `inputs` (`SigmoidFocalLoss`). When supplied, the reduction denominator becomes weight mass instead of a count (e.g. `mean` divides by `sum(sample_weight * valid_mask)` rather than the valid count); `mean_positive` keeps its numerator over all valid elements and normalizes only by positive weight mass. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`.
+**`sample_weight` (forward-time, not a constructor parameter):** every focal loss accepts an optional trailing keyword argument, `sample_weight`, non-negative and finite, shaped like `targets` (`SoftmaxFocalLoss`) or, for `SigmoidFocalLoss`, shaped with dim 0 equal to `inputs.size(0)` and trailing dims broadcastable to `inputs` (e.g. `[N, 1, H, W]` against `[N, C, H, W]`). The full dim-0 extent is required so the weight stays aligned with `inputs` after a DDP all-gather, which concatenates along dim 0. When supplied, the reduction denominator becomes weight mass instead of a count (e.g. `mean` divides by `sum(sample_weight * valid_mask)` rather than the valid count); `mean_positive` keeps its numerator over all valid elements and normalizes only by positive weight mass. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`.
 
 ### Ranking losses
 
@@ -319,13 +319,15 @@ class MyModel(pl.LightningModule):
         return loss
 ```
 
-`**kwargs` (e.g. `return_per_class=True`, `sample_weight=...`) are forwarded to `main_loss` in every phase: warmup-ended, blend, and main alike. `warmup_loss` only ever receives `sample_weight`, and only when its `forward` declares a parameter of that name (checked once at construction). Every other keyword argument reaches `main_loss` exclusively, and third-party warmup losses that do not accept `sample_weight` keep working unweighted.
+`**kwargs` (e.g. `return_per_class=True`, `sample_weight=...`) are forwarded to `main_loss` in every phase: warmup-ended, blend, and main alike. `warmup_loss` receives exactly the keyword arguments its own `forward` declares by name, or all of them when its `forward` declares `**kwargs`; the check runs once at construction. Anything it cannot accept is dropped, so third-party warmup losses that do not take `sample_weight` keep working unweighted.
+
+During the blend phase, `return_per_class=True` returns a tuple whose elements come from two different objectives: the leading `loss` is the blended scalar `(1 - w) * warmup + w * main`, while `per_class` and `valid` pass through from `main_loss` unblended (there is no warmup-side per-class counterpart). If you log per-class metrics, treat them as main-loss values, not as a decomposition of the returned scalar, until the blend ends.
 
 ### Parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)`, optionally `sample_weight` |
+| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)`. Keyword arguments it declares (or `**kwargs`) are forwarded |
 | `main_loss` | required | Loss used after warmup; must accept `(logits, targets, **kwargs)` |
 | `warmup_epochs` | `0` | Epochs to use `warmup_loss`; `0` skips warmup entirely |
 | `temp_start` | `0.05` | Temperature at phase switch |

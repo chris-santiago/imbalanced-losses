@@ -10,20 +10,14 @@ from __future__ import annotations
 
 import torch
 
+from imbalanced_losses._queue import PooledBatch
+
 
 def subsample_pool(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
+    batch: PooledBatch,
     max_size: int,
-    is_iid: torch.Tensor | None = None,
     is_live: torch.Tensor | None = None,
-    sample_weight: torch.Tensor | None = None,
-) -> (
-    tuple[torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-):
+) -> tuple[PooledBatch, torch.Tensor | None]:
     """
     Minimum-quota subsample of a ranking pool to at most *max_size* rows.
 
@@ -40,47 +34,31 @@ def subsample_pool(
     natural frequency — intentionally so, to ensure they contribute gradient
     signal — while the remainder of the budget is filled uniformly.
 
+    Selection is weight-blind: ``batch.sample_weight`` is transported, never
+    consulted, when deciding which rows to keep (spec section 3).
+
     Parameters
     ----------
-    logits : torch.Tensor, shape [M, C]
-        Pool logits (live batch + queue, already filtered for ignore_index).
-        May contain gradients — the returned view preserves them.
-    targets : torch.Tensor, shape [M]
-        Integer class labels corresponding to *logits*.
+    batch : PooledBatch
+        Pool rows (live batch + queue, already filtered for ignore_index).
+        ``logits`` may carry gradients — the returned rows preserve them.
+        Every tensor the batch carries is re-indexed by the same selection,
+        so no supplied tensor can be dropped or left misaligned.
     max_size : int
         Maximum number of rows to return.  Must be positive.
-    is_iid : torch.Tensor, shape [M], dtype=bool, optional
-        Per-row iid flag.  When provided, the returned 3-tuple includes the
-        flag tensor indexed by the same selected rows as logits/targets.
-        When ``None`` (default), the existing 2-tuple is returned, keeping
-        backward compatibility with all existing callers.
     is_live : torch.Tensor, shape [M], dtype=bool, optional
         Per-row live-batch flag (True = live-batch row, False = queue row).
-        When provided alongside *is_iid*, it is indexed by the same selected
-        rows and returned as the fourth element.  When ``None`` (default),
-        it does not affect the return arity.
-    sample_weight : torch.Tensor, shape [M], optional
-        Per-row weight.  When provided alongside *is_iid* and *is_live*, it
-        is indexed by the same ``final_idx`` as every other returned tensor
-        and returned as the fifth element.  When ``None`` (default), it
-        does not affect the return arity.  Providing *sample_weight*
-        without both *is_iid* and *is_live* is not supported by this
-        signature (mirrors *is_live*'s dependency on *is_iid*): the arity
-        is governed strictly by which of the earlier optional tensors were
-        also supplied.
+        Travels outside *batch* because it is built by the caller after the
+        merge, not by the queue; it is indexed by the same selection.
 
     Returns
     -------
-    logits_sub : torch.Tensor, shape [min(M, max_size), C]
-    targets_sub : torch.Tensor, shape [min(M, max_size)]
-    is_iid_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
-        Only returned when *is_iid* is not ``None``.
-    is_live_sub : torch.Tensor, shape [min(M, max_size)], dtype=bool
-        Only returned when *is_live* is not ``None``.  Always follows
-        *is_iid_sub* in position.
-    sample_weight_sub : torch.Tensor, shape [min(M, max_size)]
-        Only returned when *sample_weight* is not ``None``.  Always follows
-        *is_live_sub* in position.
+    batch_sub : PooledBatch
+        The selected rows, ``min(M, max_size)`` of them, with every field
+        the input batch carried.
+    is_live_sub : torch.Tensor or None
+        *is_live* under the same selection, or ``None`` when it was not
+        supplied.
 
     Notes
     -----
@@ -99,15 +77,10 @@ def subsample_pool(
     This inflates ``|P_c|`` and therefore pairwise matrix memory.  Size
     ``max_pool_size`` accordingly: ``|P_c| ≈ max_pool_size // (2 * n_classes)``.
     """
+    logits, targets = batch.logits, batch.targets
     m = logits.size(0)
     if m <= max_size:
-        if is_iid is None:
-            return logits, targets
-        if is_live is None:
-            return logits, targets, is_iid
-        if sample_weight is None:
-            return logits, targets, is_iid, is_live
-        return logits, targets, is_iid, is_live, sample_weight
+        return batch, is_live
 
     device = targets.device
     classes, inverse = targets.unique(return_inverse=True)
@@ -139,16 +112,7 @@ def subsample_pool(
         extra_idx = remaining_idx[perm]
         final_idx = torch.cat([reserved_idx, extra_idx])
 
-    if is_iid is None:
-        return logits[final_idx], targets[final_idx]
-    if is_live is None:
-        return logits[final_idx], targets[final_idx], is_iid[final_idx]
-    if sample_weight is None:
-        return logits[final_idx], targets[final_idx], is_iid[final_idx], is_live[final_idx]
     return (
-        logits[final_idx],
-        targets[final_idx],
-        is_iid[final_idx],
-        is_live[final_idx],
-        sample_weight[final_idx],
+        batch.index(final_idx),
+        None if is_live is None else is_live[final_idx],
     )

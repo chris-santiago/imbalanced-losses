@@ -908,6 +908,54 @@ class TestSigmoidFocalLossSampleWeight:
         with pytest.raises(ValueError, match="broadcastable"):
             SigmoidFocalLoss()(logits, targets, sample_weight=weight)
 
+    @pytest.mark.parametrize(
+        "shape", [(1, 4), (4,), ()], ids=["leading-one", "channel-only", "scalar"]
+    )
+    def test_weight_without_full_dim0_extent_raises(self, shape):
+        # Narrowed contract: dim 0 must equal inputs.size(0). These shapes
+        # all broadcast against inputs locally, but gather_distributed
+        # concatenates the weight along dim 0, so any of them would survive
+        # validation on one rank and then misalign against the gathered
+        # batch on a multi-rank step.
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        with pytest.raises(ValueError, match="sample_weight must match inputs dim-0"):
+            SigmoidFocalLoss()(logits, targets, sample_weight=torch.ones(shape))
+
+    def test_trailing_dim_broadcast_still_accepted(self):
+        # The narrowing is dim-0 only: [N, 1] over [N, C] is still valid.
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 1) + 0.1
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+        loss_none = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / weight.expand_as(loss_none).sum()
+        torch.testing.assert_close(fn(logits, targets, sample_weight=weight), expected)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")], ids=["nan", "inf"])
+    def test_non_finite_weight_raises(self, bad):
+        # A NaN weight silently produces a NaN loss; an inf weight silently
+        # produces an inf or NaN one. Both are caller-visible misuse, like a
+        # negative weight.
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 4)
+        weight[0, 0] = bad
+        with pytest.raises(ValueError, match="finite"):
+            SigmoidFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_weight_cast_to_loss_dtype(self):
+        # The weight's dtype must not decide the dtype of the value that
+        # gets backpropagated; the ranking path already casts to the loss
+        # dtype in merge(), and the focal path matches it.
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 4, dtype=torch.float64) + 0.1
+        loss = SigmoidFocalLoss(reduction="mean")(logits, targets, sample_weight=weight)
+        assert loss.dtype == torch.float32
+
     def test_all_zero_weight_warns_once_zero_loss_finite_grad(self):
         torch.manual_seed(SEED)
         logits = torch.randn(8, 4, requires_grad=True)
@@ -1129,11 +1177,37 @@ class TestSoftmaxFocalLossSampleWeight:
         with pytest.raises(ValueError, match="non-negative"):
             SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
 
-    def test_mismatched_shape_raises(self):
+    def test_mismatched_dim0_raises(self):
         logits = torch.randn(8, 4)
         targets = torch.randint(0, 4, (8,))
         weight = torch.rand(9)
-        with pytest.raises(ValueError, match="targets shape"):
+        with pytest.raises(ValueError, match="sample_weight must match targets dim-0"):
+            SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")], ids=["nan", "inf"])
+    def test_non_finite_weight_raises(self, bad):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(8)
+        weight[3] = bad
+        with pytest.raises(ValueError, match="finite"):
+            SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_weight_cast_to_loss_dtype(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(8, dtype=torch.float64) + 0.1
+        loss = SoftmaxFocalLoss(reduction="mean")(logits, targets, sample_weight=weight)
+        assert loss.dtype == torch.float32
+
+    def test_mismatched_trailing_shape_raises(self):
+        # Dim 0 matches targets but the full shape does not: SoftmaxFocalLoss
+        # requires targets.shape exactly, no broadcasting.
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(8, 1)
+        with pytest.raises(ValueError, match="sample_weight must be"):
             SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
 
     def test_all_zero_weight_warns_once_zero_loss_finite_grad(self):

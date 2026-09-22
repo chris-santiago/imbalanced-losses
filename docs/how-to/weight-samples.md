@@ -54,7 +54,7 @@ For `PAUCAtBudgetLoss`, only the soft-TPR numerator is weighted; the FPR band ed
 
 ## Focal losses: weighted denominators, same shape as targets
 
-`SigmoidFocalLoss` and `SoftmaxFocalLoss` accept `sample_weight` too, shaped like `targets` (`SoftmaxFocalLoss`) or broadcastable to `inputs` (`SigmoidFocalLoss`):
+`SigmoidFocalLoss` and `SoftmaxFocalLoss` accept `sample_weight` too: shaped exactly like `targets` for `SoftmaxFocalLoss`, and for `SigmoidFocalLoss` shaped with dim 0 equal to `inputs.size(0)` and trailing dims broadcastable to `inputs` (so `[N, 1, H, W]` over `[N, C, H, W]` works, while `[C]` or a scalar does not: the full dim-0 extent is what keeps the weight aligned after a DDP all-gather):
 
 ```python
 from imbalanced_losses import SoftmaxFocalLoss
@@ -81,5 +81,7 @@ A weight you supply on one step is stored in the memory queue and reused on late
 ## Validation
 
 - `sample_weight` must be non-negative; a negative value anywhere raises `ValueError`.
-- `sample_weight` must match the expected shape (`[N]` for ranking losses, `targets.shape` for `SoftmaxFocalLoss`, broadcastable to `inputs` for `SigmoidFocalLoss`); a mismatch raises `ValueError`.
+- `sample_weight` must be finite; a `NaN` or `inf` anywhere raises `ValueError`. Both would otherwise propagate silently into the loss value and the gradient.
+- `sample_weight` must match the expected shape (`[N]` for ranking losses, `targets.shape` for `SoftmaxFocalLoss`, dim-0-exact and trailing-dim broadcastable to `inputs` for `SigmoidFocalLoss`); a mismatch raises `ValueError`.
+- `sample_weight` is cast to the loss dtype, so a `float64` weight does not promote a `float32` loss.
 - A `sample_weight` tensor that is entirely zero triggers a one-time `UserWarning` per instance, since it is very likely a wiring bug rather than an intentional all-zero batch.

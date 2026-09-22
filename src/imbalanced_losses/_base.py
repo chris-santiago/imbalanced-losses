@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from imbalanced_losses._queue import _MemoryQueue
 from imbalanced_losses._sampling import subsample_pool
+from imbalanced_losses._weights import _SampleWeightMixin
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
@@ -59,7 +60,7 @@ def _resolve_gather(gather_distributed: bool | None) -> bool:
 # Abstract base class
 # ---------------------------------------------------------------------------
 
-class _QueuedRankingLoss(nn.Module, abc.ABC):
+class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     """
     Abstract base for ranking losses that use a memory queue.
 
@@ -124,7 +125,6 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
 
         self._gather_resolved: bool | None = None
         self._subsample_warned = False
-        self._sample_weight_warned = False
 
         # Delegate all queue state to _MemoryQueue.
         self._queue = _MemoryQueue(queue_size, num_classes, ignore_index)
@@ -189,7 +189,7 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
-        sample_weight: torch.Tensor | None,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute loss and validity for each class.
@@ -318,38 +318,13 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
                 f"iid_mask must be [N] matching logits dim-0, "
                 f"got {tuple(iid_mask.shape)} vs N={logits.size(0)}"
             )
-        if sample_weight is not None:
-            if sample_weight.ndim != 1 or sample_weight.size(0) != logits.size(0):
-                raise ValueError(
-                    f"sample_weight must be [N] matching logits dim-0, "
-                    f"got {tuple(sample_weight.shape)} vs N={logits.size(0)}"
-                )
-            # Detach immediately -- sample_weight never carries or receives
-            # gradient, and every downstream touch point assumes this.
-            sample_weight = sample_weight.detach()
-            # Both reductions below are undefined/vacuous on an empty tensor
-            # (.min() raises; .all() is trivially True). A zero-row call is
-            # an explicitly supported shape -- e.g. an unequal-last-batch DDP
-            # rank -- and must fall through to the existing empty-pool path
-            # exactly like an unweighted zero-row call does, not raise or
-            # spuriously warn here.
-            if sample_weight.numel() > 0:
-                min_val = sample_weight.min()
-                if min_val < 0:
-                    raise ValueError(
-                        f"sample_weight must be non-negative, got min {min_val.item()}"
-                    )
-                if bool((sample_weight == 0).all()):
-                    if not self._sample_weight_warned:
-                        warnings.warn(
-                            f"{type(self).__name__}: sample_weight is entirely zero for this "
-                            f"call, a likely misconfiguration; treating it as the "
-                            f"zero-positive-weight degenerate case. "
-                            f"(This warning is shown once per instance.)",
-                            UserWarning,
-                            stacklevel=2,
-                        )
-                        self._sample_weight_warned = True
+        sample_weight = self._check_sample_weight(
+            sample_weight,
+            dim0=logits.size(0),
+            dtype=logits.dtype,
+            reference="logits",
+            exact_shape=(logits.size(0),),
+        )
 
         # Materialise all-True iid_mask when None so downstream is uniform.
         # Detached always — iid_mask is never differentiable.
@@ -387,43 +362,40 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
         weighted_active = sample_weight is not None or self._queue.has_weights
 
         # --- merge with queue ------------------------------------------------
+        # A materialized all-ones live weight is what lets a weighted queue
+        # row weight a later unweighted call; on the unweighted path
+        # live_weight stays None and no weight tensor exists at all.
+        live_weight: torch.Tensor | None = None
         if weighted_active:
             live_weight = (
                 sample_weight
                 if sample_weight is not None
                 else torch.ones(n_live, dtype=logits.dtype, device=logits.device)
             )
-            all_logits, all_targets, all_is_iid, all_weight = self._queue.merge(
-                logits, targets, is_iid=live_iid, return_iid=True, sample_weight=live_weight
-            )
-        else:
-            all_logits, all_targets, all_is_iid = self._queue.merge(
-                logits, targets, is_iid=live_iid, return_iid=True
-            )
-            all_weight = None
+        pool = self._queue.merge(
+            logits, targets, is_iid=live_iid, sample_weight=live_weight
+        )
 
         # is_live: True for the N_live live rows (placed first by merge), False
-        # for queue rows.  Aligned row-for-row with all_logits/all_targets.
+        # for queue rows.  Aligned row-for-row with the pooled tensors.  Rides
+        # outside PooledBatch because it is a property of this call, not of
+        # the queue's contents.
         with torch.no_grad():
             all_is_live = torch.cat([
                 torch.ones(n_live, dtype=torch.bool, device=logits.device),
-                torch.zeros(all_logits.size(0) - n_live, dtype=torch.bool, device=logits.device),
+                torch.zeros(pool.logits.size(0) - n_live, dtype=torch.bool, device=logits.device),
             ])
 
         # --- filter ignore_index ---------------------------------------------
-        valid = all_targets != self.ignore_index
-        all_logits  = all_logits[valid]
-        all_targets = all_targets[valid]
-        all_is_iid  = all_is_iid[valid]
+        valid = pool.targets != self.ignore_index
+        pool = pool.index(valid)
         all_is_live = all_is_live[valid]
-        if weighted_active:
-            all_weight = all_weight[valid]
 
         # --- subsample if pool exceeds max_pool_size -------------------------
-        if self.max_pool_size is not None and all_logits.size(0) > self.max_pool_size:
+        if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
             if not self._subsample_warned:
                 warnings.warn(
-                    f"{type(self).__name__}: pool size {all_logits.size(0)} exceeds "
+                    f"{type(self).__name__}: pool size {pool.logits.size(0)} exceeds "
                     f"max_pool_size={self.max_pool_size}; applying "
                     f"minimum-quota subsampling. Loss is now a stochastic approximation. "
                     f"(This warning is shown once per instance.)",
@@ -431,19 +403,12 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
                     stacklevel=2,
                 )
                 self._subsample_warned = True
-            if weighted_active:
-                all_logits, all_targets, all_is_iid, all_is_live, all_weight = subsample_pool(
-                    all_logits, all_targets, self.max_pool_size,
-                    is_iid=all_is_iid, is_live=all_is_live, sample_weight=all_weight,
-                )
-            else:
-                all_logits, all_targets, all_is_iid, all_is_live = subsample_pool(
-                    all_logits, all_targets, self.max_pool_size,
-                    is_iid=all_is_iid, is_live=all_is_live,
-                )
+            pool, all_is_live = subsample_pool(
+                pool, self.max_pool_size, is_live=all_is_live
+            )
 
         # --- empty pool check ------------------------------------------------
-        if all_logits.size(0) == 0:
+        if pool.logits.size(0) == 0:
             out = logits.sum() * 0.0
             if self.reduction == "none":
                 out = out.expand(self.num_classes)
@@ -458,11 +423,12 @@ class _QueuedRankingLoss(nn.Module, abc.ABC):
             return out
 
         # --- subclass validation hook ----------------------------------------
-        self._validate_filtered_targets(all_targets)
+        self._validate_filtered_targets(pool.targets)
 
         # --- per-class compute -----------------------------------------------
         loss_vec, valid_vec = self._compute_per_class(
-            all_logits, all_targets, all_is_iid, all_is_live, sample_weight=all_weight
+            pool.logits, pool.targets, pool.is_iid, all_is_live,
+            sample_weight=pool.sample_weight,
         )
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------

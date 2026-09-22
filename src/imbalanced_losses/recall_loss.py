@@ -33,6 +33,7 @@ from typing import Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._weights import _positive_mass
 
 
 class RecallAtQuantileLoss(_QueuedRankingLoss):
@@ -216,8 +217,13 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Delegate to the internal ``_MemoryQueue``."""
-        return self._queue.merge(logits, targets)
+        """Delegate to the internal ``_MemoryQueue``.
+
+        Kept as a 2-tuple for the pre-``PooledBatch`` callers this shim
+        exists for; the pooled rail itself uses the named fields.
+        """
+        pool = self._queue.merge(logits, targets)
+        return pool.logits, pool.targets
 
     # ------------------------------------------------------------------
     # Core algorithm
@@ -270,8 +276,9 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
 
         w_pos: torch.Tensor | None = None
         if sample_weight is not None:
-            w_pos = sample_weight[is_pos]
-            if float(w_pos.sum()) == 0.0:
+            w_pos, no_mass = _positive_mass(sample_weight, is_pos)
+            if no_mass:
+                # Zero weighted positive mass: same invalid path as n_pos == 0.
                 return scores.new_zeros(()), False
 
         theta = torch.quantile(
@@ -314,7 +321,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
-        sample_weight: torch.Tensor | None,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - recall for each class via one-vs-rest decomposition.
@@ -357,7 +364,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
                     stacklevel=4,
                 )
             recall, is_valid = self._soft_recall_at_quantile(
-                logits[:, 0], targets.bool(), sample_weight
+                logits[:, 0], targets.bool(), sample_weight=sample_weight
             )
             loss_vals = [1.0 - recall]
             valid_mask = [is_valid]
@@ -365,7 +372,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 recall, is_valid = self._soft_recall_at_quantile(
-                    logits[:, c], targets == c, sample_weight
+                    logits[:, c], targets == c, sample_weight=sample_weight
                 )
                 loss_vals.append(1.0 - recall)
                 valid_mask.append(is_valid)

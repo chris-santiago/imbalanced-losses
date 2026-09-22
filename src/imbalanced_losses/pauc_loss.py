@@ -67,6 +67,7 @@ from typing import Any, Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._weights import _positive_mass
 
 
 class PAUCAtBudgetLoss(_QueuedRankingLoss):
@@ -395,8 +396,13 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Delegate to the internal ``_MemoryQueue``."""
-        return self._queue.merge(logits, targets)
+        """Delegate to the internal ``_MemoryQueue``.
+
+        Kept as a 2-tuple for the pre-``PooledBatch`` callers this shim
+        exists for; the pooled rail itself uses the named fields.
+        """
+        pool = self._queue.merge(logits, targets)
+        return pool.logits, pool.targets
 
     # ------------------------------------------------------------------
     # Core algorithm
@@ -631,8 +637,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         w_num: torch.Tensor | None = None
         if sample_weight is not None:
-            w_num = sample_weight[pos_num]
-            if float(w_num.sum()) == 0.0:
+            w_num, no_mass = _positive_mass(sample_weight, pos_num)
+            if no_mass:
                 # Zero weighted positive mass: same invalid path as n_pos == 0.
                 return scores.new_zeros(()), False, {}
 
@@ -945,7 +951,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
-        sample_weight: torch.Tensor | None,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - pAUC for each class via one-vs-rest decomposition.
@@ -990,7 +996,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 )
             is_pos = targets.bool()
             pauc, is_valid, diag = self._compute_pauc(
-                logits[:, 0], is_pos, ~is_pos, is_iid, is_live, sample_weight
+                logits[:, 0], is_pos, ~is_pos, is_iid, is_live,
+                sample_weight=sample_weight,
             )
             loss_vals = [1.0 - pauc]
             valid_mask = [is_valid]
@@ -1001,7 +1008,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             for c in range(self.num_classes):
                 is_pos = targets == c
                 pauc, is_valid, diag = self._compute_pauc(
-                    logits[:, c], is_pos, ~is_pos, is_iid, is_live, sample_weight
+                    logits[:, c], is_pos, ~is_pos, is_iid, is_live,
+                    sample_weight=sample_weight,
                 )
                 loss_vals.append(1.0 - pauc)
                 valid_mask.append(is_valid)

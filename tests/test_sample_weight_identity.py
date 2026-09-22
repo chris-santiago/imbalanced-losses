@@ -28,7 +28,6 @@ from _golden_sample_weight import (
     DTYPES,
     FIXTURE_PATH,
     SEED,
-    _make_logits,
     build_grid,
     run_entry,
 )
@@ -140,50 +139,17 @@ class TestUnweightedBitwiseDDPSingleProcess:
 
     @pytest.mark.parametrize("dtype", DTYPES, ids=_dtype_str)
     def test_replay_matches_fixture_with_gather_forced(self, golden, dtype):
-        configs = build_grid()
         dtype_str = _dtype_str(dtype)
 
-        for config_index, config in enumerate(configs):
-            loss_fn = config.loss_cls(**config.loss_kwargs).to(dtype)
-            loss_fn.train()
-            # Force the real (unmocked) DDP gather call sites to run on every
-            # forward, instead of the auto-detect result (False, since the
-            # golden grid's own capture never initializes a process group).
-            loss_fn._gather_resolved = True
-
-            for step_index, step in enumerate(config.steps):
-                logits = _make_logits(config_index, step_index, dtype, config.logits_shape)
-                logits.requires_grad_(True)
-                targets = step.targets.to(dtype) if config.float_targets else step.targets
-
-                forward_kwargs: dict[str, object] = {}
-                if step.iid_mask is not None:
-                    forward_kwargs["iid_mask"] = step.iid_mask
-                if config.return_per_class:
-                    forward_kwargs["return_per_class"] = True
-
-                out = loss_fn(logits, targets, **forward_kwargs)
-                if isinstance(out, tuple):
-                    loss_val, per_class = out[0], out[1]
-                else:
-                    loss_val, per_class = out, None
-
-                backward_target = loss_val if loss_val.ndim == 0 else loss_val.sum()
-                backward_target.backward()
-
-                prefix = f"{config.name}|dtype={dtype_str}|step={step_index}"
-                assert torch.equal(loss_val.detach(), golden[f"{prefix}|loss"]), (
-                    f"{prefix}|loss: DDP single-process (gather forced, world_size=1) "
-                    f"replay diverged from the golden fixture."
-                )
-                assert torch.equal(logits.grad.detach(), golden[f"{prefix}|grad"]), (
-                    f"{prefix}|grad: DDP single-process (gather forced, world_size=1) "
-                    f"replay diverged from the golden fixture."
-                )
-                if per_class is not None:
-                    assert torch.equal(per_class.detach(), golden[f"{prefix}|per_class"]), (
-                        f"{prefix}|per_class: DDP single-process (gather forced, "
-                        f"world_size=1) replay diverged from the golden fixture."
+        for config_index, config in enumerate(build_grid()):
+            step_results = run_entry(config, config_index, dtype, force_gather=True)
+            for step_key, step_result in step_results.items():
+                prefix = f"{config.name}|dtype={dtype_str}|step={step_key}"
+                for field_name, actual in step_result.items():
+                    assert torch.equal(actual, golden[f"{prefix}|{field_name}"]), (
+                        f"{prefix}|{field_name}: DDP single-process (gather "
+                        f"forced, world_size=1) replay diverged from the "
+                        f"golden fixture."
                     )
 
 
@@ -198,9 +164,11 @@ class _RecordingRankingLoss(_QueuedRankingLoss):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.received_sample_weight: torch.Tensor | None = "unset"  # type: ignore[assignment]
+        self.received_logits: torch.Tensor | None = None
 
-    def _compute_per_class(self, logits, targets, is_iid, is_live, sample_weight):
+    def _compute_per_class(self, logits, targets, is_iid, is_live, sample_weight=None):
         self.received_sample_weight = sample_weight
+        self.received_logits = logits
         loss_vec = logits.sum(dim=0) * 0.0
         valid_vec = torch.ones(self.num_classes, dtype=torch.bool, device=logits.device)
         return loss_vec, valid_vec
@@ -294,12 +262,36 @@ class TestTransport:
         assert received.shape == (self.N - 1,)
         assert torch.allclose(received, weight[1:])
 
-    def test_wrong_shape_raises_value_error(self):
+    def test_wrong_dim0_raises_value_error(self):
         loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=0)
         logits = torch.randn(self.N, self.NUM_CLASSES)
         bad_weight = torch.rand(self.N + 1)
-        with pytest.raises(ValueError, match="sample_weight must be"):
+        with pytest.raises(ValueError, match="sample_weight must match logits dim-0"):
             loss(logits, self._targets(), sample_weight=bad_weight)
+
+    def test_wrong_trailing_shape_raises_value_error(self):
+        # Dim 0 is right but the weight is [N, 1], not [N]: the ranking
+        # contract is exact, no broadcasting.
+        loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=0)
+        logits = torch.randn(self.N, self.NUM_CLASSES)
+        with pytest.raises(ValueError, match="sample_weight must be"):
+            loss(logits, self._targets(), sample_weight=torch.rand(self.N, 1))
+
+    def test_nan_weight_raises_value_error(self):
+        # A NaN weight is the same class of caller-visible misuse as a
+        # negative one: unchecked, it silently produces a NaN loss.
+        loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=0)
+        weight = torch.rand(self.N)
+        weight[2] = float("nan")
+        with pytest.raises(ValueError, match="finite"):
+            loss(torch.randn(self.N, self.NUM_CLASSES), self._targets(), sample_weight=weight)
+
+    def test_inf_weight_raises_value_error(self):
+        loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=0)
+        weight = torch.rand(self.N)
+        weight[0] = float("inf")
+        with pytest.raises(ValueError, match="finite"):
+            loss(torch.randn(self.N, self.NUM_CLASSES), self._targets(), sample_weight=weight)
 
     def test_negative_weight_raises_value_error(self):
         loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=0)
@@ -341,6 +333,103 @@ class TestTransport:
             out = loss(logits, targets, sample_weight=weight)
         assert torch.equal(out, torch.zeros(()))
         assert loss.received_sample_weight == "unset"
+
+    def test_weighted_pool_survives_max_pool_size_subsampling(self):
+        # The weighted subsample rail: with max_pool_size below the pool
+        # size, the weight must be re-indexed by the same selection as the
+        # logits, not dropped or left in the pre-subsample order.
+        n, c = 40, self.NUM_CLASSES
+        loss = _RecordingRankingLoss(num_classes=c, queue_size=0, max_pool_size=20)
+        # Encode each row's original index in logits column 0, exactly as
+        # tests/test_sampling.py does, so a returned row identifies itself.
+        logits = torch.arange(n * c, dtype=torch.float).reshape(n, c)
+        targets = torch.arange(n) % c
+        weight = torch.arange(n, dtype=torch.float) * 0.5
+
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            loss(logits, targets, sample_weight=weight)
+
+        received = loss.received_sample_weight
+        assert received is not None
+        assert received.shape == (20,)
+        assert loss.received_logits.shape == (20, c)
+        for row in range(20):
+            orig_idx = int(loss.received_logits[row, 0].item()) // c
+            assert received[row].item() == pytest.approx(weight[orig_idx].item()), (
+                f"row {row}: pooled weight is misaligned with the subsampled "
+                f"logits (expected weight[{orig_idx}])"
+            )
+
+    @staticmethod
+    def _probe_path(loss, logits, targets) -> bool:
+        """Run one unweighted call in eval mode (no enqueue) and report
+        whether the weighted arithmetic path was selected."""
+        loss.eval()
+        loss(logits, targets)
+        return loss.received_sample_weight is not None
+
+    def test_checkpoint_round_trip_preserves_the_active_arithmetic_path(self):
+        # Which path runs must be a property of the stored rows, so a
+        # save/load cycle can never move an instance between the weighted
+        # and unweighted op sequences (the ULP-level drift the None guard
+        # exists to prevent).
+        logits = torch.randn(self.N, self.NUM_CLASSES)
+        targets = self._targets()
+
+        saved = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=self.N)
+        saved.train()
+        saved(logits, targets, sample_weight=torch.rand(self.N) + 0.5)
+
+        restored = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=self.N)
+        restored.load_state_dict(saved.state_dict(), strict=True)
+
+        probe_logits = torch.randn(self.N, self.NUM_CLASSES)
+        before = self._probe_path(saved, probe_logits, targets)
+        after = self._probe_path(restored, probe_logits, targets)
+        assert before is True, "a weighted queue must select the weighted path"
+        assert after == before, (
+            "a checkpoint round trip changed which arithmetic path runs"
+        )
+
+    def test_checkpoint_round_trip_of_an_unweighted_queue_stays_unweighted(self):
+        # The mirror case: an all-ones weight is arithmetically unweighted,
+        # so neither the live instance nor the reloaded one may switch paths.
+        logits = torch.randn(self.N, self.NUM_CLASSES)
+        targets = self._targets()
+
+        saved = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=self.N)
+        saved.train()
+        saved(logits, targets, sample_weight=torch.ones(self.N))
+
+        restored = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=self.N)
+        restored.load_state_dict(saved.state_dict(), strict=True)
+
+        probe_logits = torch.randn(self.N, self.NUM_CLASSES)
+        before = self._probe_path(saved, probe_logits, targets)
+        after = self._probe_path(restored, probe_logits, targets)
+        assert before is False, "an all-ones weight must not activate the weighted path"
+        assert after == before, (
+            "a checkpoint round trip changed which arithmetic path runs"
+        )
+
+    def test_unweighted_path_restored_once_no_weighted_row_remains(self):
+        # queue_size == N, so each step's enqueue replaces the buffer
+        # wholesale. Once the weighted rows are gone, the loss returns to
+        # the unweighted op sequence rather than paying for it forever.
+        loss = _RecordingRankingLoss(num_classes=self.NUM_CLASSES, queue_size=self.N)
+        loss.train()
+        targets = self._targets()
+        loss(torch.randn(self.N, self.NUM_CLASSES), targets,
+             sample_weight=torch.rand(self.N) + 0.5)
+
+        loss(torch.randn(self.N, self.NUM_CLASSES), targets)
+        assert loss.received_sample_weight is not None  # weighted rows still pooled
+
+        loss(torch.randn(self.N, self.NUM_CLASSES), targets)
+        assert loss.received_sample_weight is None, (
+            "every weighted row has been overwritten by weight-1 rows, so the "
+            "unweighted path must be active again"
+        )
 
     def test_sample_weight_positional_fifth_slot_rejected_on_base(self):
         # sample_weight is keyword-only on _QueuedRankingLoss.forward (spec

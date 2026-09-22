@@ -14,7 +14,13 @@ import torch.distributed as dist
 
 import torch.nn as nn
 
-from imbalanced_losses import PAUCAtBudgetLoss, RecallAtQuantileLoss, SmoothAPLoss
+from imbalanced_losses import (
+    PAUCAtBudgetLoss,
+    RecallAtQuantileLoss,
+    SigmoidFocalLoss,
+    SmoothAPLoss,
+    SoftmaxFocalLoss,
+)
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 from imbalanced_losses.warmup_wrapper import LossWarmupWrapper
 
@@ -450,44 +456,27 @@ class TestVariableSizeGather:
 # ---------------------------------------------------------------------------
 
 
-def _make_pauc_gather_mock(
-    logits_ranks: list[torch.Tensor],
-    targets_ranks: list[torch.Tensor],
-    iid_ranks: list[torch.Tensor],
-    weight_ranks: list[torch.Tensor] | None = None,
-):
+def _make_group_gather_mock(groups: list[list[torch.Tensor]]):
     """
-    Build a side_effect for dist.all_gather that handles the interleaved
-    calls per forward pass (2 calls per tensor: sizes then data):
-      1. sizes gather for logits (int64)
-      2. data gather for logits (padded float32)
-      3. sizes gather for targets (int64)
-      4. data gather for targets (padded int64)
-      5. sizes gather for iid_mask (int64; gathered as uint8)
-      6. data gather for iid_mask (padded uint8)
+    Build a side_effect for ``dist.all_gather`` that serves one gathered
+    tensor per *group*, in order, across the two calls each gather makes.
 
-    When *weight_ranks* is supplied, a 4th group is appended -- the
-    sample_weight gather, immediately after iid_mask and matching its
-    position in ``_QueuedRankingLoss.forward`` (float32, no uint8 cast):
-      7. sizes gather for sample_weight (int64)
-      8. data gather for sample_weight (padded float32)
+    ``distributed.py`` gathers every tensor with two collectives: first the
+    per-rank dim-0 sizes (int64), then the (zero-padded, when sizes differ)
+    data. A forward that gathers G tensors therefore issues 2G calls, and
+    this mock routes them by call index::
 
-    This makes 6 total calls on an unweighted step and 8 on a weighted one.
-    Both the equal-size fast path and the variable-size path make every call
-    in the active group set; _gather_sizes is always called first regardless
-    of whether ranks differ in size. The equal-size fast path skips padding
-    in the data gather, but does NOT skip the sizes gather. The mock routes
-    calls via:
-      group = call_idx // 2  (which tensor group: logits, targets, iid_mask[, weight])
-      phase = call_idx %  2  (0 = sizes call, 1 = data call)
+        group = call_idx // 2   (which tensor: groups[0], groups[1], ...)
+        phase = call_idx %  2   (0 = sizes call, 1 = data call)
+
+    Each element of *groups* is the list of per-rank tensors for one
+    gathered tensor, in rank order; they must be listed in the same order
+    the loss gathers them. The equal-size fast path skips padding in the
+    data call but still issues the sizes call, so the routing holds for
+    both paths.
     """
-    all_tensors = [logits_ranks, targets_ranks, [m.to(torch.uint8) for m in iid_ranks]]
-    if weight_ranks is not None:
-        all_tensors.append(weight_ranks)
-
-    # Pre-compute sizes and padded tensors for each group.
-    groups = []
-    for tensors in all_tensors:
+    prepared = []
+    for tensors in groups:
         sizes = [torch.tensor([t.size(0)], dtype=torch.int64) for t in tensors]
         max_rows = max(t.size(0) for t in tensors)
         padded = []
@@ -498,25 +487,56 @@ def _make_pauc_gather_mock(
                 padded.append(pad)
             else:
                 padded.append(t.clone())
-        groups.append((sizes, padded))
+        prepared.append((sizes, padded))
 
     call_idx = [0]
 
     def _side_effect(output_list, input_tensor):
-        # Determine which group this call belongs to by looking at the call index.
-        # Each group uses 2 calls: sizes then data.
-        group_idx = call_idx[0] // 2
-        is_sizes_call = (call_idx[0] % 2) == 0
-        sizes, padded = groups[group_idx % len(groups)]
-        if is_sizes_call:
-            for i, s in enumerate(sizes):
-                output_list[i].copy_(s)
+        sizes, padded = prepared[(call_idx[0] // 2) % len(prepared)]
+        if call_idx[0] % 2 == 0:
+            for i, size in enumerate(sizes):
+                output_list[i].copy_(size)
         else:
-            for i, p in enumerate(padded):
-                output_list[i].copy_(p.detach())
+            for i, tensor in enumerate(padded):
+                output_list[i].copy_(tensor.detach())
         call_idx[0] += 1
 
     return _side_effect
+
+
+def _make_pauc_gather_mock(
+    logits_ranks: list[torch.Tensor],
+    targets_ranks: list[torch.Tensor],
+    iid_ranks: list[torch.Tensor],
+    weight_ranks: list[torch.Tensor] | None = None,
+):
+    """
+    Gather mock for ``_QueuedRankingLoss.forward``'s tensor order:
+    logits, targets, iid_mask (transported as uint8), and -- only when
+    *weight_ranks* is supplied -- sample_weight, in the position it
+    occupies right after iid_mask. That makes 6 collectives on an
+    unweighted step and 8 on a weighted one.
+    """
+    groups = [logits_ranks, targets_ranks, [m.to(torch.uint8) for m in iid_ranks]]
+    if weight_ranks is not None:
+        groups.append(weight_ranks)
+    return _make_group_gather_mock(groups)
+
+
+def _make_focal_gather_mock(
+    inputs_ranks: list[torch.Tensor],
+    targets_ranks: list[torch.Tensor],
+    weight_ranks: list[torch.Tensor] | None = None,
+):
+    """
+    Gather mock for the focal losses' tensor order: inputs, targets, and --
+    only when *weight_ranks* is supplied -- sample_weight. That makes 4
+    collectives on an unweighted step and 6 on a weighted one.
+    """
+    groups = [inputs_ranks, targets_ranks]
+    if weight_ranks is not None:
+        groups.append(weight_ranks)
+    return _make_group_gather_mock(groups)
 
 
 class TestPAUCGatherDistributed:
@@ -873,6 +893,187 @@ class TestPAUCGatherWeightedDistributed:
             f"({loss_from_pool.item():.8f}) -- the gather is pure transport and must "
             f"not change the weighted arithmetic."
         )
+
+
+# ---------------------------------------------------------------------------
+# Focal-loss sample_weight under mocked multi-rank DDP gather
+#
+# At world_size == 1 the gather helpers return their input unchanged, so a
+# single-process replay cannot tell whether the weight was gathered at all.
+# These tests run against a mocked multi-rank group, where dropping the
+# weight gather leaves an ungathered [N] weight against a gathered
+# [N x world_size] loss.
+# ---------------------------------------------------------------------------
+
+
+class TestFocalGatherWeightedDistributed:
+    """
+    Verify both focal losses gather ``sample_weight`` alongside
+    ``inputs``/``targets``, with the exact collective count (spec section 9:
+    a weighted step adds one no-grad gather; an unweighted step's count is
+    unchanged) and correct alignment across unequal per-rank batch sizes.
+    """
+
+    C = 3
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    def _sigmoid_rank(self, gen, n):
+        inputs = torch.randn(n, self.C, generator=gen)
+        targets = torch.randint(0, 2, (n, self.C), generator=gen).float()
+        # Per-element weight: SigmoidFocalLoss scores every logit
+        # independently, so the weight matches `inputs`, not the row count.
+        weight = torch.rand(n, self.C, generator=gen) * 2.0 + 0.5
+        return inputs, targets, weight
+
+    def _softmax_rank(self, gen, n):
+        inputs = torch.randn(n, self.C, generator=gen)
+        targets = torch.randint(0, self.C, (n,), generator=gen)
+        weight = torch.rand(n, generator=gen) * 2.0 + 0.5
+        return inputs, targets, weight
+
+    def _rank_builder(self, family):
+        return self._sigmoid_rank if family == "sigmoid" else self._softmax_rank
+
+    def _loss(self, family, **kwargs):
+        cls = SigmoidFocalLoss if family == "sigmoid" else SoftmaxFocalLoss
+        loss_fn = cls(reduction="mean", **kwargs)
+        return loss_fn
+
+    @pytest.mark.parametrize("family", ["sigmoid", "softmax"])
+    def test_weighted_step_issues_six_collectives(self, family):
+        """inputs, targets, and weight x (sizes + data)."""
+        from unittest.mock import patch
+
+        gen = torch.Generator().manual_seed(500)
+        build = self._rank_builder(family)
+        r0_x, r0_t, r0_w = build(gen, 12)
+        r1_x, r1_t, r1_w = build(gen, 12)
+        mock = _make_focal_gather_mock([r0_x, r1_x], [r0_t, r1_t], [r0_w, r1_w])
+
+        loss_fn = self._loss(family, gather_distributed=True)
+        loss_fn._gather_resolved = True
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock) as mock_gather:
+            loss_fn(r0_x.detach().requires_grad_(True), r0_t, sample_weight=r0_w)
+
+        assert mock_gather.call_count == 6, (
+            f"expected 6 collectives (inputs, targets, weight x sizes+data) on "
+            f"a weighted focal step, got {mock_gather.call_count}. A missing "
+            f"weight gather leaves the weight misaligned against the gathered "
+            f"batch on every real multi-rank step."
+        )
+
+    @pytest.mark.parametrize("family", ["sigmoid", "softmax"])
+    def test_unweighted_step_issues_four_collectives(self, family):
+        """An unweighted step issues no additional collective."""
+        from unittest.mock import patch
+
+        gen = torch.Generator().manual_seed(501)
+        build = self._rank_builder(family)
+        r0_x, r0_t, _ = build(gen, 12)
+        r1_x, r1_t, _ = build(gen, 12)
+        mock = _make_focal_gather_mock([r0_x, r1_x], [r0_t, r1_t])
+
+        loss_fn = self._loss(family, gather_distributed=True)
+        loss_fn._gather_resolved = True
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock) as mock_gather:
+            loss_fn(r0_x.detach().requires_grad_(True), r0_t)
+
+        assert mock_gather.call_count == 4, (
+            f"expected 4 collectives (inputs, targets x sizes+data) on an "
+            f"unweighted focal step, got {mock_gather.call_count}."
+        )
+
+    @pytest.mark.parametrize("family", ["sigmoid", "softmax"])
+    def test_three_rank_unequal_size_weighted_matches_concatenated_pool(self, family):
+        """
+        3 ranks with unequal sizes -- including a zero-row rank -- pad and
+        trim the weight correctly, and the DDP-gathered weighted loss equals
+        the same loss computed directly on the manually concatenated pool.
+        """
+        from unittest.mock import patch
+
+        gen = torch.Generator().manual_seed(502)
+        build = self._rank_builder(family)
+        r0_x, r0_t, r0_w = build(gen, 12)
+        r1_x, r1_t, r1_w = build(gen, 7)
+        # A zero-row rank is an explicitly supported DDP shape (the last,
+        # unequal batch of an epoch).
+        r2_x, r2_t, r2_w = build(gen, 0)
+
+        inputs_ranks = [r0_x, r1_x, r2_x]
+        targets_ranks = [r0_t, r1_t, r2_t]
+        weight_ranks = [r0_w, r1_w, r2_w]
+        assert len({t.size(0) for t in inputs_ranks}) > 1, "ranks must have unequal sizes"
+
+        mock = _make_focal_gather_mock(inputs_ranks, targets_ranks, weight_ranks)
+        loss_ddp = self._loss(family, gather_distributed=True)
+        loss_ddp._gather_resolved = True
+
+        r0_x_grad = r0_x.detach().requires_grad_(True)
+        with patch.object(dist, "get_world_size", return_value=3), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock):
+            loss_from_ddp = loss_ddp(r0_x_grad, r0_t, sample_weight=r0_w)
+
+        assert torch.isfinite(loss_from_ddp)
+        loss_from_ddp.backward()
+        assert r0_x_grad.grad is not None, "gradient should flow to local-rank inputs"
+        assert r0_x_grad.grad.shape == r0_x.shape
+
+        loss_pool_fn = self._loss(family, gather_distributed=False)
+        loss_from_pool = loss_pool_fn(
+            torch.cat(inputs_ranks, dim=0),
+            torch.cat(targets_ranks, dim=0),
+            sample_weight=torch.cat(weight_ranks, dim=0),
+        )
+        assert torch.equal(loss_from_ddp.detach(), loss_from_pool), (
+            f"DDP-gathered weighted focal loss ({loss_from_ddp.item():.8f}) must "
+            f"equal the loss on the concatenated single-process pool "
+            f"({loss_from_pool.item():.8f}) -- the gather is pure transport."
+        )
+
+    def test_sigmoid_trailing_broadcast_weight_survives_the_gather(self):
+        """
+        A ``[N, 1]`` weight (broadcast over the channel dim) is gathered on
+        dim 0 like any other, so it still lines up with the gathered inputs.
+        This is the shape the narrowed dim-0 contract still accepts.
+        """
+        from unittest.mock import patch
+
+        gen = torch.Generator().manual_seed(503)
+        r0_x, r0_t, _ = self._sigmoid_rank(gen, 9)
+        r1_x, r1_t, _ = self._sigmoid_rank(gen, 5)
+        r0_w = torch.rand(9, 1, generator=gen) + 0.1
+        r1_w = torch.rand(5, 1, generator=gen) + 0.1
+
+        mock = _make_focal_gather_mock([r0_x, r1_x], [r0_t, r1_t], [r0_w, r1_w])
+        loss_ddp = SigmoidFocalLoss(reduction="mean", gather_distributed=True)
+        loss_ddp._gather_resolved = True
+
+        with patch.object(dist, "get_world_size", return_value=2), \
+             patch.object(dist, "get_rank", return_value=0), \
+             patch.object(dist, "all_gather", side_effect=mock) as mock_gather:
+            loss_from_ddp = loss_ddp(r0_x.detach().requires_grad_(True), r0_t,
+                                     sample_weight=r0_w)
+
+        assert mock_gather.call_count == 6
+        loss_pool = SigmoidFocalLoss(reduction="mean", gather_distributed=False)(
+            torch.cat([r0_x, r1_x], dim=0),
+            torch.cat([r0_t, r1_t], dim=0),
+            sample_weight=torch.cat([r0_w, r1_w], dim=0),
+        )
+        assert torch.equal(loss_from_ddp.detach(), loss_pool)
 
 
 # ---------------------------------------------------------------------------

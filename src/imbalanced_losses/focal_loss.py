@@ -13,13 +13,12 @@ Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017.
 
 from __future__ import annotations
 
-import warnings
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from imbalanced_losses._base import _resolve_gather
+from imbalanced_losses._weights import _SampleWeightMixin
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
@@ -27,7 +26,7 @@ from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_gr
 # Sigmoid Focal Loss
 # ---------------------------------------------------------------------------
 
-class SigmoidFocalLoss(nn.Module):
+class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
     """
     Sigmoid Focal Loss as used in RetinaNet.
 
@@ -76,7 +75,6 @@ class SigmoidFocalLoss(nn.Module):
         self.reduction = reduction
         self.gather_distributed = gather_distributed
         self._gather_resolved: bool | None = None
-        self._sample_weight_warned = False
 
     def _should_gather(self) -> bool:
         if self._gather_resolved is None:
@@ -98,13 +96,18 @@ class SigmoidFocalLoss(nn.Module):
         targets : Tensor
             Same shape, float 0/1 labels.
         sample_weight : Tensor, optional
-            Per-element weight, broadcastable to ``inputs``. ``None``
-            (default) leaves the objective unweighted -- when no weight has
-            ever been supplied to this instance, the loss and its gradient
-            are bitwise identical to the pre-``sample_weight`` release. When
-            provided, must be non-negative and broadcastable to ``inputs``;
-            it is detached on entry and never carries gradient. Under DDP
-            (``gather_distributed``), all ranks must agree on whether
+            Per-element weight. Dim 0 must equal ``inputs.size(0)``;
+            trailing dims may broadcast (e.g. ``[N, 1, H, W]`` against
+            ``[N, C, H, W]``). ``None`` (default) leaves the objective
+            unweighted -- when no weight has ever been supplied to this
+            instance, the loss and its gradient are bitwise identical to
+            the pre-``sample_weight`` release. When provided, must be
+            non-negative and finite; it is detached on entry, cast to the
+            loss dtype, and never carries gradient. The full dim-0 extent
+            is required because ``gather_distributed`` concatenates the
+            weight along dim 0: a weight that broadcast over dim 0 would
+            validate on one rank and then misalign against the gathered
+            batch. Under DDP, all ranks must agree on whether
             ``sample_weight`` is supplied on a given step -- a mismatch
             desynchronizes the collectives across ranks.
 
@@ -114,14 +117,16 @@ class SigmoidFocalLoss(nn.Module):
             Scalar or per-element loss depending on ``reduction``.
         """
         if sample_weight is not None:
-            try:
-                sample_weight.expand(inputs.shape)
-            except RuntimeError:
-                raise ValueError(
-                    f"sample_weight must be broadcastable to inputs, "
-                    f"got {tuple(sample_weight.shape)} vs inputs {tuple(inputs.shape)}"
-                ) from None
-        sample_weight = _validate_sample_weight(self, sample_weight)
+            # Guarded: inputs.size(0) is only defined for a batched input,
+            # and an unweighted call must reach the pre-sample_weight path
+            # without touching the input's shape at all.
+            sample_weight = self._check_sample_weight(
+                sample_weight,
+                dim0=inputs.size(0),
+                dtype=inputs.dtype,
+                reference="inputs",
+                broadcast_shape=inputs.shape,
+            )
 
         if self._should_gather():
             inputs  = all_gather_with_grad(inputs)
@@ -138,14 +143,22 @@ class SigmoidFocalLoss(nn.Module):
             alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
             loss = alpha_t * loss
 
-        return _reduce(loss, self.reduction, sample_weight=sample_weight)
+        # No validity mask exists for the sigmoid case: every element of
+        # `inputs` is a real prediction, so 'mean' averages over all of them.
+        if self.reduction == "none":
+            return _reduce_none(loss, sample_weight)
+        if self.reduction == "mean":
+            return _reduce_mean_all(loss, sample_weight)
+        if self.reduction == "sum":
+            return _reduce_sum(loss, sample_weight)
+        raise _invalid_reduction(self.reduction)
 
 
 # ---------------------------------------------------------------------------
 # Softmax Focal Loss
 # ---------------------------------------------------------------------------
 
-class SoftmaxFocalLoss(nn.Module):
+class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
     """
     Softmax Focal Loss for mutually-exclusive multiclass classification.
 
@@ -212,7 +225,6 @@ class SoftmaxFocalLoss(nn.Module):
         self.background_class = background_class
         self.gather_distributed = gather_distributed
         self._gather_resolved: bool | None = None
-        self._sample_weight_warned = False
 
         if alpha is not None:
             alpha = torch.as_tensor(alpha, dtype=torch.float32)
@@ -247,9 +259,10 @@ class SoftmaxFocalLoss(nn.Module):
             (default) leaves the objective unweighted -- when no weight has
             ever been supplied to this instance, the loss and its gradient
             are bitwise identical to the pre-``sample_weight`` release. When
-            provided, must be non-negative and match ``targets`` exactly; it
-            is detached on entry and never carries gradient. ``ignore_index``
-            rows contribute nothing regardless of weight. Under DDP
+            provided, must be non-negative, finite, and match ``targets``
+            exactly; it is detached on entry, cast to the loss dtype, and
+            never carries gradient. ``ignore_index`` rows contribute
+            nothing regardless of weight. Under DDP
             (``gather_distributed``), all ranks must agree on whether
             ``sample_weight`` is supplied on a given step -- a mismatch
             desynchronizes the collectives across ranks.
@@ -259,12 +272,13 @@ class SoftmaxFocalLoss(nn.Module):
         Tensor
             Scalar or per-sample loss depending on ``reduction``.
         """
-        if sample_weight is not None and sample_weight.shape != targets.shape:
-            raise ValueError(
-                f"sample_weight must match targets shape, "
-                f"got {tuple(sample_weight.shape)} vs targets {tuple(targets.shape)}"
-            )
-        sample_weight = _validate_sample_weight(self, sample_weight)
+        sample_weight = self._check_sample_weight(
+            sample_weight,
+            dim0=targets.size(0),
+            dtype=inputs.dtype,
+            reference="targets",
+            exact_shape=targets.shape,
+        )
 
         if self._should_gather():
             inputs  = all_gather_with_grad(inputs)
@@ -311,18 +325,32 @@ class SoftmaxFocalLoss(nn.Module):
         loss = loss * valid_mask
 
         # ---- 6. Reduction ----------------------------------------------------
-        # 'mean' is routed through _reduce like every other mode (rather than
-        # short-circuited inline) so its denominator picks up sample_weight
-        # the same way 'mean_positive' does below.
+        # `loss` already has ignore_index positions zeroed (step 5), so every
+        # mode's numerator is the full sum; the modes differ only in which
+        # index set normalises it.
+        if self.reduction == "none":
+            return _reduce_none(loss, sample_weight)
+        if self.reduction == "mean":
+            return _reduce_mean_masked(loss, valid_mask, sample_weight)
         if self.reduction == "mean_positive":
             positive_mask = valid_mask & (targets != self.background_class)
-            return _reduce(loss, "mean_positive", valid_mask, positive_mask, sample_weight=sample_weight)
-
-        return _reduce(loss, self.reduction, valid_mask, sample_weight=sample_weight)
+            return _reduce_mean_masked(loss, positive_mask, sample_weight)
+        if self.reduction == "sum":
+            return _reduce_sum(loss, sample_weight)
+        raise _invalid_reduction(self.reduction)
 
 
 # ---------------------------------------------------------------------------
-# Shared reduction helper
+# Shared reduction helpers
+#
+# One function per reduction mode, each with a single `sample_weight is None`
+# guard.  The `None` branch is the pre-``sample_weight`` arithmetic, run
+# op-for-op; the weighted branch is always "weighted sum over a weight-mass
+# denominator".  Which index set the denominator covers is the caller's
+# decision -- it is the caller that knows whether 'mean' means "over every
+# element" (sigmoid) or "over the valid ones" (softmax), and that
+# `mean_positive` normalises by positives while still summing negatives into
+# the numerator (the RetinaNet asymmetry).
 # ---------------------------------------------------------------------------
 
 def _floor_zero_mass(mass: torch.Tensor) -> torch.Tensor:
@@ -339,113 +367,59 @@ def _floor_zero_mass(mass: torch.Tensor) -> torch.Tensor:
     return torch.where(mass > 0, mass, torch.ones_like(mass))
 
 
-def _reduce(
-    loss: torch.Tensor,
-    reduction: str,
-    valid_mask: torch.Tensor | None = None,
-    positive_mask: torch.Tensor | None = None,
-    sample_weight: torch.Tensor | None = None,
+def _reduce_none(
+    loss: torch.Tensor, sample_weight: torch.Tensor | None
 ) -> torch.Tensor:
-    """Apply reduction, handling valid/positive masks and an optional weight.
-
-    For 'mean_positive', the numerator sums over ALL valid positions (negatives
-    included) but the denominator counts only positive positions.  This matches
-    the RetinaNet convention where alpha-weighted negative loss still contributes
-    but the normalisation is anchored to the positive count.
-
-    When `sample_weight` is supplied (already broadcastable/aligned with
-    `loss`, per spec S4.1), every count-normalised denominator becomes the
-    weight mass over the same index set the count covered: valid elements
-    for 'mean', positive elements for 'mean_positive'.  `sample_weight is
-    None` is the structural unweighted path -- it runs the exact
-    pre-``sample_weight`` arithmetic below, unchanged.
-
-    A zero weight mass is floored to 1, mirroring the unweighted
-    convention's `.clamp(min=1)` (see `_floor_zero_mass`) rather than an
-    `eps` floor -- an `eps` floor blows up under the RetinaNet asymmetry,
-    where `mean_positive`'s numerator can be nonzero (negatives' weighted
-    loss) even when the positive weight mass is structurally zero (an
-    all-background batch).
-    """
-    if reduction == "none":
-        if sample_weight is not None:
-            return loss * sample_weight
+    """Per-element loss, scaled by the weight when there is one."""
+    if sample_weight is None:
         return loss
-    elif reduction == "mean":
-        if sample_weight is not None:
-            weight_mass = (
-                sample_weight * valid_mask
-                if valid_mask is not None
-                else sample_weight.expand_as(loss)
-            )
-            denom = _floor_zero_mass(weight_mass.sum())
-            return (loss * sample_weight).sum() / denom
-        if valid_mask is not None:
-            return loss.sum() / valid_mask.sum().clamp(min=1)
-        return loss.mean()
-    elif reduction == "mean_positive":
-        if sample_weight is not None:
-            weight_mass = sample_weight * positive_mask
-            denom = _floor_zero_mass(weight_mass.sum())
-            return (loss * sample_weight).sum() / denom
-        n_positive = positive_mask.sum().clamp(min=1)
-        return loss.sum() / n_positive
-    elif reduction == "sum":
-        if sample_weight is not None:
-            return (loss * sample_weight).sum()
+    return loss * sample_weight
+
+
+def _reduce_sum(
+    loss: torch.Tensor, sample_weight: torch.Tensor | None
+) -> torch.Tensor:
+    """Total loss, weighted when there is a weight."""
+    if sample_weight is None:
         return loss.sum()
-    raise ValueError(
+    return (loss * sample_weight).sum()
+
+
+def _reduce_mean_all(
+    loss: torch.Tensor, sample_weight: torch.Tensor | None
+) -> torch.Tensor:
+    """Mean over every element of *loss* (no validity mask in play).
+
+    Unweighted this is ``loss.mean()``; weighted it is the weighted sum over
+    the weight mass of the same elements.
+    """
+    if sample_weight is None:
+        return loss.mean()
+    mass = sample_weight.expand_as(loss).sum()
+    return (loss * sample_weight).sum() / _floor_zero_mass(mass)
+
+
+def _reduce_mean_masked(
+    loss: torch.Tensor, mask: torch.Tensor, sample_weight: torch.Tensor | None
+) -> torch.Tensor:
+    """Sum of *loss* over a denominator restricted to *mask*.
+
+    The numerator is always the full ``loss`` sum -- callers zero out the
+    elements that must not contribute before calling.  Only the denominator
+    is restricted to *mask*: the element count under *mask* unweighted, the
+    weight mass under *mask* weighted.  ``mask=valid_mask`` gives 'mean';
+    ``mask=positive_mask`` gives 'mean_positive' with its numerator still
+    summing the (non-masked-out) negatives.
+    """
+    if sample_weight is None:
+        return loss.sum() / mask.sum().clamp(min=1)
+    mass = (sample_weight * mask).sum()
+    return (loss * sample_weight).sum() / _floor_zero_mass(mass)
+
+
+def _invalid_reduction(reduction: str) -> ValueError:
+    """Build the error raised for an unsupported ``reduction`` string."""
+    return ValueError(
         f"Invalid reduction: '{reduction}'. "
         "Supported modes: 'none', 'mean', 'mean_positive', 'sum'."
     )
-
-
-# ---------------------------------------------------------------------------
-# Shared sample_weight validation
-# ---------------------------------------------------------------------------
-
-def _validate_sample_weight(
-    module: nn.Module,
-    sample_weight: torch.Tensor | None,
-) -> torch.Tensor | None:
-    """Detach, reject negatives, and one-shot-warn on an all-zero weight.
-
-    Shared by ``SigmoidFocalLoss`` and ``SoftmaxFocalLoss`` after each has
-    already checked its own shape contract (broadcastable-to-inputs for
-    Sigmoid, exact ``targets`` shape for Softmax) and raised its own
-    shape-specific ``ValueError``. Mirrors the validation/warning idiom in
-    ``_base.py::_QueuedRankingLoss.forward`` (detach on entry, raise on any
-    negative value, one-shot ``UserWarning`` on a wholly-zero tensor)
-    without importing from it -- focal losses have their own forward flow
-    and gather block.
-    """
-    if sample_weight is None:
-        return None
-    # Detach immediately -- sample_weight never carries or receives
-    # gradient, and every downstream touch point assumes this.
-    sample_weight = sample_weight.detach()
-    # Both reductions below are undefined/vacuous on an empty tensor
-    # (.min() raises; .all() is trivially True). A zero-row call must fall
-    # through untouched, not raise or spuriously warn here.
-    if sample_weight.numel() > 0:
-        min_val = sample_weight.min()
-        if min_val < 0:
-            raise ValueError(
-                f"sample_weight must be non-negative, got min {min_val.item()}"
-            )
-        if bool((sample_weight == 0).all()):
-            if not module._sample_weight_warned:
-                warnings.warn(
-                    f"{type(module).__name__}: sample_weight is entirely zero for this "
-                    f"call, a likely misconfiguration; the reduction denominator is "
-                    f"floored, yielding a zero loss. "
-                    f"(This warning is shown once per instance.)",
-                    UserWarning,
-                    # One frame deeper than _base.py's direct warnings.warn
-                    # call (this helper is invoked from forward, not inlined
-                    # in it), so stacklevel=3 -- not 2 -- is what points the
-                    # warning at the user's call site rather than at forward.
-                    stacklevel=3,
-                )
-                module._sample_weight_warned = True
-    return sample_weight

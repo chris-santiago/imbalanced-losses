@@ -255,7 +255,10 @@ def _make_logits(
 
 
 def run_entry(
-    config: GoldenConfig, config_index: int, dtype: torch.dtype
+    config: GoldenConfig,
+    config_index: int,
+    dtype: torch.dtype,
+    force_gather: bool = False,
 ) -> dict[str, dict[str, torch.Tensor]]:
     """
     Instantiate ``config.loss_cls`` once and replay every step in sequence.
@@ -263,6 +266,22 @@ def run_entry(
     The loss instance (and its memory queue, for queued losses) carries
     state across steps within this call, matching how the queue evolves
     across consecutive training steps.
+
+    Parameters
+    ----------
+    config, config_index, dtype
+        The grid entry to replay; *config_index* must be the config's
+        position in ``build_grid()`` so the generated logits line up with
+        the capture.
+    force_gather : bool, optional
+        When True, set ``_gather_resolved = True`` on the loss so every
+        forward calls the real (unmocked) DDP gather helpers instead of the
+        auto-detect result. The capture always runs with this False (no
+        process group is initialized at capture time). A replay under a
+        single-process ``gloo`` group sets it True: at ``world_size == 1``
+        the gather helpers return their input unchanged, so the results
+        must still match the fixture bit-for-bit. Never affects what the
+        default path computes, so it does not invalidate the fixture.
 
     Returns
     -------
@@ -272,6 +291,8 @@ def run_entry(
     """
     loss_fn = config.loss_cls(**config.loss_kwargs).to(dtype)
     loss_fn.train()
+    if force_gather:
+        loss_fn._gather_resolved = True
 
     results: dict[str, dict[str, torch.Tensor]] = {}
     for step_index, step in enumerate(config.steps):

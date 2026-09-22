@@ -49,9 +49,9 @@ If the entire `sample_weight` tensor supplied on a call is zero, that is very li
 
 When a ranking loss's pool exceeds `max_pool_size`, `subsample_pool` selects rows uniformly at random within each class's quota. It does not look at `sample_weight` when deciding what to keep or drop. A handful of very high-weight rows can be discarded at exactly the same rate as low-weight rows in the same class. This is a known limitation (weight-aware subsampling is a logged follow-up, not yet built): if your weights are highly skewed and `max_pool_size` triggers often, either raise `max_pool_size` to reduce how often subsampling fires, or monitor whether high-value rows are being systematically underrepresented in your effective training signal.
 
-**Negative weights raise; the pAUC diagnostics stay unweighted**
+**Negative and non-finite weights raise; the pAUC diagnostics stay unweighted**
 
-`sample_weight` must be non-negative. A negative value anywhere in the tensor raises `ValueError` at `forward`, since it is caller-visible misuse rather than a degenerate-but-valid state. Separately, `PAUCAtBudgetLoss`'s `return_diagnostics=True` statistics (`pauc_var`, `band_neg_count`, `grad_pos_count`) are computed exactly as they are unweighted. They describe the pool's ranking geometry, not the weighted objective, and a weighted `pauc_var` is a logged follow-up.
+`sample_weight` must be non-negative and finite. A negative, `NaN`, or `inf` value anywhere in the tensor raises `ValueError` at `forward`, since all three are caller-visible misuse rather than a degenerate-but-valid state. `NaN` is worth calling out separately: an unchecked `NaN` weight produces a `NaN` loss and a `NaN` gradient with no error and no warning, which is the same silent failure the negative check exists to prevent. Zero, by contrast, is a legitimate weight and takes the degenerate path described above. Separately, `PAUCAtBudgetLoss`'s `return_diagnostics=True` statistics (`pauc_var`, `band_neg_count`, `grad_pos_count`) are computed exactly as they are unweighted. They describe the pool's ranking geometry, not the weighted objective, and a weighted `pauc_var` is a logged follow-up.
 
 ---
 

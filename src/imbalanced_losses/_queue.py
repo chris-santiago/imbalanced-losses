@@ -4,12 +4,62 @@ Circular memory queue for ranking losses.
 Used internally by SmoothAPLoss and RecallAtQuantileLoss to accumulate
 (logits, targets) pairs across batches for stable gradient estimates at
 low positive rates.
+
+Also defines :class:`PooledBatch`, the fixed shape every pooled
+(live batch + queue) rail passes around: ``_MemoryQueue.merge`` produces
+it, ``_sampling.subsample_pool`` re-indexes it, and
+``_QueuedRankingLoss.forward`` consumes it.
 """
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 import torch.nn as nn
+
+
+class PooledBatch(NamedTuple):
+    """One pooled ranking batch: live rows first, queue rows after.
+
+    Every field is aligned row-for-row.  The optional fields are ``None``
+    when that tensor is not in play for this call -- notably
+    ``sample_weight`` is ``None`` exactly when the unweighted code path is
+    active -- and every rail that re-indexes a batch must carry each
+    supplied tensor through with the same index (see :meth:`index`), so a
+    tensor can never be silently dropped by a rail that did not expect it.
+
+    Attributes
+    ----------
+    logits : torch.Tensor, shape [M, C]
+    targets : torch.Tensor, shape [M]
+    is_iid : torch.Tensor, shape [M], dtype=bool, optional
+        Per-row iid-eligibility flag.
+    sample_weight : torch.Tensor, shape [M], optional
+        Per-row weight.  ``None`` iff the unweighted path is active.
+    """
+
+    logits: torch.Tensor
+    targets: torch.Tensor
+    is_iid: torch.Tensor | None = None
+    sample_weight: torch.Tensor | None = None
+
+    def index(self, idx: torch.Tensor) -> PooledBatch:
+        """Select rows by *idx* from every tensor this batch carries.
+
+        Parameters
+        ----------
+        idx : torch.Tensor
+            Boolean mask or index tensor applied to dim 0 of every field.
+        """
+        return PooledBatch(
+            logits=self.logits[idx],
+            targets=self.targets[idx],
+            is_iid=None if self.is_iid is None else self.is_iid[idx],
+            sample_weight=(
+                None if self.sample_weight is None else self.sample_weight[idx]
+            ),
+        )
 
 
 class _MemoryQueue(nn.Module):
@@ -44,9 +94,14 @@ class _MemoryQueue(nn.Module):
         self.num_classes = num_classes
         self.ignore_index = ignore_index
 
-        # Tracks whether any stored row was ever enqueued with an explicit
-        # sample_weight. Not persisted in the state dict -- reconstructed
-        # from the loaded _q_weight buffer in _load_from_state_dict.
+        # Whether the buffer currently holds a row whose stored weight is
+        # not 1.  One definition, evaluated from the buffer itself at every
+        # point the buffer can change (enqueue, reset, checkpoint load), so
+        # it is a property of the stored rows rather than of the call
+        # history: overwriting every weighted row with unweighted rows
+        # returns the queue -- and the loss -- to the unweighted path, and
+        # a state_dict round trip cannot move an instance between the
+        # weighted and unweighted op sequences.  Not itself persisted.
         self.has_weights = False
 
         if queue_size > 0:
@@ -82,10 +137,16 @@ class _MemoryQueue(nn.Module):
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
         )
-        # has_weights is not itself persisted -- reconstruct it from the
-        # loaded buffer so a weighted checkpoint restores has_weights=True.
-        if self.queue_size > 0:
-            self.has_weights = bool((self._q_weight != 1).any())
+        self._refresh_has_weights()
+
+    # ------------------------------------------------------------------
+    # Internal state
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _refresh_has_weights(self) -> None:
+        """Re-evaluate :attr:`has_weights` from the stored weights."""
+        self.has_weights = self.queue_size > 0 and bool((self._q_weight != 1).any())
 
     # ------------------------------------------------------------------
     # Properties
@@ -126,8 +187,9 @@ class _MemoryQueue(nn.Module):
             Per-row weight to store alongside the batch.  When ``None``,
             the whole batch is stored at weight 1.0 via a scalar fill (no
             same-shape ones tensor is allocated).  Stored detached.
-            Supplying a non-``None`` weight (including an explicit
-            all-ones tensor) sets :attr:`has_weights` to ``True``.
+            :attr:`has_weights` is re-evaluated from the buffer afterwards,
+            so an explicit all-ones weight leaves it ``False`` and a batch
+            that overwrites the last non-unit row clears it.
 
         Notes
         -----
@@ -153,7 +215,6 @@ class _MemoryQueue(nn.Module):
             weight = None
         else:
             weight = sample_weight.detach().to(dtype=logits.dtype)
-            self.has_weights = True
 
         if n >= self.queue_size:
             self._q_logits.copy_(logits.detach()[-self.queue_size:])
@@ -164,6 +225,7 @@ class _MemoryQueue(nn.Module):
             else:
                 self._q_weight.copy_(weight[-self.queue_size:])
             self._q_ptr.zero_()
+            self._refresh_has_weights()
             return
 
         ptr = int(self._q_ptr)
@@ -194,19 +256,15 @@ class _MemoryQueue(nn.Module):
             self._q_iid[:second]     = iid[first:]
 
         self._q_ptr.fill_((ptr + n) % self.queue_size)
+        self._refresh_has_weights()
 
     def merge(
         self,
         logits: torch.Tensor,
         targets: torch.Tensor,
         is_iid: torch.Tensor | None = None,
-        return_iid: bool = False,
         sample_weight: torch.Tensor | None = None,
-    ) -> (
-        tuple[torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+    ) -> PooledBatch:
         """
         Concatenate the live batch with the current queue contents.
 
@@ -216,84 +274,57 @@ class _MemoryQueue(nn.Module):
         targets : torch.Tensor, shape [N]
         is_iid : torch.Tensor, shape [N], dtype=bool, optional
             Per-row iid flag for the live batch.  When ``None``, the live
-            batch is treated as all-iid.  Only consulted when
-            ``return_iid=True``.
-        return_iid : bool, optional
-            When ``False`` (default), return the 2-tuple
-            ``(all_logits, all_targets)`` exactly as before this extension
-            (backward compatible).  When ``True``, return the 3-tuple
-            ``(all_logits, all_targets, all_is_iid)`` where ``all_is_iid``
-            has the live-batch flags (or all-True if ``is_iid=None``)
-            prepended to the stored ``_q_iid``, aligned row-for-row with
-            the returned logits/targets.
+            batch is treated as all-iid and the flag is synthesized.
         sample_weight : torch.Tensor, shape [N], optional
-            Per-row weight for the live batch.  Only consulted when
-            ``return_iid=True``.  When ``None`` (default), the returned
-            tuple arity is unchanged from before this parameter existed
-            (2-tuple or 3-tuple).  When provided alongside
-            ``return_iid=True``, the 4-tuple
-            ``(all_logits, all_targets, all_is_iid, all_weight)`` is
-            returned, with ``all_weight`` holding the live weights
-            (cast to ``logits.dtype``) prepended to the stored
-            ``_q_weight``, aligned row-for-row with the returned
-            logits/targets.
+            Per-row weight for the live batch.  When ``None`` (default),
+            the returned batch carries ``sample_weight=None`` -- the
+            structural unweighted path, in which no weight tensor is
+            materialized at all.  When provided, the returned weight holds
+            the live weights (detached, cast to ``logits.dtype``) prepended
+            to the stored ``_q_weight``.
 
         Returns
         -------
-        all_logits : torch.Tensor, shape [N + Q, C]
-            Live logits followed by queue logits (cast to matching
-            device/dtype). Q = queue_size; unfilled slots have
-            ignore_index targets and are filtered downstream.
-        all_targets : torch.Tensor, shape [N + Q]
-        all_is_iid : torch.Tensor, shape [N + Q], dtype=bool
-            Only present when ``return_iid=True``.
-        all_weight : torch.Tensor, shape [N + Q]
-            Only present when ``return_iid=True`` and ``sample_weight`` is
-            not ``None``.
+        PooledBatch
+            ``logits``/``targets`` are the live rows followed by the queue
+            rows (``[N + Q, C]`` / ``[N + Q]``; Q = queue_size, unfilled
+            slots carry ignore_index targets and are filtered downstream).
+            ``is_iid`` is always populated and aligned row-for-row.
+            ``sample_weight`` is populated exactly when one was supplied.
 
         Notes
         -----
-        When ``queue_size == 0`` the inputs are returned unchanged (no copy).
-        For ``return_iid=True`` with ``queue_size == 0``, the synthesized
-        live iid tensor (or the supplied ``is_iid``) is returned as the
-        third element, and ``sample_weight`` (detached, cast to
-        ``logits.dtype`` -- matching the ``queue_size > 0`` branch) as the
-        fourth when supplied.
+        When ``queue_size == 0`` the live ``logits``/``targets`` are
+        returned unchanged (no copy).
         """
-        if self.queue_size == 0:
-            if not return_iid:
-                return logits, targets
-            live_iid = (
-                torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
-                if is_iid is None
-                else is_iid
-            )
-            if sample_weight is None:
-                return logits, targets, live_iid
-            return logits, targets, live_iid, sample_weight.detach().to(dtype=logits.dtype)
-
-        q_logits  = self._q_logits.to(device=logits.device, dtype=logits.dtype)
-        q_targets = self._q_targets.to(device=targets.device)
-        all_logits  = torch.cat([logits, q_logits], dim=0)
-        all_targets = torch.cat([targets, q_targets], dim=0)
-
-        if not return_iid:
-            return all_logits, all_targets
-
         live_iid = (
             torch.ones(logits.size(0), dtype=torch.bool, device=logits.device)
             if is_iid is None
             else is_iid
         )
-        q_iid = self._q_iid.to(device=logits.device)
-        all_is_iid = torch.cat([live_iid, q_iid], dim=0)
+        live_weight = (
+            None
+            if sample_weight is None
+            else sample_weight.detach().to(dtype=logits.dtype)
+        )
 
-        if sample_weight is None:
-            return all_logits, all_targets, all_is_iid
+        if self.queue_size == 0:
+            return PooledBatch(logits, targets, live_iid, live_weight)
 
-        q_weight = self._q_weight.to(device=logits.device, dtype=logits.dtype)
-        all_weight = torch.cat([sample_weight.detach().to(dtype=logits.dtype), q_weight], dim=0)
-        return all_logits, all_targets, all_is_iid, all_weight
+        q_logits  = self._q_logits.to(device=logits.device, dtype=logits.dtype)
+        q_targets = self._q_targets.to(device=targets.device)
+        q_iid     = self._q_iid.to(device=logits.device)
+        all_weight = None
+        if live_weight is not None:
+            q_weight = self._q_weight.to(device=logits.device, dtype=logits.dtype)
+            all_weight = torch.cat([live_weight, q_weight], dim=0)
+
+        return PooledBatch(
+            logits=torch.cat([logits, q_logits], dim=0),
+            targets=torch.cat([targets, q_targets], dim=0),
+            is_iid=torch.cat([live_iid, q_iid], dim=0),
+            sample_weight=all_weight,
+        )
 
     @torch.no_grad()
     def reset(self) -> None:
