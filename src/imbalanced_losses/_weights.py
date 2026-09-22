@@ -61,8 +61,9 @@ def _caller_stacklevel() -> int:
         level += 1
     # Every frame on the stack belongs to the library or to torch, which
     # happens only when there is no user frame to blame (an import-time
-    # call).  Point at the outermost frame rather than guessing.
-    return level
+    # call).  The loop has advanced ``level`` one past the last frame, so
+    # step back to point at the outermost frame rather than guessing.
+    return level - 1
 
 
 class _SampleWeightMixin:
