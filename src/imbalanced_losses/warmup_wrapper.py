@@ -212,19 +212,18 @@ class LossWarmupWrapper(nn.Module):
 
         self._has_temperature: bool = hasattr(main_loss, "temperature")
         self._has_reset_queue: bool = hasattr(main_loss, "reset_queue")
-        # What warmup_loss can be called with, decided once. Guarded with the
-        # same hasattr idiom the constructor uses for main_loss rather than
-        # assuming the nn.Module annotation holds.
-        self._warmup_params: frozenset[str] = frozenset()
-        self._warmup_takes_var_keyword: bool = False
+        # Whether warmup_loss can be handed a sample_weight, decided once.
+        # A loss qualifies by declaring the parameter by name or by
+        # declaring **kwargs (which a loss that forwards its kwargs on does).
+        # Guarded with the same hasattr idiom the constructor uses for
+        # main_loss rather than assuming the nn.Module annotation holds.
+        self._warmup_accepts_sample_weight: bool = False
         if hasattr(warmup_loss, "forward"):
             params = inspect.signature(warmup_loss.forward).parameters.values()
-            self._warmup_params = frozenset(
-                p.name for p in params
-                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-            )
-            self._warmup_takes_var_keyword = any(
-                p.kind is p.VAR_KEYWORD for p in params
+            self._warmup_accepts_sample_weight = any(
+                (p.name == "sample_weight" and p.kind is not p.VAR_POSITIONAL)
+                or p.kind is p.VAR_KEYWORD
+                for p in params
             )
 
         if not self._has_temperature:
@@ -505,13 +504,22 @@ class LossWarmupWrapper(nn.Module):
             Additional keyword arguments forwarded to ``main_loss`` in every
             phase (warmup-ended, blend, and main), e.g. ``return_per_class=True``
             or ``sample_weight=...``.  ``warmup_loss`` only ever receives
-            each keyword argument that its ``forward`` declares by name (or
-            all of them, when its ``forward`` declares ``**kwargs``), decided
-            once in ``__init__``; anything it cannot accept is dropped.
+            ``sample_weight``, and only when its ``forward`` declares that
+            parameter by name or declares ``**kwargs`` (decided once in
+            ``__init__``).  No other keyword argument reaches ``warmup_loss``
+            in any phase: an argument that changes what ``warmup_loss``
+            returns would break the blend step's scalar arithmetic and make
+            the warmup phase's return arity depend on the warmup loss's
+            signature.
 
         Returns
         -------
         torch.Tensor or tuple
+            The return shape tracks ``main_loss`` whenever ``main_loss`` is
+            called, i.e. in the blend and main phases.  During the pure
+            warmup phase the wrapper returns ``warmup_loss``'s scalar, so
+            return-shape keyword arguments have no effect there.
+
             During warmup: scalar tensor from ``warmup_loss``.  During blend:
             ``(1 - w) * warmup_loss(...) + w * main_loss(...)``, a scalar
             tensor.  If ``main_loss`` returns a tuple instead (e.g.
@@ -548,6 +556,15 @@ class LossWarmupWrapper(nn.Module):
         if w >= 1.0:
             return self.main_loss(logits, targets, **kwargs)
         warmup_out = self.warmup_loss(logits, targets, **self._warmup_kwargs(kwargs))
+        if isinstance(warmup_out, tuple):
+            # Only sample_weight ever reaches warmup_loss, so nothing the
+            # wrapper sends can make it return a tuple -- but a loss that
+            # returns one unconditionally must still blend rather than
+            # raise. Its leading element is the scalar loss by the same
+            # convention main_loss follows; the rest has no warmup-side
+            # meaning here and is dropped, since the returned extras track
+            # main_loss.
+            warmup_out = warmup_out[0]
         main_out = self.main_loss(logits, targets, **kwargs)
         if isinstance(main_out, tuple):
             main_loss_value, *main_extra = main_out
@@ -558,20 +575,27 @@ class LossWarmupWrapper(nn.Module):
     def _warmup_kwargs(self, kwargs: dict) -> dict:
         """
         Select the subset of ``forward``'s ``**kwargs`` that ``warmup_loss``
-        can actually accept.
+        should receive.
 
-        A keyword argument is forwarded when ``warmup_loss.forward`` declares
-        a parameter of that name, or declares ``**kwargs`` of its own (in
-        which case everything is forwarded, since such a loss can route what
-        it understands and ignore the rest).  Everything else is dropped, so
-        a warmup loss that declares neither (e.g. ``nn.CrossEntropyLoss``) is
-        never called with an argument it does not accept.
+        Only ``sample_weight`` is ever eligible, and only when
+        ``warmup_loss.forward`` declares it by name or declares ``**kwargs``
+        of its own (decided once in ``__init__``).  Every other keyword
+        argument is dropped, so a non-declaring ``warmup_loss`` (e.g.
+        ``nn.CrossEntropyLoss``) is never called with an argument it does
+        not accept.
 
-        Nothing here is coupled to any particular argument name: the wrapper
-        is a phase scheduler, and which keyword arguments a loss takes is the
-        loss's business.
+        The narrowness is deliberate, not an oversight. This wrapper does
+        arithmetic on ``warmup_loss``'s return value during the blend
+        phase, so an argument that changes what ``warmup_loss`` *returns*
+        (``return_per_class``, ``return_diagnostics``) must not cross:
+        forwarding it would hand the blend a tuple instead of a scalar, and
+        would make the warmup phase's return arity depend on the warmup
+        loss's signature. ``sample_weight`` is the one argument the wrapper
+        knows to be return-shape-neutral, which is what makes it safe to
+        forward. Widening this set means deciding what the extra argument
+        does to the return shape first.
         """
-        if self._warmup_takes_var_keyword:
-            return dict(kwargs)
-        return {k: v for k, v in kwargs.items() if k in self._warmup_params}
+        if self._warmup_accepts_sample_weight and "sample_weight" in kwargs:
+            return {"sample_weight": kwargs["sample_weight"]}
+        return {}
 

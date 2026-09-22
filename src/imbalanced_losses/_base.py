@@ -318,12 +318,8 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
                 f"iid_mask must be [N] matching logits dim-0, "
                 f"got {tuple(iid_mask.shape)} vs N={logits.size(0)}"
             )
-        sample_weight = self._check_sample_weight(
-            sample_weight,
-            dim0=logits.size(0),
-            dtype=logits.dtype,
-            reference="logits",
-            exact_shape=(logits.size(0),),
+        sample_weight = self._check_sample_weight_per_row(
+            sample_weight, logits, dtype=logits.dtype
         )
 
         # Materialise all-True iid_mask when None so downstream is uniform.

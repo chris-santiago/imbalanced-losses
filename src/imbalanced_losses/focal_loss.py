@@ -50,13 +50,17 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
     gamma : float
         Exponent of the modulating factor (1 - p_t). Default: 2.
     reduction : str
-        'none' | 'mean' | 'sum'. Default: 'mean'.
+        'none' | 'mean' | 'sum'. Default: 'mean'.  ``'mean_positive'`` is
+        softmax-only: there is no background class in the sigmoid
+        formulation to normalise against.
     gather_distributed : bool or None, optional
         Whether to all-gather inputs and targets across DDP workers before
         computing the loss.  ``None`` (default) auto-detects: gathers when
         ``torch.distributed`` is initialized with world_size > 1.  Set to
         ``False`` to opt out.
     """
+
+    SUPPORTED_REDUCTIONS: tuple[str, ...] = ("none", "mean", "sum")
 
     def __init__(
         self,
@@ -116,17 +120,9 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
         Tensor
             Scalar or per-element loss depending on ``reduction``.
         """
-        if sample_weight is not None:
-            # Guarded: inputs.size(0) is only defined for a batched input,
-            # and an unweighted call must reach the pre-sample_weight path
-            # without touching the input's shape at all.
-            sample_weight = self._check_sample_weight(
-                sample_weight,
-                dim0=inputs.size(0),
-                dtype=inputs.dtype,
-                reference="inputs",
-                broadcast_shape=inputs.shape,
-            )
+        sample_weight = self._check_sample_weight_broadcastable(
+            sample_weight, inputs, dtype=inputs.dtype
+        )
 
         if self._should_gather():
             inputs  = all_gather_with_grad(inputs)
@@ -151,7 +147,7 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
             return _reduce_mean_all(loss, sample_weight)
         if self.reduction == "sum":
             return _reduce_sum(loss, sample_weight)
-        raise _invalid_reduction(self.reduction)
+        raise _invalid_reduction(self.reduction, self.SUPPORTED_REDUCTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +202,8 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
     positive count is noisy.  Gathering ensures the denominator reflects the
     true global positive count.
     """
+
+    SUPPORTED_REDUCTIONS: tuple[str, ...] = ("none", "mean", "mean_positive", "sum")
 
     def __init__(
         self,
@@ -272,12 +270,8 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         Tensor
             Scalar or per-sample loss depending on ``reduction``.
         """
-        sample_weight = self._check_sample_weight(
-            sample_weight,
-            dim0=targets.size(0),
-            dtype=inputs.dtype,
-            reference="targets",
-            exact_shape=targets.shape,
+        sample_weight = self._check_sample_weight_like(
+            sample_weight, targets, dtype=inputs.dtype
         )
 
         if self._should_gather():
@@ -337,7 +331,7 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
             return _reduce_mean_masked(loss, positive_mask, sample_weight)
         if self.reduction == "sum":
             return _reduce_sum(loss, sample_weight)
-        raise _invalid_reduction(self.reduction)
+        raise _invalid_reduction(self.reduction, self.SUPPORTED_REDUCTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +411,13 @@ def _reduce_mean_masked(
     return (loss * sample_weight).sum() / _floor_zero_mass(mass)
 
 
-def _invalid_reduction(reduction: str) -> ValueError:
-    """Build the error raised for an unsupported ``reduction`` string."""
-    return ValueError(
-        f"Invalid reduction: '{reduction}'. "
-        "Supported modes: 'none', 'mean', 'mean_positive', 'sum'."
-    )
+def _invalid_reduction(reduction: str, supported: tuple[str, ...]) -> ValueError:
+    """Build the error raised for an unsupported ``reduction`` string.
+
+    *supported* is the calling class's own set: the two focal losses do not
+    support the same reductions (``mean_positive`` is softmax-only), and a
+    message that lists a mode it is simultaneously rejecting sends the
+    caller in a circle.
+    """
+    modes = ", ".join(repr(mode) for mode in supported)
+    return ValueError(f"Invalid reduction: '{reduction}'. Supported modes: {modes}.")

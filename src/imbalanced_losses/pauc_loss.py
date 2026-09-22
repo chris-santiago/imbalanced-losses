@@ -398,8 +398,13 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Delegate to the internal ``_MemoryQueue``.
 
-        Kept as a 2-tuple for the pre-``PooledBatch`` callers this shim
-        exists for; the pooled rail itself uses the named fields.
+        Backward-compatibility surface only: nothing inside the library
+        calls this, and the pooled rail uses ``merge``'s
+        :class:`~imbalanced_losses._queue.PooledBatch` fields directly. It
+        is retained because it was a (private) method on this class before
+        the queue was extracted and before ``merge`` returned a
+        ``PooledBatch``, so an out-of-library subclass may still call it;
+        it therefore keeps returning the 2-tuple that contract promised.
         """
         pool = self._queue.merge(logits, targets)
         return pool.logits, pool.targets

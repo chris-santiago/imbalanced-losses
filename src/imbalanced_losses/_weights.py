@@ -18,20 +18,34 @@ import warnings
 import torch
 
 # Frame budget for the one-shot whole-zero UserWarning.  Counting outward
-# from ``warnings.warn`` inside ``_check_sample_weight``:
-#   1 = _check_sample_weight (this module)
-#   2 = the ``forward`` that called it
-#   3 = ``forward``'s caller
-# 3 therefore attributes the warning to whoever called ``forward``, which is
-# what a user needs to see.  One value for every loss family: the previous
-# per-family values (2 inline in ``_base.forward``, 3 in the focal helper)
-# differed only because of the extra frame, and both aimed at this same
-# target frame.
-_WARN_STACKLEVEL = 3
+# from ``warnings.warn`` inside ``_accept_sample_weight``:
+#   1 = _accept_sample_weight (this module)
+#   2 = the _check_sample_weight_* contract method that called it
+#   3 = the ``forward`` that called that
+#   4 = ``forward``'s caller
+# 4 therefore attributes the warning to ``forward``'s immediate caller
+# rather than to this module.  One value for every loss family and every
+# contract: the ladder above is fixed, since every path into the warning
+# runs through exactly one contract method.
+#
+# Under ``nn.Module.__call__`` that immediate caller is torch's own
+# ``_call_impl``, as it was before this module existed.  Counting further
+# out to reach the user's own frame would couple the constant to torch's
+# call-wrapper depth and would then misfire wherever that ladder differs:
+# a direct ``loss.forward(...)`` call, or ``PAUCAtBudgetLoss.forward``
+# delegating through ``super().forward``.
+_WARN_STACKLEVEL = 4
 
 
 class _SampleWeightMixin:
     """Mixin giving a loss one ``sample_weight`` validation routine.
+
+    Exposes one method per shape contract -- per-row, element-for-element,
+    and trailing-dim-broadcastable -- each taking the tensor it validates
+    against, so a loss names its contract at the call site and the
+    ``None`` fast path never touches the reference tensor.  All three share
+    :meth:`_accept_sample_weight` for the detach, the value checks, the
+    one-shot warning, and the dtype cast.
 
     Owns the one-shot warning flag (:attr:`_sample_weight_warned`) so the
     validation routine never reaches into an object it does not own.  The
@@ -41,82 +55,123 @@ class _SampleWeightMixin:
 
     _sample_weight_warned: bool = False
 
-    def _check_sample_weight(
+    # -- one method per shape contract; all three share the value checks --
+
+    def _check_sample_weight_per_row(
         self,
         sample_weight: torch.Tensor | None,
+        logits: torch.Tensor,
         *,
-        dim0: int,
         dtype: torch.dtype,
-        reference: str,
-        exact_shape: tuple[int, ...] | torch.Size | None = None,
-        broadcast_shape: tuple[int, ...] | torch.Size | None = None,
     ) -> torch.Tensor | None:
-        """Detach, validate, and cast a caller-supplied ``sample_weight``.
+        """Validate a weight carrying one value per row of *logits*.
+
+        The ranking-loss contract: shape exactly ``[logits.size(0)]``.
+        """
+        if sample_weight is None:
+            return None
+        n = logits.size(0)
+        self._check_dim0(sample_weight, n, "logits")
+        if tuple(sample_weight.shape) != (n,):
+            raise ValueError(
+                f"sample_weight must be {(n,)} matching logits, "
+                f"got {tuple(sample_weight.shape)} vs N={n}"
+            )
+        return self._accept_sample_weight(sample_weight, dtype)
+
+    def _check_sample_weight_like(
+        self,
+        sample_weight: torch.Tensor | None,
+        targets: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Validate a weight matching *targets* element for element.
+
+        ``SoftmaxFocalLoss``'s contract: shape exactly ``targets.shape``,
+        no broadcasting.
+        """
+        if sample_weight is None:
+            return None
+        self._check_dim0(sample_weight, targets.size(0), "targets")
+        if sample_weight.shape != targets.shape:
+            raise ValueError(
+                f"sample_weight must be {tuple(targets.shape)} matching targets, "
+                f"got {tuple(sample_weight.shape)} vs N={targets.size(0)}"
+            )
+        return self._accept_sample_weight(sample_weight, dtype)
+
+    def _check_sample_weight_broadcastable(
+        self,
+        sample_weight: torch.Tensor | None,
+        inputs: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Validate a weight that broadcasts over *inputs*' trailing dims.
+
+        ``SigmoidFocalLoss``'s contract: dim 0 exactly ``inputs.size(0)``,
+        trailing dims broadcastable (``[N, 1, H, W]`` against
+        ``[N, C, H, W]``).  Dim 0 is exact rather than broadcastable
+        because ``gather_distributed`` concatenates the weight along dim 0.
+        """
+        if sample_weight is None:
+            return None
+        self._check_dim0(sample_weight, inputs.size(0), "inputs")
+        try:
+            sample_weight.expand(inputs.shape)
+        except RuntimeError:
+            raise ValueError(
+                f"sample_weight must be broadcastable to inputs, "
+                f"got {tuple(sample_weight.shape)} vs inputs {tuple(inputs.shape)}"
+            ) from None
+        return self._accept_sample_weight(sample_weight, dtype)
+
+    # -- shared pieces -----------------------------------------------------
+
+    @staticmethod
+    def _check_dim0(sample_weight: torch.Tensor, dim0: int, reference: str) -> None:
+        """Require the weight's dim-0 extent to be exactly *dim0*.
+
+        Shared by all three contracts, and checked first in each, because
+        it is the invariant a DDP all-gather depends on: the gather
+        concatenates along dim 0, so a weight whose dim 0 is not the batch
+        size passes validation on one rank and then misaligns against the
+        gathered batch on the next.
+        """
+        if sample_weight.ndim == 0 or sample_weight.size(0) != dim0:
+            raise ValueError(
+                f"sample_weight must match {reference} dim-0, "
+                f"got {tuple(sample_weight.shape)} vs N={dim0}"
+            )
+
+    def _accept_sample_weight(
+        self, sample_weight: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Detach, value-check, and cast an already shape-checked weight.
 
         Parameters
         ----------
-        sample_weight : torch.Tensor or None
-            The caller's weight.  ``None`` returns ``None``: that is the
-            structural unweighted path and nothing here may touch it.
-        dim0 : int
-            Required dim-0 extent.  This is the invariant that makes the
-            weight concatenate correctly under a DDP all-gather, which
-            concatenates along dim 0: a weight whose dim 0 is not the
-            batch size survives validation on one rank and then misaligns
-            against the gathered batch on the next.
+        sample_weight : torch.Tensor
+            The caller's weight, shape already validated.
         dtype : torch.dtype
             Loss dtype.  The returned weight is cast to it, so the weight's
             own dtype never decides the dtype of the value that gets
             backpropagated.
-        reference : str
-            Name of the tensor the weight is validated against
-            (``"logits"``, ``"targets"``, ``"inputs"``), used in error
-            messages only.
-        exact_shape : tuple[int, ...], optional
-            When given, the weight's full shape must equal it.
-        broadcast_shape : tuple[int, ...], optional
-            When given, the weight must be broadcastable to it (trailing
-            dims only -- *dim0* is still checked exactly).  Mutually
-            exclusive with *exact_shape*.
 
         Returns
         -------
-        torch.Tensor or None
-            The detached, validated, cast weight, or ``None``.
+        torch.Tensor
+            The detached, validated, cast weight.
 
         Raises
         ------
         ValueError
-            On a shape mismatch, or on any negative, ``NaN``, or ``inf``
-            entry.  All three are caller-visible misuse: a ``NaN`` weight
-            silently produces a ``NaN`` loss, exactly the failure the
-            negative-weight check exists to prevent.
+            On any negative, ``NaN``, or ``inf`` entry.  All three are
+            caller-visible misuse: a ``NaN`` weight silently produces a
+            ``NaN`` loss, exactly the failure the negative-weight check
+            exists to prevent.
         """
-        if sample_weight is None:
-            return None
-        if exact_shape is not None and broadcast_shape is not None:
-            raise TypeError("pass at most one of exact_shape / broadcast_shape")
-
-        shape = tuple(sample_weight.shape)
-        if sample_weight.ndim == 0 or sample_weight.size(0) != dim0:
-            raise ValueError(
-                f"sample_weight must match {reference} dim-0, "
-                f"got {shape} vs N={dim0}"
-            )
-        if exact_shape is not None and shape != tuple(exact_shape):
-            raise ValueError(
-                f"sample_weight must be {tuple(exact_shape)} matching {reference}, "
-                f"got {shape} vs N={dim0}"
-            )
-        if broadcast_shape is not None:
-            try:
-                sample_weight.expand(broadcast_shape)
-            except RuntimeError:
-                raise ValueError(
-                    f"sample_weight must be broadcastable to {reference}, "
-                    f"got {shape} vs {reference} {tuple(broadcast_shape)}"
-                ) from None
-
         # Detach immediately -- sample_weight never carries or receives
         # gradient, and every downstream touch point assumes this.  The
         # value checks below run on the caller's dtype, before the cast, so

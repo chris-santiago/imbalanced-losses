@@ -797,6 +797,38 @@ class TestGatherDistributed:
 # ===========================================================================
 
 
+class TestUnsupportedReduction:
+    """The rejection message must name each class's own supported set."""
+
+    def test_sigmoid_message_omits_mean_positive(self):
+        # mean_positive is a softmax-only reduction: advertising it in the
+        # message that rejects it sends the caller in a circle.
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        with pytest.raises(ValueError) as excinfo:
+            SigmoidFocalLoss(reduction="mean_positive")(logits, targets)
+        assert str(excinfo.value) == (
+            "Invalid reduction: 'mean_positive'. "
+            "Supported modes: 'none', 'mean', 'sum'."
+        )
+
+    def test_softmax_message_lists_all_four_modes(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        with pytest.raises(ValueError) as excinfo:
+            SoftmaxFocalLoss(reduction="nonsense")(logits, targets)
+        assert str(excinfo.value) == (
+            "Invalid reduction: 'nonsense'. "
+            "Supported modes: 'none', 'mean', 'mean_positive', 'sum'."
+        )
+
+    def test_sigmoid_message_for_an_unknown_mode(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        with pytest.raises(ValueError, match="Supported modes: 'none', 'mean', 'sum'"):
+            SigmoidFocalLoss(reduction="nonsense")(logits, targets)
+
+
 class TestSigmoidFocalLossSampleWeight:
     def test_mean_weighted_oracle_2d(self):
         torch.manual_seed(SEED)
@@ -850,7 +882,9 @@ class TestSigmoidFocalLossSampleWeight:
         targets = torch.randint(0, 2, (N, C, H, W)).float()
         weight = torch.rand(N, 1, H, W) + 0.1
 
-        loss_none_unweighted = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        loss_none_unweighted = SigmoidFocalLoss(
+            alpha=0.25, gamma=2.0, reduction="none"
+        )(logits, targets)
         expected = loss_none_unweighted * weight
 
         actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(
@@ -1014,7 +1048,9 @@ class TestSoftmaxFocalLossSampleWeight:
         loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
         expected = (loss_none * weight).sum() / weight.sum()
 
-        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_mean_weighted_oracle_3d(self):
@@ -1027,7 +1063,9 @@ class TestSoftmaxFocalLossSampleWeight:
         loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
         expected = (loss_none * weight).sum() / weight.sum()
 
-        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_mean_weighted_oracle_4d(self):
@@ -1040,7 +1078,9 @@ class TestSoftmaxFocalLossSampleWeight:
         loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
         expected = (loss_none * weight).sum() / weight.sum()
 
-        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_mean_positive_weighted_oracle(self):
@@ -1052,7 +1092,9 @@ class TestSoftmaxFocalLossSampleWeight:
         targets[:8] = torch.randint(1, C, (8,))
         weight = torch.rand(N) + 0.1
 
-        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none", background_class=0)(logits, targets)
+        loss_none = SoftmaxFocalLoss(
+            gamma=2.0, reduction="none", background_class=0
+        )(logits, targets)
         positive_mask = targets != 0
         expected = (loss_none * weight).sum() / (weight * positive_mask).sum()
 
@@ -1066,7 +1108,9 @@ class TestSoftmaxFocalLossSampleWeight:
         # the denominator (positive weight mass) is untouched by the change.
         weight_neg_zeroed = weight.clone()
         weight_neg_zeroed[8:] = 0.0
-        actual_neg_zeroed = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)(
+        actual_neg_zeroed = SoftmaxFocalLoss(
+            gamma=2.0, reduction="mean_positive", background_class=0
+        )(
             logits, targets, sample_weight=weight_neg_zeroed
         )
         assert not torch.allclose(actual, actual_neg_zeroed)
@@ -1081,7 +1125,9 @@ class TestSoftmaxFocalLossSampleWeight:
         loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
         expected = (loss_none * weight).sum()
 
-        actual = SoftmaxFocalLoss(gamma=2.0, reduction="sum")(logits, targets, sample_weight=weight)
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="sum")(
+            logits, targets, sample_weight=weight
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_none_weighted_oracle(self):
@@ -1094,7 +1140,9 @@ class TestSoftmaxFocalLossSampleWeight:
         loss_none_unweighted = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
         expected = loss_none_unweighted * weight
 
-        actual = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets, sample_weight=weight)
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="none")(
+            logits, targets, sample_weight=weight
+        )
         torch.testing.assert_close(actual, expected)
 
     def test_ignore_index_rows_zero_regardless_of_weight_and_excluded_from_denominator(self):
@@ -1349,7 +1397,9 @@ class TestSampleWeightGatherDistributed:
 
         fn_gathered = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
         fn_gathered._gather_resolved = True
-        fn_off = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean", gather_distributed=False)
+        fn_off = SigmoidFocalLoss(
+            alpha=0.25, gamma=2.0, reduction="mean", gather_distributed=False
+        )
 
         loss_gathered = fn_gathered(logits, targets, sample_weight=weight)
         loss_off = fn_off(logits, targets, sample_weight=weight)

@@ -319,7 +319,9 @@ class MyModel(pl.LightningModule):
         return loss
 ```
 
-`**kwargs` (e.g. `return_per_class=True`, `sample_weight=...`) are forwarded to `main_loss` in every phase: warmup-ended, blend, and main alike. `warmup_loss` receives exactly the keyword arguments its own `forward` declares by name, or all of them when its `forward` declares `**kwargs`; the check runs once at construction. Anything it cannot accept is dropped, so third-party warmup losses that do not take `sample_weight` keep working unweighted.
+`**kwargs` (e.g. `return_per_class=True`, `sample_weight=...`) are forwarded to `main_loss` in every phase: warmup-ended, blend, and main alike. `warmup_loss` only ever receives `sample_weight`, and only when its `forward` declares that parameter by name or declares `**kwargs`; the check runs once at construction, so third-party warmup losses that do not take `sample_weight` keep working unweighted. No other keyword argument reaches `warmup_loss` in any phase. That narrowness is deliberate: the blend step multiplies `warmup_loss`'s return value by a scalar, so an argument that changes what the warmup loss *returns* (`return_per_class`, `return_diagnostics`) must not cross.
+
+**Return shape.** The wrapper's return shape tracks `main_loss` whenever `main_loss` is called, which is every phase except pure warmup. During the pure-warmup phase the wrapper returns `warmup_loss`'s scalar, so return-shape keyword arguments have no effect there.
 
 During the blend phase, `return_per_class=True` returns a tuple whose elements come from two different objectives: the leading `loss` is the blended scalar `(1 - w) * warmup + w * main`, while `per_class` and `valid` pass through from `main_loss` unblended (there is no warmup-side per-class counterpart). If you log per-class metrics, treat them as main-loss values, not as a decomposition of the returned scalar, until the blend ends.
 
@@ -327,7 +329,7 @@ During the blend phase, `return_per_class=True` returns a tuple whose elements c
 
 | Parameter | Default | Description |
 |---|---|---|
-| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)`. Keyword arguments it declares (or `**kwargs`) are forwarded |
+| `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)` and return a scalar. Receives `sample_weight` if it declares it (or `**kwargs`); no other keyword argument is forwarded |
 | `main_loss` | required | Loss used after warmup; must accept `(logits, targets, **kwargs)` |
 | `warmup_epochs` | `0` | Epochs to use `warmup_loss`; `0` skips warmup entirely |
 | `temp_start` | `0.05` | Temperature at phase switch |

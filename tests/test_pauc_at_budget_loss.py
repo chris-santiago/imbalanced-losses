@@ -2192,7 +2192,10 @@ class TestSampleWeightPauc:
         _, stats_u = loss_fn(logits, targets, return_diagnostics=True)
         _, stats_w = loss_fn(logits, targets, sample_weight=weight, return_diagnostics=True)
 
-        for key in ("t_alpha", "t_beta", "tau_eff", "band_neg_count", "pauc_var", "grad_pos_count"):
+        for key in (
+            "t_alpha", "t_beta", "tau_eff", "band_neg_count", "pauc_var",
+            "grad_pos_count",
+        ):
             assert torch.equal(stats_u[key], stats_w[key]), (
                 f"{key} changed between unweighted and weighted calls on the same pool: "
                 f"{stats_u[key]} vs {stats_w[key]}"
