@@ -504,6 +504,147 @@ class TestForward:
 
 
 # ---------------------------------------------------------------------------
+# sample_weight forwarding
+# ---------------------------------------------------------------------------
+
+
+class _RecordingMainLoss(nn.Module):
+    """Main-loss stub with a temperature attribute that records every kwarg
+    it is called with and returns a fixed differentiable scalar."""
+
+    def __init__(self):
+        super().__init__()
+        self.temperature = 0.01
+        self.calls: list[dict] = []
+
+    def forward(self, logits, targets, **kwargs):
+        self.calls.append(dict(kwargs))
+        return logits.sum() * 0.0
+
+    def reset_queue(self):
+        pass
+
+
+class _RecordingWarmupLossWithWeight(nn.Module):
+    """Warmup-loss stub whose ``forward`` declares ``sample_weight``."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, logits, targets, *, sample_weight=None):
+        self.calls.append({"sample_weight": sample_weight})
+        return logits.sum() * 0.0
+
+
+class _RecordingWarmupLossNoWeight(nn.Module):
+    """Warmup-loss stub whose ``forward`` does not declare ``sample_weight``."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[dict] = []
+
+    def forward(self, logits, targets):
+        self.calls.append({})
+        return logits.sum() * 0.0
+
+
+class TestSampleWeightForwarding:
+    C, B = 4, 16
+
+    def _batch(self):
+        logits = torch.randn(self.B, self.C)
+        targets = torch.randint(0, self.C, (self.B,))
+        return logits, targets
+
+    def test_reaches_main_loss_after_warmup_ends(self):
+        # Hard switch: warmup completes, no blend, w >= 1.0.
+        main = _RecordingMainLoss()
+        w = _make_wrapper(warmup_epochs=1, main_loss=main)
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(10)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(main.calls) == 1
+        assert torch.equal(main.calls[0]["sample_weight"], sw)
+
+    def test_reaches_main_loss_during_blend(self):
+        # final_main_weight < 1 holds main_weight strictly below 1 forever.
+        main = _RecordingMainLoss()
+        w = _make_wrapper(
+            warmup_epochs=1, main_loss=main, final_main_weight=0.5
+        )
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(10)
+        assert 0.0 < w.main_weight < 1.0
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(main.calls) == 1
+        assert torch.equal(main.calls[0]["sample_weight"], sw)
+
+    def test_reaches_main_loss_in_pure_main_phase(self):
+        # No warmup at all: main_loss is active from the first call.
+        main = _RecordingMainLoss()
+        w = _make_wrapper(warmup_epochs=0, main_loss=main)
+        w.on_train_batch_start(0)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(main.calls) == 1
+        assert torch.equal(main.calls[0]["sample_weight"], sw)
+
+    def test_reaches_warmup_loss_that_declares_it(self):
+        warmup = _RecordingWarmupLossWithWeight()
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(warmup.calls) == 1
+        assert torch.equal(warmup.calls[0]["sample_weight"], sw)
+
+    def test_not_passed_to_warmup_loss_that_does_not_declare_it(self):
+        warmup = _RecordingWarmupLossNoWeight()
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        loss = w(logits, targets, sample_weight=sw)  # must not raise
+        assert len(warmup.calls) == 1
+        assert warmup.calls[0] == {}
+        assert loss.ndim == 0
+
+    def test_not_passed_to_cross_entropy_warmup_loss(self):
+        # nn.CrossEntropyLoss.forward does not declare sample_weight; the
+        # wrapper must drop it silently rather than raise a TypeError.
+        w = _make_wrapper(warmup_epochs=2)  # default warmup_loss = CrossEntropyLoss
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        loss = w(logits, targets, sample_weight=sw)
+        assert loss.ndim == 0
+
+    def test_reaches_library_warmup_loss_that_declares_it(self):
+        # Integration: a real library loss used as warmup_loss is weighted.
+        # A non-uniform weight must change the warmup-phase loss value
+        # relative to an all-ones weight, proving sample_weight was received
+        # and used, not merely accepted and ignored.
+        torch.manual_seed(42)
+        warmup = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = _make_wrapper(warmup_epochs=2, warmup_loss=warmup)
+        w.on_train_epoch_start(0)
+        logits, targets = self._batch()
+        ones = torch.ones(self.B)
+        skewed = torch.rand(self.B) + 0.1
+        with torch.no_grad():
+            loss_uniform = w(logits, targets, sample_weight=ones)
+            loss_skewed = w(logits, targets, sample_weight=skewed)
+        assert not torch.allclose(loss_uniform, loss_skewed)
+
+
+# ---------------------------------------------------------------------------
 # Integration: full epoch loop with SmoothAPLoss
 # ---------------------------------------------------------------------------
 
@@ -739,6 +880,73 @@ class TestForwardBlend:
         logits, targets = self._batch()
         result = w(logits, targets, return_per_class=True)
         assert isinstance(result, tuple)
+
+    def test_return_per_class_reaches_main_loss_mid_blend(self):
+        """Regression: the blend path used to silently drop every kwarg, so
+        return_per_class=True never reached main_loss while 0 < w < 1."""
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = _make_wrapper(warmup_epochs=1, blend_epochs=3, main_loss=main)
+        w.on_train_epoch_start(1)  # blend epoch 0 → main_weight = 1/4
+        w.on_train_batch_start(10)
+        assert 0.0 < w.main_weight < 1.0
+        logits, targets = self._batch()
+        result = w(logits, targets, return_per_class=True)
+        assert isinstance(result, tuple)
+        loss, per_class, valid = result
+        assert loss.ndim == 0
+        assert per_class.shape == (self.C,)
+        assert valid.shape == (self.C,)
+
+    def test_return_per_class_mid_blend_blends_only_the_loss(self):
+        """The blended scalar equals (1-w)*warmup + w*main_loss even when
+        main_loss returns a tuple; the per-class/valid elements pass through
+        from main_loss unmodified (no warmup-side counterpart exists)."""
+        warmup = nn.CrossEntropyLoss()
+        main = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        w = LossWarmupWrapper(
+            warmup_loss=warmup,
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=100,
+            blend_epochs=3,
+        )
+        w.on_train_epoch_start(1)  # blend epoch 0 → main_weight = 1/4
+        w.on_train_batch_start(10)
+        logits, targets = self._batch()
+        with torch.no_grad():
+            loss, per_class, valid = w(logits, targets, return_per_class=True)
+            wt = w.main_weight
+            main_loss_val, main_per_class, main_valid = main(
+                logits, targets, return_per_class=True
+            )
+            expected_loss = (1 - wt) * warmup(logits, targets) + wt * main_loss_val
+        assert loss.item() == pytest.approx(expected_loss.item(), rel=1e-5)
+        assert torch.equal(per_class, main_per_class)
+        assert torch.equal(valid, main_valid)
+
+    def test_sample_weight_reaches_both_losses_during_blend(self):
+        """sample_weight reaches both warmup_loss (when it declares the
+        parameter) and main_loss simultaneously during the blend phase."""
+        warmup = SmoothAPLoss(num_classes=self.C, queue_size=0)
+        main = _RecordingMainLoss()
+        w = LossWarmupWrapper(
+            warmup_loss=warmup,
+            main_loss=main,
+            warmup_epochs=1,
+            temp_start=0.1,
+            temp_end=0.01,
+            temp_decay_steps=100,
+            blend_epochs=3,
+        )
+        w.on_train_epoch_start(1)  # blend epoch 0 → main_weight = 1/4
+        w.on_train_batch_start(10)
+        logits, targets = self._batch()
+        sw = torch.rand(self.B)
+        w(logits, targets, sample_weight=sw)
+        assert len(main.calls) == 1
+        assert torch.equal(main.calls[0]["sample_weight"], sw)
 
     def test_gradient_flows_through_both_during_blend(self):
         warmup = nn.CrossEntropyLoss()
