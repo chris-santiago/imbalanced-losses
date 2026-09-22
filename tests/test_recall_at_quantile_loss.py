@@ -18,11 +18,14 @@ Coverage
 from __future__ import annotations
 
 import math
+from unittest import mock
 
 import pytest
 import torch
 
 from imbalanced_losses.recall_loss import RecallAtQuantileLoss
+
+SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +203,8 @@ class TestSoftRecallAtQuantile:
                                         queue_size=0, quantile_interpolation="linear")
         torch.manual_seed(11)
         scores = torch.randn(20)
-        is_pos = torch.zeros(20, dtype=torch.bool); is_pos[:5] = True
+        is_pos = torch.zeros(20, dtype=torch.bool)
+        is_pos[:5] = True
         r_high, _ = fn_high._soft_recall_at_quantile(scores, is_pos)
         r_lin,  _ = fn_lin._soft_recall_at_quantile(scores, is_pos)
         # They won't always differ, but this seed produces different thresholds
@@ -426,7 +430,8 @@ class TestRecallAtQuantileLossIgnoreIndex:
         logits  = torch.randn(B, C)
         targets = torch.randint(0, C, (B,))
 
-        padded = targets.clone(); padded[:4] = -100
+        padded = targets.clone()
+        padded[:4] = -100
         loss_padded = fn(logits, padded)
         loss_clean  = fn(logits[4:], targets[4:])
         assert torch.allclose(loss_padded, loss_clean, atol=1e-5)
@@ -553,7 +558,8 @@ class TestRecallAtQuantileLossBinary:
     def test_binary_ignore_index_excluded(self):
         fn = RecallAtQuantileLoss(num_classes=1, quantile=SANITY_Q, queue_size=0)
         logits  = torch.randn(B, 1)
-        targets = torch.randint(0, 2, (B,)); targets[0] = -100
+        targets = torch.randint(0, 2, (B,))
+        targets[0] = -100
         loss = fn(logits, targets)
         assert not math.isnan(loss.item())
 
@@ -858,3 +864,169 @@ class TestIidMaskTransport:
         # Second call merges live batch with queued rows.
         loss2 = fn(logits, targets, iid_mask=iid_mask)
         assert torch.isfinite(loss2)
+
+
+# ---------------------------------------------------------------------------
+# sample_weight arithmetic (Task 3)
+# ---------------------------------------------------------------------------
+
+class TestSampleWeightSoftRecall:
+    """
+    Hand oracles for the weighted soft-recall formula on ``_soft_recall_at_quantile``:
+
+        weighted_recall = Σ_{i∈P} w_i · σ((s_i − θ)/τ) / Σ_{i∈P} w_i
+
+    θ (the threshold) is always the unweighted quantile of all scores.
+    """
+
+    # 6-row pool: 3 negatives, 3 positives at known scores.
+    SCORES = torch.tensor([-2.0, -1.0, 0.0, 1.0, 2.0, 3.0])
+    IS_POS = torch.tensor([False, False, False, True, True, True])
+    # Non-uniform weights on the positives; negatives' weights are never
+    # consulted by the ranking objective, so they are left at 1.
+    WEIGHT = torch.tensor([1.0, 1.0, 1.0, 3.0, 1.0, 0.5])
+
+    def _fn(self, **kw) -> RecallAtQuantileLoss:
+        return RecallAtQuantileLoss(
+            num_classes=1, quantile=0.5, temperature=1.0,
+            quantile_interpolation="linear", queue_size=0, **kw
+        )
+
+    def test_hand_oracle_weighted_recall(self):
+        fn = self._fn()
+        recall, valid = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, self.WEIGHT)
+        assert valid
+
+        # Independently recompute theta and soft_above -- the oracle.
+        theta = torch.quantile(self.SCORES.detach(), 0.5, interpolation="linear")
+        soft_above = torch.sigmoid((self.SCORES[self.IS_POS] - theta) / 1.0)
+        w_pos = self.WEIGHT[self.IS_POS]
+        expected = (soft_above * w_pos).sum() / w_pos.sum()
+
+        torch.testing.assert_close(recall, expected)
+
+    def test_weighted_differs_from_unweighted(self):
+        # Sanity check the oracle has teeth: non-uniform weights must move
+        # the result away from the plain mean.
+        fn = self._fn()
+        recall_w, _ = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, self.WEIGHT)
+        recall_u, _ = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, None)
+        assert not torch.allclose(recall_w, recall_u)
+
+    def test_all_ones_weight_matches_unweighted(self):
+        fn = self._fn()
+        ones = torch.ones_like(self.SCORES)
+        recall_w, valid_w = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, ones)
+        recall_u, valid_u = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, None)
+        assert valid_w and valid_u
+        torch.testing.assert_close(recall_w, recall_u)
+
+    def test_positive_scaling_invariance(self):
+        # Scaling every weight by a positive constant must not change the
+        # weighted mean (numerator and denominator scale together).
+        fn = self._fn()
+        recall1, _ = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, self.WEIGHT)
+        recall2, _ = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, self.WEIGHT * 7.0)
+        torch.testing.assert_close(recall1, recall2)
+
+    def test_theta_computation_does_not_see_weight(self):
+        # The threshold quantile call must receive identical arguments
+        # whether or not a weight is supplied -- proof that weighting never
+        # reaches torch.quantile.
+        fn = self._fn()
+        calls = []
+        orig_quantile = torch.quantile
+
+        def _spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return orig_quantile(*args, **kwargs)
+
+        with mock.patch("torch.quantile", side_effect=_spy):
+            fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, None)
+            fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, self.WEIGHT)
+
+        assert len(calls) == 2
+        (args0, kwargs0), (args1, kwargs1) = calls
+        assert torch.equal(args0[0], args1[0])
+        assert args0[1] == args1[1]
+        assert kwargs0 == kwargs1
+
+    def test_zero_positive_weight_mass_is_invalid(self):
+        fn = self._fn()
+        zero_pos_weight = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+        recall, valid = fn._soft_recall_at_quantile(self.SCORES, self.IS_POS, zero_pos_weight)
+        assert not valid
+
+    def test_no_positives_invalid_regardless_of_weight(self):
+        fn = self._fn()
+        no_pos = torch.zeros(6, dtype=torch.bool)
+        recall, valid = fn._soft_recall_at_quantile(self.SCORES, no_pos, self.WEIGHT)
+        assert not valid
+
+
+class TestSampleWeightForward:
+    """Forward-level weighted-arithmetic behavior via _compute_per_class."""
+
+    def test_zero_positive_weight_class_invalid_all_reductions(self):
+        g = torch.Generator().manual_seed(SEED)
+        n_classes = 2
+        logits = torch.randn(8, n_classes, generator=g)
+        targets = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        weight = torch.ones(8)
+        weight[:4] = 0.0  # class-0 positives (rows 0-3) carry zero weight
+
+        fn_none = RecallAtQuantileLoss(
+            num_classes=n_classes, quantile=SANITY_Q, queue_size=0, reduction="none"
+        )
+        loss_none, per_class_none, valid_none = fn_none(
+            logits, targets, sample_weight=weight, return_per_class=True
+        )
+        assert not valid_none[0].item()
+        assert valid_none[1].item()
+        assert math.isnan(per_class_none[0].item())
+        assert not math.isnan(per_class_none[1].item())
+
+        fn_mean = RecallAtQuantileLoss(
+            num_classes=n_classes, quantile=SANITY_Q, queue_size=0, reduction="mean"
+        )
+        loss_mean = fn_mean(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_mean, per_class_none[1])
+
+        fn_sum = RecallAtQuantileLoss(
+            num_classes=n_classes, quantile=SANITY_Q, queue_size=0, reduction="sum"
+        )
+        loss_sum = fn_sum(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_sum, per_class_none[1])
+
+    def test_multiclass_weight_shared_across_classes(self):
+        # A single [N] weight applies to whichever class a row is positive
+        # for -- there is no per-class weight axis.
+        g = torch.Generator().manual_seed(SEED)
+        n_classes = 3
+        n = 12
+        logits = torch.randn(n, n_classes, generator=g)
+        targets = torch.randint(0, n_classes, (n,), generator=g)
+        weight = torch.rand(n, generator=g) + 0.1  # keep positive weight mass nonzero
+
+        fn = RecallAtQuantileLoss(
+            num_classes=n_classes, quantile=SANITY_Q, queue_size=0, reduction="none"
+        )
+        _, per_class, valid = fn(logits, targets, sample_weight=weight, return_per_class=True)
+
+        for c in range(n_classes):
+            recall_c, is_valid_c = fn._soft_recall_at_quantile(
+                logits[:, c], targets == c, weight
+            )
+            assert bool(valid[c]) == is_valid_c
+            if is_valid_c:
+                torch.testing.assert_close(per_class[c], 1.0 - recall_c)
+
+    def test_all_ones_weight_matches_unweighted_forward(self):
+        g = torch.Generator().manual_seed(SEED)
+        logits = torch.randn(B, C, generator=g)
+        targets = torch.randint(0, C, (B,), generator=g)
+
+        fn = RecallAtQuantileLoss(num_classes=C, quantile=SANITY_Q, queue_size=0)
+        loss_u = fn(logits, targets)
+        loss_w = fn(logits, targets, sample_weight=torch.ones(B))
+        torch.testing.assert_close(loss_u, loss_w)

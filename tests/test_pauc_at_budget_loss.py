@@ -9,10 +9,14 @@ interaction. Task 5 adds tau scale-inflation stability, reset_queue, queue
 iid-flag round-trip, and max_pool_size + iid_mask alignment.
 """
 
+import math
+
 import pytest
 import torch
 
 from imbalanced_losses import PAUCAtBudgetLoss
+
+SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -2076,3 +2080,252 @@ def test_runs_on_mps(surrogate):
     assert out.device.type == "mps"
     assert torch.isfinite(out), "loss must be finite on MPS"
     assert torch.isfinite(logits.grad).all(), "gradients must be finite on MPS"
+
+
+# ---------------------------------------------------------------------------
+# sample_weight arithmetic (Task 3)
+# ---------------------------------------------------------------------------
+#
+# Controlled binary pool used by the hand-oracle tests: 10 iid negatives at
+# integer scores 0..9, 3 positives at distinct scores with non-uniform
+# weights. n_knots=2 + tau_scale='band' keeps every trapezoid knot equal to
+# a band edge (t_k[0]==t_alpha, t_k[-1]==t_beta, locked by
+# test_endpoint_knot_thresholds_equal_band_edges), so the oracle can be
+# built entirely from the public return_diagnostics thresholds without
+# reaching into n_knots>2 interior knots that forward() does not expose.
+
+_SW_NEG_SCORES = torch.arange(10, dtype=torch.float32)
+_SW_POS_SCORES = torch.tensor([12.0, 13.0, 14.0])
+_SW_POS_WEIGHT = torch.tensor([3.0, 1.0, 0.5])
+
+
+def _sw_loss_fn(surrogate, budget_basis, **kw):
+    return PAUCAtBudgetLoss(
+        num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate,
+        n_knots=2, tau_scale="band", temperature=0.5,
+        quantile_interpolation="higher", queue_size=0,
+        budget_basis=budget_basis, **kw,
+    )
+
+
+def _sw_batch():
+    logits = torch.cat([_SW_NEG_SCORES, _SW_POS_SCORES]).unsqueeze(1)
+    targets = torch.cat([
+        torch.zeros(10, dtype=torch.long), torch.ones(3, dtype=torch.long),
+    ])
+    weight = torch.cat([torch.ones(10), _SW_POS_WEIGHT])
+    return logits, targets, weight
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+@pytest.mark.parametrize("budget_basis", ["fpr", "population"])
+class TestSampleWeightPauc:
+    def test_hand_oracle_weighted_numerator(self, surrogate, budget_basis):
+        loss_fn = _sw_loss_fn(surrogate, budget_basis)
+        logits, targets, weight = _sw_batch()
+
+        loss, per_class, valid, stats = loss_fn(
+            logits, targets, sample_weight=weight,
+            return_per_class=True, return_diagnostics=True,
+        )
+        assert bool(valid[0])
+        t_alpha = stats["t_alpha"][0]
+        t_beta = stats["t_beta"][0]
+        tau_eff = stats["tau_eff"][0]
+
+        pos = _SW_POS_SCORES
+        w = _SW_POS_WEIGHT
+
+        if surrogate == "trapezoid":
+            # n_knots=2: tpr[0] is at t_alpha, tpr[1] at t_beta (pinning
+            # invariant), and the composite-trapezoid weights collapse to
+            # a plain average of the two.
+            c_alpha = torch.sigmoid((pos - t_alpha) / tau_eff)
+            c_beta = torch.sigmoid((pos - t_beta) / tau_eff)
+            tpr_alpha = (c_alpha * w).sum() / w.sum()
+            tpr_beta = (c_beta * w).sum() / w.sum()
+            expected_pauc = 0.5 * (tpr_alpha + tpr_beta)
+        else:
+            neg = _SW_NEG_SCORES
+            band_neg = neg[(neg >= t_beta) & (neg <= t_alpha)]
+            assert band_neg.numel() > 0, "test setup must produce a non-empty band"
+            contrib = torch.sigmoid(
+                (pos.unsqueeze(1) - band_neg.unsqueeze(0)) / tau_eff
+            )
+            expected_pauc = (w.unsqueeze(1) * contrib).sum() / (band_neg.numel() * w.sum())
+
+        expected_loss = 1.0 - expected_pauc
+        torch.testing.assert_close(per_class[0], expected_loss, atol=1e-5, rtol=1e-5)
+
+    def test_weighted_differs_from_unweighted(self, surrogate, budget_basis):
+        # Sanity check the oracle has teeth: non-uniform positive weights
+        # must move the loss away from the unweighted value.
+        loss_fn = _sw_loss_fn(surrogate, budget_basis)
+        logits, targets, weight = _sw_batch()
+        loss_w = loss_fn(logits, targets, sample_weight=weight)
+        loss_u = loss_fn(logits, targets)
+        assert not torch.allclose(loss_w, loss_u)
+
+    def test_all_ones_weight_matches_unweighted(self, surrogate, budget_basis):
+        loss_fn = _sw_loss_fn(surrogate, budget_basis)
+        logits, targets, _ = _sw_batch()
+        loss_ones = loss_fn(logits, targets, sample_weight=torch.ones(logits.size(0)))
+        loss_none = loss_fn(logits, targets)
+        torch.testing.assert_close(loss_ones, loss_none)
+
+    def test_positive_scaling_invariance(self, surrogate, budget_basis):
+        loss_fn = _sw_loss_fn(surrogate, budget_basis)
+        logits, targets, weight = _sw_batch()
+        loss1 = loss_fn(logits, targets, sample_weight=weight)
+        loss2 = loss_fn(logits, targets, sample_weight=weight * 9.0)
+        torch.testing.assert_close(loss1, loss2)
+
+    def test_diagnostics_bitwise_equal_with_and_without_weight(self, surrogate, budget_basis):
+        # Thresholds, tau_eff, the band mask (via band_neg_count), pauc_var
+        # (hence the per-positive v it derives from), and grad_pos_count are
+        # all computed before -- and independently of -- the weighted
+        # aggregation, so they must be bit-identical whether or not a
+        # weight is supplied on the same pool.
+        loss_fn = _sw_loss_fn(surrogate, budget_basis)
+        logits, targets, weight = _sw_batch()
+
+        _, stats_u = loss_fn(logits, targets, return_diagnostics=True)
+        _, stats_w = loss_fn(logits, targets, sample_weight=weight, return_diagnostics=True)
+
+        for key in ("t_alpha", "t_beta", "tau_eff", "band_neg_count", "pauc_var", "grad_pos_count"):
+            assert torch.equal(stats_u[key], stats_w[key]), (
+                f"{key} changed between unweighted and weighted calls on the same pool: "
+                f"{stats_u[key]} vs {stats_w[key]}"
+            )
+
+    def test_zero_positive_weight_class_invalid_all_reductions(self, surrogate, budget_basis):
+        g = torch.Generator().manual_seed(SEED)
+        n = 200
+        logits = torch.randn(n, 2, generator=g)
+        targets = (torch.rand(n, generator=g) < 0.5).long()
+        logits[targets == 1, 1] += 1.5  # separate class-1 positives from negatives
+        weight = torch.ones(n)
+        weight[targets == 0] = 0.0  # class-0 positives (rows where target==0) all zero weight
+
+        common = dict(
+            num_classes=2, alpha=0.1, beta=0.5, surrogate=surrogate,
+            budget_basis=budget_basis, queue_size=0,
+        )
+
+        fn_none = PAUCAtBudgetLoss(reduction="none", **common)
+        loss_none, per_class_none, valid_none = fn_none(
+            logits, targets, sample_weight=weight, return_per_class=True
+        )
+        assert not valid_none[0].item()
+        assert valid_none[1].item()
+        assert math.isnan(per_class_none[0].item())
+        assert not math.isnan(per_class_none[1].item())
+
+        fn_mean = PAUCAtBudgetLoss(reduction="mean", **common)
+        loss_mean = fn_mean(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_mean, per_class_none[1])
+
+        fn_sum = PAUCAtBudgetLoss(reduction="sum", **common)
+        loss_sum = fn_sum(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_sum, per_class_none[1])
+
+    def test_gradient_flows_to_positives_and_band_negatives_not_weights(
+        self, surrogate, budget_basis
+    ):
+        loss_fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate,
+            budget_basis=budget_basis, queue_size=0,
+        )
+        logits, targets = _wide_binary_batch()
+        logits.requires_grad_(True)
+        weight = torch.rand(logits.size(0))
+        weight.requires_grad_(True)
+
+        out = loss_fn(logits, targets, sample_weight=weight)
+        out.backward()
+
+        is_pos = targets.bool()
+        assert logits.grad[is_pos].abs().sum() > 0, "gradient must flow to positives"
+        if surrogate == "pairwise":
+            assert logits.grad[~is_pos].abs().sum() > 0, (
+                "pairwise band negatives must carry gradient"
+            )
+        else:
+            assert torch.allclose(
+                logits.grad[~is_pos], torch.zeros_like(logits.grad[~is_pos])
+            ), "trapezoid negatives only enter through detached thresholds"
+        assert weight.grad is None, (
+            "sample_weight is detached at forward entry -- it must never receive gradient"
+        )
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+@pytest.mark.parametrize("budget_basis", ["fpr", "population"])
+def test_pos_numerator_live_ignores_queue_weight(surrogate, budget_basis):
+    def _run(q_weight):
+        fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate,
+            n_knots=2, tau_scale="band", temperature=0.5,
+            quantile_interpolation="higher", budget_basis=budget_basis,
+            queue_size=64, pos_numerator="live",
+        )
+        fn.train()
+        g = torch.Generator().manual_seed(SEED)
+
+        q_neg = torch.randn(48, 1, generator=g) * 2.0
+        q_pos = torch.full((16, 1), 3.0)
+        q_log = torch.cat([q_neg, q_pos], dim=0)
+        q_tgt = torch.cat([torch.zeros(48, dtype=torch.long), torch.ones(16, dtype=torch.long)])
+        q_weight_t = torch.cat([torch.ones(48), torch.full((16,), q_weight)])
+        with torch.no_grad():
+            fn._queue.enqueue(q_log, q_tgt, sample_weight=q_weight_t)
+
+        live_neg = torch.randn(60, 1, generator=g) * 2.0
+        live_pos = torch.full((8, 1), 1.0)
+        live_log = torch.cat([live_neg, live_pos], dim=0)
+        live_tgt = torch.cat([torch.zeros(60, dtype=torch.long), torch.ones(8, dtype=torch.long)])
+        live_weight = torch.cat([torch.ones(60), torch.full((8,), 2.0)])
+
+        return fn(live_log, live_tgt, sample_weight=live_weight)
+
+    loss_low_q = _run(q_weight=1.0)
+    loss_high_q = _run(q_weight=50.0)
+    # pos_numerator="live" restricts the numerator to is_pos & is_live, so
+    # queue rows never enter w_num -- their weight must have zero effect.
+    assert torch.equal(loss_low_q, loss_high_q)
+
+
+@pytest.mark.parametrize("surrogate", ["trapezoid", "pairwise"])
+@pytest.mark.parametrize("budget_basis", ["fpr", "population"])
+def test_pos_numerator_pool_uses_stored_queue_weight(surrogate, budget_basis):
+    def _run(q_weight):
+        fn = PAUCAtBudgetLoss(
+            num_classes=1, alpha=0.1, beta=0.5, surrogate=surrogate,
+            n_knots=2, tau_scale="band", temperature=0.5,
+            quantile_interpolation="higher", budget_basis=budget_basis,
+            queue_size=64, pos_numerator="pool",
+        )
+        fn.train()
+        g = torch.Generator().manual_seed(SEED)
+
+        q_neg = torch.randn(48, 1, generator=g) * 2.0
+        q_pos = torch.full((16, 1), 3.0)
+        q_log = torch.cat([q_neg, q_pos], dim=0)
+        q_tgt = torch.cat([torch.zeros(48, dtype=torch.long), torch.ones(16, dtype=torch.long)])
+        q_weight_t = torch.cat([torch.ones(48), torch.full((16,), q_weight)])
+        with torch.no_grad():
+            fn._queue.enqueue(q_log, q_tgt, sample_weight=q_weight_t)
+
+        live_neg = torch.randn(60, 1, generator=g) * 2.0
+        live_pos = torch.full((8, 1), 1.0)
+        live_log = torch.cat([live_neg, live_pos], dim=0)
+        live_tgt = torch.cat([torch.zeros(60, dtype=torch.long), torch.ones(8, dtype=torch.long)])
+        live_weight = torch.cat([torch.ones(60), torch.full((8,), 2.0)])
+
+        return fn(live_log, live_tgt, sample_weight=live_weight)
+
+    loss_low_q = _run(q_weight=1.0)
+    loss_high_q = _run(q_weight=50.0)
+    # pos_numerator="pool" pools live + queue positives, so the queue's
+    # stored weight must move the loss.
+    assert not torch.allclose(loss_low_q, loss_high_q)
