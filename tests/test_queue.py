@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from imbalanced_losses._queue import _MemoryQueue
+from imbalanced_losses._queue import PooledBatch, _MemoryQueue
 
 
 # ---------------------------------------------------------------------------
@@ -197,31 +197,40 @@ class TestMerge:
         q = _MemoryQueue(queue_size=0, num_classes=self.C)
         logits = torch.randn(4, self.C)
         targets = torch.zeros(4, dtype=torch.long)
-        out_l, out_t = q.merge(logits, targets)
-        assert out_l is logits
-        assert out_t is targets
+        pool = q.merge(logits, targets)
+        assert pool.logits is logits
+        assert pool.targets is targets
+
+    def test_returns_a_pooled_batch(self):
+        # merge has exactly one return shape: PooledBatch, is_iid always
+        # populated, sample_weight populated only when one was supplied.
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        pool = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long))
+        assert isinstance(pool, PooledBatch)
+        assert pool.is_iid is not None
+        assert pool.sample_weight is None
 
     def test_output_logits_shape(self):
         q = _MemoryQueue(queue_size=8, num_classes=self.C)
         logits = torch.randn(4, self.C)
         targets = torch.zeros(4, dtype=torch.long)
-        out_l, _ = q.merge(logits, targets)
-        assert out_l.shape == (4 + 8, self.C)
+        pool = q.merge(logits, targets)
+        assert pool.logits.shape == (4 + 8, self.C)
 
     def test_output_targets_shape(self):
         q = _MemoryQueue(queue_size=8, num_classes=self.C)
         logits = torch.randn(4, self.C)
         targets = torch.zeros(4, dtype=torch.long)
-        _, out_t = q.merge(logits, targets)
-        assert out_t.shape == (4 + 8,)
+        pool = q.merge(logits, targets)
+        assert pool.targets.shape == (4 + 8,)
 
     def test_live_batch_comes_first(self):
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         logits = torch.ones(3, self.C) * 7.0
         targets = torch.tensor([1, 2, 0])
-        out_l, out_t = q.merge(logits, targets)
-        assert torch.allclose(out_l[:3], logits)
-        assert (out_t[:3] == targets).all()
+        pool = q.merge(logits, targets)
+        assert torch.allclose(pool.logits[:3], logits)
+        assert (pool.targets[:3] == targets).all()
 
     def test_queue_contents_follow_live_batch(self):
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
@@ -232,26 +241,26 @@ class TestMerge:
 
         logits = torch.zeros(2, self.C)
         targets = torch.zeros(2, dtype=torch.long)
-        out_l, out_t = q.merge(logits, targets)
-        assert torch.allclose(out_l[2:], fill)
-        assert (out_t[2:] == fill_targets).all()
+        pool = q.merge(logits, targets)
+        assert torch.allclose(pool.logits[2:], fill)
+        assert (pool.targets[2:] == fill_targets).all()
 
     def test_unfilled_slots_carry_ignore_index(self):
         # Fresh queue: all target slots should be ignore_index
         q = _MemoryQueue(queue_size=8, num_classes=self.C, ignore_index=-100)
         logits = torch.randn(4, self.C)
         targets = torch.zeros(4, dtype=torch.long)
-        _, out_t = q.merge(logits, targets)
+        pool = q.merge(logits, targets)
         # The queue portion is the last 8 entries
-        assert (out_t[4:] == -100).all()
+        assert (pool.targets[4:] == -100).all()
 
     def test_dtype_cast_in_merge(self):
         # Queue was constructed in float32; live batch is float16 — queue should be cast
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         logits = torch.randn(2, self.C).to(torch.float16)
         targets = torch.zeros(2, dtype=torch.long)
-        out_l, _ = q.merge(logits, targets)
-        assert out_l.dtype == torch.float16
+        pool = q.merge(logits, targets)
+        assert pool.logits.dtype == torch.float16
 
     def test_merge_concatenates_correctly_after_enqueue(self):
         torch.manual_seed(42)
@@ -262,10 +271,47 @@ class TestMerge:
 
         batch2 = torch.randn(3, self.C)
         tgt2 = torch.randint(0, self.C, (3,))
-        out_l, out_t = q.merge(batch2, tgt2)
+        pool = q.merge(batch2, tgt2)
         # Total rows: 3 live + 8 queue
-        assert out_l.shape[0] == 11
-        assert out_t.shape[0] == 11
+        assert pool.logits.shape[0] == 11
+        assert pool.targets.shape[0] == 11
+
+
+# ---------------------------------------------------------------------------
+# PooledBatch
+# ---------------------------------------------------------------------------
+
+
+class TestPooledBatchIndex:
+    """``index`` carries every tensor the batch holds through one selection."""
+
+    C = 2
+
+    def _batch(self, *, weighted: bool) -> PooledBatch:
+        return PooledBatch(
+            logits=torch.arange(8, dtype=torch.float).view(4, self.C),
+            targets=torch.tensor([0, 1, 0, 1]),
+            is_iid=torch.tensor([True, False, True, False]),
+            sample_weight=torch.tensor([1.0, 2.0, 3.0, 4.0]) if weighted else None,
+        )
+
+    def test_every_supplied_tensor_is_indexed(self):
+        out = self._batch(weighted=True).index(torch.tensor([3, 1]))
+        assert torch.equal(out.targets, torch.tensor([1, 1]))
+        assert torch.equal(out.is_iid, torch.tensor([False, False]))
+        assert torch.equal(out.sample_weight, torch.tensor([4.0, 2.0]))
+        assert torch.equal(out.logits, torch.tensor([[6.0, 7.0], [2.0, 3.0]]))
+
+    def test_absent_tensors_stay_absent(self):
+        out = self._batch(weighted=False).index(torch.tensor([0, 2]))
+        assert out.sample_weight is None
+        assert out.is_iid is not None
+
+    def test_boolean_mask_selection(self):
+        mask = torch.tensor([True, False, False, True])
+        out = self._batch(weighted=True).index(mask)
+        assert torch.equal(out.sample_weight, torch.tensor([1.0, 4.0]))
+        assert out.logits.shape == (2, self.C)
 
 
 # ---------------------------------------------------------------------------
@@ -435,69 +481,57 @@ class TestEnqueueIid:
 class TestMergeIid:
     C = 3
 
-    def test_return_iid_false_is_2tuple(self):
-        # Default (return_iid=False) must return exactly 2 elements — backward compat.
+    def test_iid_always_populated(self):
+        # is_iid is built unconditionally: there is no arity to opt into.
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
-        result = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long))
-        assert len(result) == 2
+        pool = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long))
+        assert pool.is_iid is not None
+        assert pool.is_iid.shape == (2 + 4,)
 
-    def test_return_iid_true_is_3tuple(self):
-        q = _MemoryQueue(queue_size=4, num_classes=self.C)
-        result = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long),
-                         return_iid=True)
-        assert len(result) == 3
-
-    def test_return_iid_false_identical_to_pre_change(self):
-        # Shape and values of the 2-tuple must be unchanged.
+    def test_logits_and_targets_unchanged_by_the_iid_field(self):
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         logits = torch.randn(2, self.C)
         targets = torch.tensor([0, 1])
-        out_l, out_t = q.merge(logits, targets)
-        assert out_l.shape == (2 + 4, self.C)
-        assert out_t.shape == (2 + 4,)
-
-    def test_iid_shape_in_3tuple(self):
-        q = _MemoryQueue(queue_size=4, num_classes=self.C)
-        _, _, out_iid = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long),
-                                return_iid=True)
-        assert out_iid.shape == (2 + 4,)
+        pool = q.merge(logits, targets)
+        assert pool.logits.shape == (2 + 4, self.C)
+        assert pool.targets.shape == (2 + 4,)
 
     def test_iid_dtype_bool(self):
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
-        _, _, out_iid = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long),
-                                return_iid=True)
-        assert out_iid.dtype == torch.bool
+        pool = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long))
+        assert pool.is_iid.dtype == torch.bool
 
     def test_iid_none_in_merge_equals_all_true(self):
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         logits = torch.randn(2, self.C)
         targets = torch.zeros(2, dtype=torch.long)
         # Explicit all-True vs None should produce the same iid tensor.
-        _, _, iid_none = q.merge(logits, targets, is_iid=None, return_iid=True)
-        _, _, iid_true = q.merge(logits, targets,
-                                 is_iid=torch.ones(2, dtype=torch.bool), return_iid=True)
+        iid_none = q.merge(logits, targets, is_iid=None).is_iid
+        iid_true = q.merge(
+            logits, targets, is_iid=torch.ones(2, dtype=torch.bool)
+        ).is_iid
         assert (iid_none == iid_true).all()
 
     def test_live_batch_iid_comes_first(self):
         # Live-batch flags occupy the first N positions.
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         live_iid = torch.tensor([True, False])
-        _, _, out_iid = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long),
-                                is_iid=live_iid, return_iid=True)
-        assert (out_iid[:2] == live_iid).all()
+        pool = q.merge(
+            torch.randn(2, self.C), torch.zeros(2, dtype=torch.long), is_iid=live_iid
+        )
+        assert (pool.is_iid[:2] == live_iid).all()
 
     def test_queue_iid_follows_live_batch(self):
         # Queue-stored flags occupy positions [N:].
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         stored_iid = torch.tensor([True, False, True, False])
         q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long), is_iid=stored_iid)
-        _, _, out_iid = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long),
-                                return_iid=True)
-        assert (out_iid[2:] == stored_iid).all()
+        pool = q.merge(torch.randn(2, self.C), torch.zeros(2, dtype=torch.long))
+        assert (pool.is_iid[2:] == stored_iid).all()
 
     def test_iid_row_alignment_with_logits(self):
-        # After enqueue+merge, out_iid[k] must correspond to the same row as
-        # out_logits[k] and out_targets[k].
+        # After enqueue+merge, is_iid[k] must correspond to the same row as
+        # logits[k] and targets[k].
         q = _MemoryQueue(queue_size=4, num_classes=self.C)
         stored_logits = torch.arange(4 * self.C, dtype=torch.float).view(4, self.C)
         stored_targets = torch.tensor([0, 1, 2, 0])
@@ -507,46 +541,39 @@ class TestMergeIid:
         live_logits = torch.zeros(2, self.C)
         live_targets = torch.tensor([1, 2])
         live_iid = torch.tensor([False, True])
-        out_l, out_t, out_iid = q.merge(live_logits, live_targets, is_iid=live_iid,
-                                        return_iid=True)
+        pool = q.merge(live_logits, live_targets, is_iid=live_iid)
         # Live rows at [0],[1]: check flag, target, logit row alignment.
-        assert bool(out_iid[0]) == False
-        assert bool(out_iid[1]) == True
-        assert int(out_t[0]) == 1
-        assert int(out_t[1]) == 2
+        assert not bool(pool.is_iid[0])
+        assert bool(pool.is_iid[1])
+        assert int(pool.targets[0]) == 1
+        assert int(pool.targets[1]) == 2
         # Queue rows at [2:6]: must match stored_iid exactly.
-        assert (out_iid[2:] == stored_iid).all()
-        assert (out_t[2:] == stored_targets).all()
+        assert (pool.is_iid[2:] == stored_iid).all()
+        assert (pool.targets[2:] == stored_targets).all()
 
-    def test_merge_queue_size_zero_return_iid_false(self):
+    def test_merge_queue_size_zero_returns_live_tensors(self):
         q = _MemoryQueue(queue_size=0, num_classes=self.C)
         logits = torch.randn(4, self.C)
         targets = torch.zeros(4, dtype=torch.long)
-        result = q.merge(logits, targets)
-        assert len(result) == 2
-        out_l, out_t = result
-        assert out_l is logits
-        assert out_t is targets
+        pool = q.merge(logits, targets)
+        assert pool.logits is logits
+        assert pool.targets is targets
 
-    def test_merge_queue_size_zero_return_iid_true_none(self):
+    def test_merge_queue_size_zero_iid_none(self):
         # When queue_size=0 and is_iid=None, synthesize all-True for the live batch.
         q = _MemoryQueue(queue_size=0, num_classes=self.C)
-        logits = torch.randn(4, self.C)
-        targets = torch.zeros(4, dtype=torch.long)
-        out_l, out_t, out_iid = q.merge(logits, targets, return_iid=True)
-        assert out_l is logits
-        assert out_t is targets
-        assert out_iid.shape == (4,)
-        assert out_iid.dtype == torch.bool
-        assert out_iid.all()
+        pool = q.merge(torch.randn(4, self.C), torch.zeros(4, dtype=torch.long))
+        assert pool.is_iid.shape == (4,)
+        assert pool.is_iid.dtype == torch.bool
+        assert pool.is_iid.all()
 
-    def test_merge_queue_size_zero_return_iid_true_explicit(self):
+    def test_merge_queue_size_zero_iid_explicit(self):
         q = _MemoryQueue(queue_size=0, num_classes=self.C)
-        logits = torch.randn(3, self.C)
-        targets = torch.zeros(3, dtype=torch.long)
         live_iid = torch.tensor([True, False, True])
-        out_l, out_t, out_iid = q.merge(logits, targets, is_iid=live_iid, return_iid=True)
-        assert (out_iid == live_iid).all()
+        pool = q.merge(
+            torch.randn(3, self.C), torch.zeros(3, dtype=torch.long), is_iid=live_iid
+        )
+        assert (pool.is_iid == live_iid).all()
 
 
 # ---------------------------------------------------------------------------
@@ -623,3 +650,370 @@ class TestIidCheckpointCompat:
         # _load_from_state_dict injects the default so strict=True doesn't error.
         q_new.load_state_dict(sd, strict=True)
         assert q_new._q_iid.all()
+
+
+# ---------------------------------------------------------------------------
+# _q_weight buffer: init
+# ---------------------------------------------------------------------------
+
+
+class TestWeightBufferInit:
+    C = 3
+
+    def test_weight_buffer_registered_positive_queue_size(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        assert hasattr(q, "_q_weight")
+
+    def test_weight_buffer_shape(self):
+        q = _MemoryQueue(queue_size=16, num_classes=self.C)
+        assert q._q_weight.shape == (16,)
+
+    def test_weight_buffer_dtype_float32(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        assert q._q_weight.dtype == torch.float32
+
+    def test_weight_buffer_initialised_to_one(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        assert (q._q_weight == 1.0).all()
+
+    def test_no_weight_buffer_when_queue_size_zero(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        assert not hasattr(q, "_q_weight")
+
+    def test_weight_buffer_appears_in_state_dict(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        assert "_q_weight" in q.state_dict()
+
+    def test_has_weights_false_on_construction(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        assert q.has_weights is False
+
+    def test_has_weights_false_when_queue_size_zero(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        assert q.has_weights is False
+
+
+# ---------------------------------------------------------------------------
+# _q_weight buffer: enqueue
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueWeight:
+    C = 3
+
+    def test_enqueue_explicit_weight_stored(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        weight = torch.tensor([2.0, 0.5, 1.5, 3.0])
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long), sample_weight=weight)
+        assert torch.allclose(q._q_weight[:4], weight)
+
+    def test_enqueue_none_weight_stores_one(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long), sample_weight=None)
+        assert (q._q_weight[:4] == 1.0).all()
+
+    def test_enqueue_none_equals_explicit_all_one(self):
+        # Both code paths must produce identical buffer contents.
+        q1 = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q2 = _MemoryQueue(queue_size=8, num_classes=self.C)
+        logits = torch.randn(4, self.C)
+        targets = torch.zeros(4, dtype=torch.long)
+        q1.enqueue(logits, targets, sample_weight=None)
+        q2.enqueue(logits, targets, sample_weight=torch.ones(4))
+        assert torch.allclose(q1._q_weight, q2._q_weight)
+
+    def test_enqueue_weighted_sets_has_weights_true(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        weight = torch.tensor([2.0, 0.5, 1.5, 3.0])
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long), sample_weight=weight)
+        assert q.has_weights is True
+
+    def test_enqueue_explicit_all_ones_leaves_has_weights_false(self):
+        # has_weights reads the stored rows ("does the buffer hold a weight
+        # other than 1"), not the call history ("was a weight ever passed").
+        # An all-ones weight is arithmetically the unweighted case, so it
+        # must not switch the loss onto the weighted op sequence.
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.ones(4))
+        assert q.has_weights is False
+
+    def test_has_weights_clears_once_weighted_rows_are_overwritten(self):
+        # Every weighted row aged out of the circular buffer: the queue holds
+        # no non-unit weight any more, so the unweighted path is restored.
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.tensor([2.0, 3.0, 4.0, 5.0]))
+        assert q.has_weights is True
+
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long))
+        assert q.has_weights is False
+
+    def test_has_weights_stays_true_while_one_weighted_row_remains(self):
+        # Partial overwrite: 3 of 4 rows replaced, one weighted row survives.
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.tensor([2.0, 3.0, 4.0, 5.0]))
+        q.enqueue(torch.zeros(3, self.C), torch.zeros(3, dtype=torch.long))
+        assert q.has_weights is True
+
+    def test_enqueue_unweighted_leaves_has_weights_false(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long))
+        assert q.has_weights is False
+
+    def test_enqueue_weight_advances_pointer_same_as_before(self):
+        q = _MemoryQueue(queue_size=16, num_classes=self.C)
+        q.enqueue(torch.zeros(5, self.C), torch.zeros(5, dtype=torch.long),
+                  sample_weight=torch.ones(5))
+        assert int(q._q_ptr) == 5
+
+    def test_enqueue_wrap_around_preserves_weight_alignment(self):
+        # Fill 6 rows, then wrap 4 more.  The 2 wrapped rows land at [0],[1].
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(6, self.C), torch.zeros(6, dtype=torch.long),
+                  sample_weight=torch.ones(6))
+        weight2 = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        q.enqueue(torch.ones(4, self.C), torch.ones(4, dtype=torch.long), sample_weight=weight2)
+        # First two of weight2 wrapped to indices 0,1 (those are weight2[2],weight2[3])
+        assert float(q._q_weight[0]) == float(weight2[2])
+        assert float(q._q_weight[1]) == float(weight2[3])
+        # Tail (indices 6,7) holds weight2[0],weight2[1]
+        assert float(q._q_weight[6]) == float(weight2[0])
+        assert float(q._q_weight[7]) == float(weight2[1])
+
+    def test_enqueue_replace_wholesale_preserves_weight(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        big_weight = torch.arange(1, 13, dtype=torch.float)  # 12 rows
+        q.enqueue(torch.zeros(12, self.C), torch.zeros(12, dtype=torch.long),
+                  sample_weight=big_weight)
+        # Only the last 8 rows of big_weight should be stored.
+        assert torch.allclose(q._q_weight, big_weight[-8:])
+        assert int(q._q_ptr) == 0
+
+    def test_enqueue_no_op_queue_size_zero_with_weight(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        # Must not raise even when sample_weight is provided.
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.ones(4))
+
+    def test_enqueue_weight_detached(self):
+        # _q_weight must not hold grad_fn references.
+        q = _MemoryQueue(queue_size=16, num_classes=self.C)
+        logits = torch.randn(4, self.C, requires_grad=True)
+        targets = torch.zeros(4, dtype=torch.long)
+        weight = torch.ones(4, requires_grad=True)
+        q.enqueue(logits, targets, sample_weight=weight)
+        assert q._q_weight[:4].grad_fn is None
+
+
+# ---------------------------------------------------------------------------
+# _q_weight buffer: merge
+# ---------------------------------------------------------------------------
+
+
+class TestMergeWeight:
+    C = 3
+
+    def _merge(self, q, n=2, *, sample_weight=None, dtype=torch.float32):
+        return q.merge(
+            torch.randn(n, self.C, dtype=dtype),
+            torch.zeros(n, dtype=torch.long),
+            sample_weight=sample_weight,
+        )
+
+    def test_no_weight_supplied_leaves_the_field_none(self):
+        # The None field is the structural unweighted path: no weight tensor
+        # is materialized anywhere.
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        assert self._merge(q).sample_weight is None
+
+    def test_weight_supplied_populates_the_field(self):
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        pool = self._merge(q, sample_weight=torch.ones(2))
+        assert pool.sample_weight is not None
+        assert pool.sample_weight.shape == (2 + 4,)
+
+    def test_weight_dtype_matches_logits(self):
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        pool = self._merge(q, sample_weight=torch.ones(2))
+        assert pool.sample_weight.dtype == torch.float32
+
+    def test_live_batch_weight_comes_first(self):
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        live_weight = torch.tensor([2.0, 3.0])
+        pool = self._merge(q, sample_weight=live_weight)
+        assert torch.allclose(pool.sample_weight[:2], live_weight)
+
+    def test_queue_weight_follows_live_batch(self):
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        stored_weight = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=stored_weight)
+        pool = self._merge(q, sample_weight=torch.ones(2))
+        assert torch.allclose(pool.sample_weight[2:], stored_weight)
+
+    def test_weight_row_alignment_with_logits(self):
+        # sample_weight[k] must correspond to the same row as logits[k].
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        stored_logits = torch.arange(4 * self.C, dtype=torch.float).view(4, self.C)
+        stored_targets = torch.tensor([0, 1, 2, 0])
+        stored_weight = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        q.enqueue(stored_logits, stored_targets, sample_weight=stored_weight)
+
+        live_logits = torch.zeros(2, self.C)
+        live_targets = torch.tensor([1, 2])
+        live_weight = torch.tensor([9.0, 8.0])
+        pool = q.merge(live_logits, live_targets, sample_weight=live_weight)
+        assert float(pool.sample_weight[0]) == 9.0
+        assert float(pool.sample_weight[1]) == 8.0
+        assert torch.allclose(pool.sample_weight[2:], stored_weight)
+
+    def test_merge_queue_size_zero_no_weight_is_none(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        assert self._merge(q, n=4).sample_weight is None
+
+    def test_merge_queue_size_zero_with_weight(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        weight = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        pool = self._merge(q, n=4, sample_weight=weight)
+        assert torch.allclose(pool.sample_weight, weight)
+
+    def test_dtype_cast_weight_in_merge(self):
+        # Queue was constructed in float32; live batch is float16 — output
+        # weight should follow the logits dtype, like _q_logits does.
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        pool = self._merge(
+            q, sample_weight=torch.ones(2).to(torch.float16), dtype=torch.float16
+        )
+        assert pool.sample_weight.dtype == torch.float16
+
+    def test_weight_dtype_matches_logits_queue_size_zero(self):
+        # The queue_size == 0 short-circuit must cast the pooled weight to
+        # logits.dtype exactly like the queue_size > 0 branch does --
+        # _compute_per_class must never see a dtype that depends on
+        # whether the queue happens to be enabled.
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        pool = self._merge(
+            q, n=4, sample_weight=torch.ones(4, dtype=torch.float32),
+            dtype=torch.float64,
+        )
+        assert pool.sample_weight.dtype == torch.float64
+
+    def test_weight_dtype_matches_logits_queue_size_positive(self):
+        q = _MemoryQueue(queue_size=4, num_classes=self.C)
+        pool = self._merge(
+            q, sample_weight=torch.ones(2, dtype=torch.float32), dtype=torch.float64
+        )
+        assert pool.sample_weight.dtype == torch.float64
+
+
+# ---------------------------------------------------------------------------
+# _q_weight buffer: reset
+# ---------------------------------------------------------------------------
+
+
+class TestResetWeight:
+    C = 3
+
+    def test_reset_restores_weight_to_one(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.tensor([2.0, 3.0, 4.0, 5.0]))
+        q.reset()
+        assert (q._q_weight == 1.0).all()
+
+    def test_reset_restores_has_weights_false(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(4, self.C), torch.zeros(4, dtype=torch.long),
+                  sample_weight=torch.ones(4) * 2.0)
+        assert q.has_weights is True
+        q.reset()
+        assert q.has_weights is False
+
+    def test_reset_no_op_when_queue_size_zero(self):
+        q = _MemoryQueue(queue_size=0, num_classes=self.C)
+        q.reset()  # must not raise
+
+    def test_enqueue_after_reset_weight_starts_fresh(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.zeros(6, self.C), torch.zeros(6, dtype=torch.long),
+                  sample_weight=torch.ones(6) * 5.0)
+        q.reset()
+        new_weight = torch.tensor([1.0, 2.0, 3.0])
+        q.enqueue(torch.ones(3, self.C), torch.zeros(3, dtype=torch.long),
+                  sample_weight=new_weight)
+        assert torch.allclose(q._q_weight[:3], new_weight)
+        # Remaining slots (not yet written) should still be 1.0 from reset.
+        assert (q._q_weight[3:] == 1.0).all()
+
+
+# ---------------------------------------------------------------------------
+# _q_weight buffer: checkpoint / state_dict
+# ---------------------------------------------------------------------------
+
+
+class TestWeightCheckpointCompat:
+    C = 3
+
+    def test_state_dict_round_trip(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        weight = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        q.enqueue(torch.randn(8, self.C), torch.zeros(8, dtype=torch.long), sample_weight=weight)
+        sd = q.state_dict()
+        assert "_q_weight" in sd
+
+        q2 = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q2.load_state_dict(sd)
+        assert torch.allclose(q2._q_weight, weight)
+
+    def test_weighted_state_dict_round_trip_has_weights_true(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        weight = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        q.enqueue(torch.randn(8, self.C), torch.zeros(8, dtype=torch.long), sample_weight=weight)
+        sd = q.state_dict()
+
+        q2 = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q2.load_state_dict(sd)
+        assert q2.has_weights is True
+
+    def test_unweighted_state_dict_round_trip_has_weights_false(self):
+        q = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q.enqueue(torch.randn(8, self.C), torch.zeros(8, dtype=torch.long))
+        sd = q.state_dict()
+
+        q2 = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q2.load_state_dict(sd)
+        assert q2.has_weights is False
+
+    def test_legacy_state_dict_missing_weight_loads_as_ones(self):
+        # Simulate a checkpoint saved before _q_weight was introduced: the
+        # key is absent from the state_dict.
+        q_legacy = _MemoryQueue(queue_size=8, num_classes=self.C)
+        sd = q_legacy.state_dict()
+        del sd["_q_weight"]
+
+        q_new = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q_new.load_state_dict(sd, strict=False)
+        assert (q_new._q_weight == 1.0).all()
+
+    def test_legacy_strict_load_injects_ones_default(self):
+        # Even with strict=True, a missing _q_weight should be handled
+        # gracefully (injected as ones in _load_from_state_dict before the
+        # strict check), mirroring the _q_iid shim.
+        q_legacy = _MemoryQueue(queue_size=8, num_classes=self.C)
+        sd = q_legacy.state_dict()
+        del sd["_q_weight"]
+
+        q_new = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q_new.load_state_dict(sd, strict=True)
+        assert (q_new._q_weight == 1.0).all()
+
+    def test_legacy_strict_load_has_weights_false(self):
+        q_legacy = _MemoryQueue(queue_size=8, num_classes=self.C)
+        sd = q_legacy.state_dict()
+        del sd["_q_weight"]
+
+        q_new = _MemoryQueue(queue_size=8, num_classes=self.C)
+        q_new.load_state_dict(sd, strict=True)
+        assert q_new.has_weights is False

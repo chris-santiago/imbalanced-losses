@@ -75,6 +75,7 @@ nav:
     - how-to/index.md
     - Use Focal Loss: how-to/use-focal-loss.md
     - Use Ranking Losses: how-to/use-ranking-losses.md
+    - Weight Samples by Value: how-to/weight-samples.md
     - Configure Warmup and Blending: how-to/configure-warmup.md
     - Train with DDP: how-to/train-with-ddp.md
     - Log Per-Class Metrics: how-to/log-per-class-metrics.md

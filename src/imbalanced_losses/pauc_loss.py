@@ -67,6 +67,7 @@ from typing import Any, Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._weights import _positive_mass
 
 
 class PAUCAtBudgetLoss(_QueuedRankingLoss):
@@ -395,8 +396,18 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Delegate to the internal ``_MemoryQueue``."""
-        return self._queue.merge(logits, targets)
+        """Delegate to the internal ``_MemoryQueue``.
+
+        Backward-compatibility surface only: nothing inside the library
+        calls this, and the pooled rail uses ``merge``'s
+        :class:`~imbalanced_losses._queue.PooledBatch` fields directly. It
+        is retained because it was a (private) method on this class before
+        the queue was extracted and before ``merge`` returned a
+        ``PooledBatch``, so an out-of-library subclass may still call it;
+        it therefore keeps returning the 2-tuple that contract promised.
+        """
+        pool = self._queue.merge(logits, targets)
+        return pool.logits, pool.targets
 
     # ------------------------------------------------------------------
     # Core algorithm
@@ -539,6 +550,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_neg: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, bool, dict[str, Any]]:
         """
         Compute normalized partial AUC over ``[alpha, beta]`` for one class.
@@ -558,6 +570,15 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag (True = live-batch row, False = queue).
             Consulted only when ``self.pos_numerator == "live"``.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight. ``None`` (default) computes the
+            unweighted numerator, byte-identical to the pre-``sample_weight``
+            release. When supplied, only the numerator positives' weights
+            (``sample_weight[pos_num]``) enter the trapezoid ``tpr_k`` and
+            pairwise pAUC numerators; negatives' weights, the band-edge
+            quantiles, ``tau_eff``, and the band mask are never touched.
+            Diagnostics (``v``, ``pauc_var``, ``band_neg_count``,
+            ``grad_pos_count``) stay unweighted.
 
         Returns
         -------
@@ -568,10 +589,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             False if there are no positives, no reference-population rows
             (iid negatives under ``budget_basis="fpr"``, or the whole iid
             population under ``budget_basis="population"``), the reference
-            dispersion is near-zero (degenerate), or (pairwise) no band
-            negatives. When ``pos_numerator="live"``, also False if there are
-            no live positives for this class (no gradient signal this step).
-            Invalid classes are excluded from reduction.
+            dispersion is near-zero (degenerate), (pairwise) no band
+            negatives, or -- when weighted -- the numerator positives' weight
+            mass is zero. When ``pos_numerator="live"``, also False if there
+            are no live positives for this class (no gradient signal this
+            step). Invalid classes are excluded from reduction.
         diag : dict
             Diagnostic scalars for this class (all detached) when
             ``self._want_diag`` is True. Keys: ``t_alpha``, ``t_beta``,
@@ -617,6 +639,13 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         else:
             # "pool": use all pooled positives (pre-change behavior).
             pos_num = is_pos
+
+        w_num: torch.Tensor | None = None
+        if sample_weight is not None:
+            w_num, no_mass = _positive_mass(sample_weight, pos_num)
+            if no_mass:
+                # Zero weighted positive mass: same invalid path as n_pos == 0.
+                return scores.new_zeros(()), False, {}
 
         ref = scores[ref_mask].detach()
         # One sort resolves the band edges, the trapezoid knots (when that
@@ -670,8 +699,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             contrib_mat = torch.sigmoid(
                 (p.unsqueeze(1) - t_k.unsqueeze(0)) / tau_eff
             )
-            # [n_knots] -- mean over numerator positives.
-            tpr = contrib_mat.mean(dim=0)
+            # [n_knots] -- mean over numerator positives (weighted mean when
+            # sample_weight is supplied; negatives never enter this term).
+            if w_num is None:
+                tpr = contrib_mat.mean(dim=0)
+            else:
+                tpr = (contrib_mat * w_num.unsqueeze(1)).sum(dim=0) / w_num.sum()
             # Composite trapezoid on a uniform grid, normalized to [alpha, beta].
             pauc = (
                 0.5 * tpr[0] + tpr[1:-1].sum() + 0.5 * tpr[-1]
@@ -679,7 +712,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             if not self._want_diag:
                 return pauc, True, {}
             # Per-positive pAUC contribution: apply the same trapezoid weights
-            # per row so that mean(v_i) == pauc.
+            # per row.  Unweighted, mean(v_i) == pauc; with sample_weight the
+            # weighted mean of v_i equals pauc while v itself stays unweighted
+            # (diagnostics are deliberately weight-blind).
             with torch.no_grad():
                 weights = contrib_mat.new_ones(self.n_knots)
                 weights[0] = 0.5
@@ -713,7 +748,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         contrib_mat = torch.sigmoid(
             (p.unsqueeze(1) - b.unsqueeze(0)) / tau_eff
         )
-        pauc = contrib_mat.mean()
+        n_band = b.size(0)
+        if w_num is None:
+            pauc = contrib_mat.mean()
+        else:
+            pauc = (w_num.unsqueeze(1) * contrib_mat).sum() / (n_band * w_num.sum())
         if not self._want_diag:
             return pauc, True, {}
         # Per-positive contribution: mean over band negatives for each positive.
@@ -747,6 +786,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         iid_mask: torch.Tensor | None = None,
         return_per_class: bool = False,
         return_diagnostics: bool = False,
+        *,
+        sample_weight: torch.Tensor | None = None,
     ) -> (
         torch.Tensor
         | tuple[torch.Tensor, dict]
@@ -781,6 +822,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
             When ``False`` (default), behavior is bit-identical to the
             base-class forward.
+        sample_weight : torch.Tensor, shape [N], optional
+            Per-observation weight, forwarded to the base-class forward
+            unchanged on both the fast and diagnostics paths.  See
+            ``_QueuedRankingLoss.forward`` for the full contract.
 
         Returns
         -------
@@ -836,7 +881,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         if not return_diagnostics:
             # Fast path: no diagnostics needed — bit-identical to base forward.
             return super().forward(
-                logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+                logits, targets, iid_mask=iid_mask, return_per_class=return_per_class,
+                sample_weight=sample_weight,
             )
 
         valid_mask = targets != self.ignore_index
@@ -850,7 +896,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         # --- delegate to base forward (runs _compute_per_class as side effect) --
         base_out = super().forward(
-            logits, targets, iid_mask=iid_mask, return_per_class=return_per_class
+            logits, targets, iid_mask=iid_mask, return_per_class=return_per_class,
+            sample_weight=sample_weight,
         )
 
         # --- assemble stats dict from _last_diag --------------------------------
@@ -909,6 +956,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - pAUC for each class via one-vs-rest decomposition.
@@ -925,6 +973,12 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; threaded into ``_compute_pauc`` so
             ``pos_numerator="live"`` can restrict the numerator positive set.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Threaded into :meth:`_compute_pauc`, which weights the
+            numerator positives' contribution to ``tpr_k`` (trapezoid) or
+            the pairwise pAUC numerator by their own weight; thresholds,
+            ``tau_eff``, the band mask, and diagnostics are unchanged.
 
         Returns
         -------
@@ -947,7 +1001,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 )
             is_pos = targets.bool()
             pauc, is_valid, diag = self._compute_pauc(
-                logits[:, 0], is_pos, ~is_pos, is_iid, is_live
+                logits[:, 0], is_pos, ~is_pos, is_iid, is_live,
+                sample_weight=sample_weight,
             )
             loss_vals = [1.0 - pauc]
             valid_mask = [is_valid]
@@ -958,7 +1013,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             for c in range(self.num_classes):
                 is_pos = targets == c
                 pauc, is_valid, diag = self._compute_pauc(
-                    logits[:, c], is_pos, ~is_pos, is_iid, is_live
+                    logits[:, c], is_pos, ~is_pos, is_iid, is_live,
+                    sample_weight=sample_weight,
                 )
                 loss_vals.append(1.0 - pauc)
                 valid_mask.append(is_valid)

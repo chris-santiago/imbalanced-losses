@@ -33,6 +33,7 @@ from typing import Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._weights import _positive_mass
 
 
 class RecallAtQuantileLoss(_QueuedRankingLoss):
@@ -216,8 +217,18 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Delegate to the internal ``_MemoryQueue``."""
-        return self._queue.merge(logits, targets)
+        """Delegate to the internal ``_MemoryQueue``.
+
+        Backward-compatibility surface only: nothing inside the library
+        calls this, and the pooled rail uses ``merge``'s
+        :class:`~imbalanced_losses._queue.PooledBatch` fields directly. It
+        is retained because it was a (private) method on this class before
+        the queue was extracted and before ``merge`` returned a
+        ``PooledBatch``, so an out-of-library subclass may still call it;
+        it therefore keeps returning the 2-tuple that contract promised.
+        """
+        pool = self._queue.merge(logits, targets)
+        return pool.logits, pool.targets
 
     # ------------------------------------------------------------------
     # Core algorithm
@@ -227,6 +238,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         self,
         scores: torch.Tensor,
         is_pos: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """
         Compute soft recall above the score quantile for one class.
@@ -239,13 +251,22 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             negatives), then applied only to positives.
         is_pos : torch.Tensor, shape [M], dtype=bool
             Positive mask for this class.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight. ``None`` (default) computes the
+            unweighted mean over positives, byte-identical to the
+            pre-``sample_weight`` release. When supplied, the positives'
+            soft-recall terms are averaged by weight mass:
+            ``Σ_i w_i · σ((s_i − θ)/τ) / Σ_i w_i``. The threshold θ is
+            always the unweighted quantile of all scores; negatives'
+            weights are never consulted.
 
         Returns
         -------
         recall : torch.Tensor, scalar
             Soft recall estimate in [0, 1].
         valid : bool
-            False if there are no positives in the pool. Classes with
+            False if there are no positives in the pool, or -- when
+            weighted -- the positives' weight mass is zero. Classes with
             no positives are excluded from the reduction rather than
             contributing a misleading 0.
 
@@ -258,13 +279,22 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         if n_pos == 0:
             return scores.new_zeros(()), False
 
+        w_pos: torch.Tensor | None = None
+        if sample_weight is not None:
+            w_pos, no_mass = _positive_mass(sample_weight, is_pos)
+            if no_mass:
+                # Zero weighted positive mass: same invalid path as n_pos == 0.
+                return scores.new_zeros(()), False
+
         theta = torch.quantile(
             scores.detach(),
             1.0 - self.quantile,
             interpolation=self.quantile_interpolation,
         )
         soft_above = torch.sigmoid((scores[is_pos] - theta) / self.temperature)
-        return soft_above.mean(), True
+        if w_pos is None:
+            return soft_above.mean(), True
+        return (soft_above * w_pos).sum() / w_pos.sum(), True
 
     # ------------------------------------------------------------------
     # Subclass validation hook
@@ -296,6 +326,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - recall for each class via one-vs-rest decomposition.
@@ -312,6 +343,12 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             not used by Recall-at-Quantile.
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; not used by Recall-at-Quantile.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Threaded into :meth:`_soft_recall_at_quantile`, which
+            weights each positive's soft-recall term by its own weight;
+            the threshold and the unweighted mean/degenerate-case
+            structure are unchanged.
 
         Returns
         -------
@@ -332,7 +369,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
                     stacklevel=4,
                 )
             recall, is_valid = self._soft_recall_at_quantile(
-                logits[:, 0], targets.bool()
+                logits[:, 0], targets.bool(), sample_weight=sample_weight
             )
             loss_vals = [1.0 - recall]
             valid_mask = [is_valid]
@@ -340,7 +377,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 recall, is_valid = self._soft_recall_at_quantile(
-                    logits[:, c], targets == c
+                    logits[:, c], targets == c, sample_weight=sample_weight
                 )
                 loss_vals.append(1.0 - recall)
                 valid_mask.append(is_valid)

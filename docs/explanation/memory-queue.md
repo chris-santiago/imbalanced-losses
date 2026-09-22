@@ -40,6 +40,14 @@ If these stale entries remain in the queue, the AP loss computes ranks relative 
 - After changing model architecture or checkpoint
 - When `reset_queue_each_epoch=True` in `LossWarmupWrapper` is set — useful when the model changes significantly epoch-to-epoch and stale logits would bias ranking
 
+## Stored `sample_weight`
+
+Each queue row stores a fourth value alongside `logits`, `targets`, and the iid flag: the weight it was enqueued with. Rows enqueued from a call that supplied `sample_weight` store that weight; rows enqueued from a call that did not (including every row enqueued before this feature existed) store `1.0`, so an unweighted step following a weighted one contributes weight-`1` rows to the pool while the pool's older weighted rows keep their stored weights. Mixed weighted/unweighted training is well-defined. `reset_queue()` restores every stored weight to `1.0` along with the rest of the buffer.
+
+The weighted arithmetic in `_compute_per_class` only activates when this call supplied a weight or the queue holds at least one row with a stored weight other than `1`; the queue exposes this as `has_weights`, a plain Python `bool` re-evaluated from the stored weights every time the buffer changes (enqueue, `reset_queue()`, checkpoint load). It is a property of the rows currently held, not of the call history: enqueuing an explicitly all-ones weight leaves it `False`, and once the last non-unit row has been overwritten by later unweighted steps it returns to `False`. This is what keeps the unweighted code path bitwise unchanged when `sample_weight` is never used: no weight tensor is ever materialized, and `merge()` performs exactly the operations it did before this feature existed.
+
+**Checkpoint compatibility:** a checkpoint saved before `sample_weight` existed has no `_q_weight` buffer in its state dict. Loading it with `strict=True` still succeeds: the missing buffer is injected as `torch.ones(queue_size)` before `load_state_dict` runs its strict-key check, mirroring the existing `_q_iid` shim. A checkpoint saved *with* weighted queue rows restores `has_weights=True` on load by inspecting the loaded `_q_weight` buffer (`(w != 1).any()`), since `has_weights` itself is not persisted.
+
 ## Queue size vs. pool size limits
 
 The core AP computation is O(|P| × M) by construction — only the positive rows of the pairwise comparison matrix are formed — where M = batch + queue. The positive rate does not change that complexity; it determines the savings factor relative to a naive O(M²) implementation (about 200× at a 0.5% positive rate). M still has a practical upper limit of ~4096 for reasonable training step times on a single GPU. At a 0.5% positive rate with M=4096, you get ~20 positives — a comfortable signal.

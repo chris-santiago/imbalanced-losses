@@ -70,6 +70,22 @@ If you explicitly do not want gathering (e.g. debugging on a single GPU while a 
 loss_fn = SmoothAPLoss(num_classes=4, gather_distributed=False)
 ```
 
+## Weighted training under DDP
+
+`sample_weight` gathers alongside `logits`, `targets`, and `iid_mask`. No extra wiring is needed beyond passing it to the loss on every rank:
+
+```python
+loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+
+# Each GPU passes its own local weight; the loss gathers it for you.
+loss = loss_fn(logits, targets, sample_weight=dollar_weight)
+loss.backward()
+```
+
+**All ranks must agree on whether `sample_weight` is supplied on a given step.** The loss issues one additional no-grad collective when a weight is present; if one rank passes `sample_weight` and another does not, the ranks disagree on how many collectives to run and the training step deadlocks or reads garbage from a misaligned buffer. Build your weight tensor unconditionally per batch (falling back to `torch.ones(N)` where you have no natural weight) rather than making the argument conditional on data content. Never write `if some_batches_have_weights: loss_fn(..., sample_weight=w)`, since a batch boundary that differs across ranks (e.g. per-rank filtering) can desynchronize the call.
+
+Unweighted steps issue no additional collective, so an all-`None` weighted-but-conditionally-empty training run pays no cost versus a version of the code that never mentions `sample_weight`.
+
 ## Confirm distributed setup
 
 Both helpers raise `RuntimeError` if called before `dist.init_process_group` — even on a single GPU. Once a process group is initialized with `world_size == 1`, they are no-ops (return the input unchanged):

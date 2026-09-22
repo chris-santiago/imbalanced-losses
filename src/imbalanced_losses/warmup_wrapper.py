@@ -54,6 +54,7 @@ Usage in a LightningModule (step-based warmup)
 
 from __future__ import annotations
 
+import inspect
 import math
 import warnings
 
@@ -130,11 +131,6 @@ class LossWarmupWrapper(nn.Module):
         Use this when you want a permanent mix — e.g.
         ``final_main_weight=0.75`` keeps a 75 / 25 main / warmup split
         indefinitely after the blend ramp completes.
-
-        .. note::
-            When ``final_main_weight < 1.0``, ``**kwargs`` are never
-            forwarded to ``main_loss`` (the blended path does not support
-            them).
     reset_queue_each_epoch : bool, optional
         Call ``main_loss.reset_queue()`` at the start of each epoch in
         the main phase (if the method exists).  Default: False.
@@ -216,6 +212,19 @@ class LossWarmupWrapper(nn.Module):
 
         self._has_temperature: bool = hasattr(main_loss, "temperature")
         self._has_reset_queue: bool = hasattr(main_loss, "reset_queue")
+        # Whether warmup_loss can be handed a sample_weight, decided once.
+        # A loss qualifies by declaring the parameter by name or by
+        # declaring **kwargs (which a loss that forwards its kwargs on does).
+        # Guarded with the same hasattr idiom the constructor uses for
+        # main_loss rather than assuming the nn.Module annotation holds.
+        self._warmup_accepts_sample_weight: bool = False
+        if hasattr(warmup_loss, "forward"):
+            params = inspect.signature(warmup_loss.forward).parameters.values()
+            self._warmup_accepts_sample_weight = any(
+                (p.name == "sample_weight" and p.kind is not p.VAR_POSITIONAL)
+                or p.kind is p.VAR_KEYWORD
+                for p in params
+            )
 
         if not self._has_temperature:
             warnings.warn(
@@ -492,21 +501,41 @@ class LossWarmupWrapper(nn.Module):
             Integer class labels or binary targets, shape as expected by
             the active loss.
         **kwargs
-            Additional keyword arguments forwarded to ``main_loss`` only
-            (e.g. ``return_per_class=True``).  Silently ignored during
-            the warmup phase.
+            Additional keyword arguments forwarded to ``main_loss`` in every
+            phase (warmup-ended, blend, and main), e.g. ``return_per_class=True``
+            or ``sample_weight=...``.  ``warmup_loss`` only ever receives
+            ``sample_weight``, and only when its ``forward`` declares that
+            parameter by name or declares ``**kwargs`` (decided once in
+            ``__init__``).  No other keyword argument reaches ``warmup_loss``
+            in any phase: an argument that changes what ``warmup_loss``
+            returns would break the blend step's scalar arithmetic and make
+            the warmup phase's return arity depend on the warmup loss's
+            signature.
 
         Returns
         -------
         torch.Tensor or tuple
-            During warmup or blend: scalar tensor.  After blend: output of
+            The return shape tracks ``main_loss`` whenever ``main_loss`` is
+            called, i.e. in the blend and main phases.  During the pure
+            warmup phase the wrapper returns ``warmup_loss``'s scalar, so
+            return-shape keyword arguments have no effect there.
+
+            During warmup: scalar tensor from ``warmup_loss``.  During blend:
+            ``(1 - w) * warmup_loss(...) + w * main_loss(...)``, a scalar
+            tensor.  If ``main_loss`` returns a tuple instead (e.g.
+            ``return_per_class=True``), only the leading loss element is
+            blended; the remaining elements pass through from ``main_loss``
+            unmodified, since there is no warmup-side counterpart for them,
+            yielding a tuple with the same shape as ``main_loss``'s own
+            ``return_per_class=True`` contract.  Note the consequence: mid
+            blend, the returned scalar is not the reduction of the returned
+            ``per_class`` vector -- the scalar is blended, the vector is
+            ``main_loss``'s unblended per-class loss.  After blend: output of
             ``main_loss`` (scalar or tuple when ``return_per_class=True``).
-            ``**kwargs`` are forwarded to ``main_loss`` only when
-            ``main_weight >= 1.0`` (i.e. ``final_main_weight == 1.0`` and
-            the blend period has ended); they are silently ignored otherwise.
+            ``**kwargs`` reach ``main_loss`` in all three phases.
         """
         if self.in_warmup:
-            return self.warmup_loss(logits, targets)
+            return self.warmup_loss(logits, targets, **self._warmup_kwargs(kwargs))
         if (
             not self._batch_hook_seen
             and not self._no_batch_hook_warned
@@ -526,5 +555,47 @@ class LossWarmupWrapper(nn.Module):
         w = self.main_weight
         if w >= 1.0:
             return self.main_loss(logits, targets, **kwargs)
-        return (1 - w) * self.warmup_loss(logits, targets) + w * self.main_loss(logits, targets)
+        warmup_out = self.warmup_loss(logits, targets, **self._warmup_kwargs(kwargs))
+        if isinstance(warmup_out, tuple):
+            # Only sample_weight ever reaches warmup_loss, so nothing the
+            # wrapper sends can make it return a tuple -- but a loss that
+            # returns one unconditionally must still blend rather than
+            # raise. Its leading element is the scalar loss by the same
+            # convention main_loss follows; the rest has no warmup-side
+            # meaning here and is dropped, since the returned extras track
+            # main_loss.
+            warmup_out = warmup_out[0]
+        main_out = self.main_loss(logits, targets, **kwargs)
+        if isinstance(main_out, tuple):
+            main_loss_value, *main_extra = main_out
+            blended = (1 - w) * warmup_out + w * main_loss_value
+            return (blended, *main_extra)
+        return (1 - w) * warmup_out + w * main_out
+
+    def _warmup_kwargs(self, kwargs: dict) -> dict:
+        """
+        Select the subset of ``forward``'s ``**kwargs`` that ``warmup_loss``
+        should receive.
+
+        Only ``sample_weight`` is ever eligible, and only when
+        ``warmup_loss.forward`` declares it by name or declares ``**kwargs``
+        of its own (decided once in ``__init__``).  Every other keyword
+        argument is dropped, so a non-declaring ``warmup_loss`` (e.g.
+        ``nn.CrossEntropyLoss``) is never called with an argument it does
+        not accept.
+
+        The narrowness is deliberate, not an oversight. This wrapper does
+        arithmetic on ``warmup_loss``'s return value during the blend
+        phase, so an argument that changes what ``warmup_loss`` *returns*
+        (``return_per_class``, ``return_diagnostics``) must not cross:
+        forwarding it would hand the blend a tuple instead of a scalar, and
+        would make the warmup phase's return arity depend on the warmup
+        loss's signature. ``sample_weight`` is the one argument the wrapper
+        knows to be return-shape-neutral, which is what makes it safe to
+        forward. Widening this set means deciding what the extra argument
+        does to the return shape first.
+        """
+        if self._warmup_accepts_sample_weight and "sample_weight" in kwargs:
+            return {"sample_weight": kwargs["sample_weight"]}
+        return {}
 

@@ -20,6 +20,7 @@ from typing import Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._weights import _positive_mass
 
 
 class SmoothAPLoss(_QueuedRankingLoss):
@@ -184,8 +185,18 @@ class SmoothAPLoss(_QueuedRankingLoss):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Delegate to the internal ``_MemoryQueue``."""
-        return self._queue.merge(logits, targets)
+        """Delegate to the internal ``_MemoryQueue``.
+
+        Backward-compatibility surface only: nothing inside the library
+        calls this, and the pooled rail uses ``merge``'s
+        :class:`~imbalanced_losses._queue.PooledBatch` fields directly. It
+        is retained because it was a (private) method on this class before
+        the queue was extracted and before ``merge`` returned a
+        ``PooledBatch``, so an out-of-library subclass may still call it;
+        it therefore keeps returning the 2-tuple that contract promised.
+        """
+        pool = self._queue.merge(logits, targets)
+        return pool.logits, pool.targets
 
     # ------------------------------------------------------------------
     # Core algorithm
@@ -196,6 +207,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
         scores: torch.Tensor,
         is_pos: torch.Tensor,
         tau: float,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """
         Compute Smooth-AP for a single binary partition of the pool.
@@ -210,6 +222,14 @@ class SmoothAPLoss(_QueuedRankingLoss):
             True for positive samples (target == c for class c).
         tau : float
             Sigmoid temperature. See class docstring.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight. ``None`` (default) computes the
+            unweighted mean of prec@k over positives, byte-identical to
+            the pre-``sample_weight`` release. When supplied, each
+            positive's prec@k contribution is weighted by its own
+            weight: ``Σ_k w_k · prec@k / Σ_k w_k``. Negatives' weights
+            are never consulted; ranks (``rank_all``/``rank_pos``) are
+            always computed unweighted.
 
         Returns
         -------
@@ -218,8 +238,9 @@ class SmoothAPLoss(_QueuedRankingLoss):
             degenerate cases.
         valid : bool
             False if the class is degenerate (all-positive or all-negative
-            in the pool). Degenerate classes are excluded from the
-            mean/sum reduction rather than contributing a misleading 0.
+            in the pool, or -- when weighted -- the positives' weight mass
+            is zero). Degenerate classes are excluded from the mean/sum
+            reduction rather than contributing a misleading 0.
 
         Notes
         -----
@@ -229,6 +250,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
             rank_all[k]   = 1 + Σ_j soft_gt[k, j]   (self zeroed)
             rank_pos[k]   = 1 + Σ_{j∈P} soft_gt[k, j]
             AP            = mean_{k∈P} rank_pos[k] / rank_all[k]
+            weighted AP   = Σ_{k∈P} w_k · rank_pos[k]/rank_all[k] / Σ_{k∈P} w_k
 
         Complexity is O(|P| × M) rather than O(M²), reducing memory and
         compute by roughly 1/pos_rate (e.g. ~200× at 0.5% positives).
@@ -242,6 +264,14 @@ class SmoothAPLoss(_QueuedRankingLoss):
         # Only compute rows for positives: [|P|, M] instead of [M, M].
         # Reduces memory/compute by ~1/pos_rate (e.g. 200× at 0.5% positives).
         pos_idx  = is_pos.nonzero(as_tuple=False).squeeze(1)           # [P]
+
+        w_pos: torch.Tensor | None = None
+        if sample_weight is not None:
+            w_pos, no_mass = _positive_mass(sample_weight, pos_idx)
+            if no_mass:
+                # Zero weighted positive mass: same invalid path as n_pos == 0.
+                return scores.new_zeros(()), False
+
         diff_pos = scores.unsqueeze(0) - scores[pos_idx].unsqueeze(1)  # [P, M]; diff[k,j] = s_j - s_pos_k
         soft_gt  = torch.sigmoid(diff_pos / tau)                        # [P, M]
         # Zero self-comparisons without in-place ops (would break autograd).
@@ -252,7 +282,11 @@ class SmoothAPLoss(_QueuedRankingLoss):
         rank_all = 1.0 + soft_gt.sum(dim=1)            # [P]
         rank_pos = 1.0 + soft_gt[:, is_pos].sum(dim=1) # [P]
 
-        ap = (rank_pos / rank_all).mean()
+        prec_at_k = rank_pos / rank_all
+        if w_pos is None:
+            ap = prec_at_k.mean()
+        else:
+            ap = (prec_at_k * w_pos).sum() / w_pos.sum()
         return ap, True
 
     # ------------------------------------------------------------------
@@ -265,6 +299,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
         targets: torch.Tensor,
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - AP for each class via one-vs-rest decomposition.
@@ -281,6 +316,12 @@ class SmoothAPLoss(_QueuedRankingLoss):
             not used by Smooth-AP.
         is_live : torch.Tensor, shape [M], dtype=bool
             Per-row live-batch flag; not used by Smooth-AP.
+        sample_weight : torch.Tensor, shape [M], optional
+            Pooled per-row weight; ``None`` iff the unweighted path is
+            active. Threaded into :meth:`_compute_smooth_ap`, which
+            weights each positive's prec@k contribution by its own
+            weight; ranks and the unweighted mean/degenerate-case
+            structure are unchanged.
 
         Returns
         -------
@@ -301,7 +342,8 @@ class SmoothAPLoss(_QueuedRankingLoss):
                     stacklevel=4,
                 )
             ap, is_valid = self._compute_smooth_ap(
-                logits[:, 0], targets.bool(), self.temperature
+                logits[:, 0], targets.bool(), self.temperature,
+                sample_weight=sample_weight,
             )
             loss_vals = [1.0 - ap]
             valid_mask = [is_valid]
@@ -309,7 +351,8 @@ class SmoothAPLoss(_QueuedRankingLoss):
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 ap, is_valid = self._compute_smooth_ap(
-                    logits[:, c], targets == c, self.temperature
+                    logits[:, c], targets == c, self.temperature,
+                    sample_weight=sample_weight,
                 )
                 loss_vals.append(1.0 - ap)
                 valid_mask.append(is_valid)

@@ -22,9 +22,51 @@ import torch
 
 from imbalanced_losses.ap_loss import SmoothAPLoss
 
+SEED = 42
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _oracle_smooth_ap(
+    scores: list[float],
+    is_pos: list[bool],
+    tau: float,
+    weight: list[float] | None = None,
+) -> float:
+    """
+    Pure-Python (no torch) reimplementation of weighted Smooth-AP, used as an
+    independent oracle for the tensor implementation.
+
+        prec@k       = rank_pos[k] / rank_all[k]   (unweighted -- rank
+                        estimation never sees the weight)
+        weighted AP  = Σ_k w_k · prec@k / Σ_k w_k
+        unweighted   = mean_k prec@k
+    """
+    m = len(scores)
+    pos_idx = [i for i in range(m) if is_pos[i]]
+
+    def _sigmoid(x: float) -> float:
+        return 1.0 / (1.0 + math.exp(-x))
+
+    prec_at_k = []
+    for k in pos_idx:
+        rank_all = 1.0
+        rank_pos = 1.0
+        for j in range(m):
+            if j == k:
+                continue
+            g = _sigmoid((scores[j] - scores[k]) / tau)
+            rank_all += g
+            if j in pos_idx:
+                rank_pos += g
+        prec_at_k.append(rank_pos / rank_all)
+
+    if weight is None:
+        return sum(prec_at_k) / len(prec_at_k)
+    w = [weight[k] for k in pos_idx]
+    return sum(p * wk for p, wk in zip(prec_at_k, w)) / sum(w)
 
 
 def _perfect_logits(
@@ -750,3 +792,153 @@ class TestMaxPoolSize:
         assert 0.0 <= loss.item() <= 1.0
         loss.backward()
         assert logits.grad is not None
+
+
+# ---------------------------------------------------------------------------
+# sample_weight arithmetic (Task 3)
+# ---------------------------------------------------------------------------
+
+
+class TestSampleWeightComputeSmoothAP:
+    """Hand oracles for the weighted Smooth-AP formula on a fixed 6-row pool."""
+
+    SCORES_LIST = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    IS_POS_LIST = [False, True, False, True, False, True]
+    TAU = 1.0
+    WEIGHT_LIST = [1.0, 2.0, 1.0, 0.5, 1.0, 3.0]
+
+    SCORES = torch.tensor(SCORES_LIST)
+    IS_POS = torch.tensor(IS_POS_LIST)
+    WEIGHT = torch.tensor(WEIGHT_LIST)
+
+    def test_hand_oracle_weighted_ap(self):
+        ap, valid = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, self.WEIGHT
+        )
+        assert valid
+        expected = _oracle_smooth_ap(
+            self.SCORES_LIST, self.IS_POS_LIST, self.TAU, self.WEIGHT_LIST
+        )
+        torch.testing.assert_close(ap, torch.tensor(expected), atol=1e-6, rtol=1e-6)
+
+    def test_ranks_unchanged_across_different_weightings(self):
+        # rank_all/rank_pos (and therefore each prec@k) never see the weight:
+        # the independent oracle recomputes ranks the same way regardless of
+        # which weight vector is applied, so if the production method agrees
+        # with the oracle for two DIFFERENT weight vectors, the underlying
+        # ranks were not perturbed by either.
+        weight2_list = [1.0, 5.0, 1.0, 5.0, 1.0, 0.1]
+        weight2 = torch.tensor(weight2_list)
+
+        ap1, _ = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, self.WEIGHT
+        )
+        ap2, _ = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, weight2
+        )
+        expected1 = _oracle_smooth_ap(
+            self.SCORES_LIST, self.IS_POS_LIST, self.TAU, self.WEIGHT_LIST
+        )
+        expected2 = _oracle_smooth_ap(
+            self.SCORES_LIST, self.IS_POS_LIST, self.TAU, weight2_list
+        )
+        torch.testing.assert_close(ap1, torch.tensor(expected1), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(ap2, torch.tensor(expected2), atol=1e-6, rtol=1e-6)
+        assert not torch.allclose(ap1, ap2)
+
+    def test_all_ones_weight_matches_unweighted(self):
+        ap_w, valid_w = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, torch.ones_like(self.SCORES)
+        )
+        ap_u, valid_u = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, None
+        )
+        assert valid_w and valid_u
+        torch.testing.assert_close(ap_w, ap_u)
+
+    def test_positive_scaling_invariance(self):
+        ap1, _ = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, self.WEIGHT
+        )
+        ap2, _ = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, self.WEIGHT * 11.0
+        )
+        torch.testing.assert_close(ap1, ap2)
+
+    def test_zero_positive_weight_mass_is_invalid(self):
+        zero_pos_weight = torch.tensor([1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+        ap, valid = SmoothAPLoss._compute_smooth_ap(
+            self.SCORES, self.IS_POS, self.TAU, zero_pos_weight
+        )
+        assert not valid
+
+    def test_degenerate_all_positive_invalid_regardless_of_weight(self):
+        scores = torch.tensor([1.0, 2.0, 3.0])
+        is_pos = torch.ones(3, dtype=torch.bool)
+        weight = torch.tensor([1.0, 2.0, 3.0])
+        ap, valid = SmoothAPLoss._compute_smooth_ap(scores, is_pos, self.TAU, weight)
+        assert not valid
+
+    def test_degenerate_all_negative_invalid_regardless_of_weight(self):
+        scores = torch.tensor([1.0, 2.0, 3.0])
+        is_pos = torch.zeros(3, dtype=torch.bool)
+        weight = torch.tensor([1.0, 2.0, 3.0])
+        ap, valid = SmoothAPLoss._compute_smooth_ap(scores, is_pos, self.TAU, weight)
+        assert not valid
+
+
+class TestSampleWeightForward:
+    """Forward-level weighted-arithmetic behavior via _compute_per_class."""
+
+    def test_zero_positive_weight_class_invalid_all_reductions(self):
+        g = torch.Generator().manual_seed(SEED)
+        n_classes = 2
+        logits = torch.randn(8, n_classes, generator=g)
+        targets = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        weight = torch.ones(8)
+        weight[:4] = 0.0  # class-0 positives (rows 0-3) carry zero weight
+
+        fn_none = SmoothAPLoss(num_classes=n_classes, queue_size=0, reduction="none")
+        loss_none, per_class_none, valid_none = fn_none(
+            logits, targets, sample_weight=weight, return_per_class=True
+        )
+        assert not valid_none[0].item()
+        assert valid_none[1].item()
+        assert math.isnan(per_class_none[0].item())
+
+        fn_mean = SmoothAPLoss(num_classes=n_classes, queue_size=0, reduction="mean")
+        loss_mean = fn_mean(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_mean, per_class_none[1])
+
+        fn_sum = SmoothAPLoss(num_classes=n_classes, queue_size=0, reduction="sum")
+        loss_sum = fn_sum(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_sum, per_class_none[1])
+
+    def test_multiclass_weight_shared_across_classes(self):
+        g = torch.Generator().manual_seed(SEED)
+        n_classes = 3
+        n = 12
+        logits = torch.randn(n, n_classes, generator=g)
+        targets = torch.randint(0, n_classes, (n,), generator=g)
+        weight = torch.rand(n, generator=g) + 0.1
+
+        fn = SmoothAPLoss(num_classes=n_classes, queue_size=0, reduction="none")
+        _, per_class, valid = fn(logits, targets, sample_weight=weight, return_per_class=True)
+
+        for c in range(n_classes):
+            ap_c, is_valid_c = fn._compute_smooth_ap(
+                logits[:, c], targets == c, fn.temperature, weight
+            )
+            assert bool(valid[c]) == is_valid_c
+            if is_valid_c:
+                torch.testing.assert_close(per_class[c], 1.0 - ap_c)
+
+    def test_all_ones_weight_matches_unweighted_forward(self):
+        g = torch.Generator().manual_seed(SEED)
+        logits = torch.randn(32, 4, generator=g)
+        targets = torch.randint(0, 4, (32,), generator=g)
+
+        fn = SmoothAPLoss(num_classes=4, queue_size=0)
+        loss_u = fn(logits, targets)
+        loss_w = fn(logits, targets, sample_weight=torch.ones(32))
+        torch.testing.assert_close(loss_u, loss_w)
