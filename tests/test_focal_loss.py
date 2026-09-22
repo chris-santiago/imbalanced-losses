@@ -14,14 +14,18 @@ Sections
 9.  SoftmaxFocalLoss – numerical edge cases
 10. SoftmaxFocalLoss – label smoothing
 11. gather_distributed – DDP resolve / no-op at world_size=1
+12. SigmoidFocalLoss – sample_weight
+13. SoftmaxFocalLoss – sample_weight
+14. sample_weight – DDP gather (single-process gloo fixture)
 """
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 
 from imbalanced_losses import SigmoidFocalLoss, SoftmaxFocalLoss
 
@@ -786,3 +790,531 @@ class TestGatherDistributed:
         fn = SoftmaxFocalLoss()
         fn(logits, targets).backward()
         assert logits.grad is not None
+
+
+# ===========================================================================
+# 12. SigmoidFocalLoss – sample_weight
+# ===========================================================================
+
+
+class TestSigmoidFocalLossSampleWeight:
+    def test_mean_weighted_oracle_2d(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        weight = torch.rand(16, 4) + 0.1
+
+        loss_none = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / weight.sum()
+
+        actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_mean_weighted_oracle_4d_broadcast(self):
+        """Weight broadcasts across the channel dim: (N, 1, H, W) over inputs (N, C, H, W)."""
+        torch.manual_seed(SEED)
+        N, C, H, W = 2, 3, 4, 4
+        logits = torch.randn(N, C, H, W)
+        targets = torch.randint(0, 2, (N, C, H, W)).float()
+        weight = torch.rand(N, 1, H, W) + 0.1
+
+        loss_none = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        weight_full = weight.expand_as(loss_none)
+        expected = (loss_none * weight_full).sum() / weight_full.sum()
+
+        actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_sum_weighted_oracle_2d(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        weight = torch.rand(16, 4) + 0.1
+
+        loss_none = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum()
+
+        actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="sum")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+
+    def test_none_weighted_oracle_4d_broadcast(self):
+        torch.manual_seed(SEED)
+        N, C, H, W = 2, 3, 4, 4
+        logits = torch.randn(N, C, H, W)
+        targets = torch.randint(0, 2, (N, C, H, W)).float()
+        weight = torch.rand(N, 1, H, W) + 0.1
+
+        loss_none_unweighted = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        expected = loss_none_unweighted * weight
+
+        actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+        assert actual.shape == logits.shape
+
+    def test_all_ones_matches_unweighted(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        ones = torch.ones(16, 4)
+
+        for reduction in ["none", "mean", "sum"]:
+            fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction=reduction)
+            unweighted = fn(logits, targets)
+            weighted = fn(logits, targets, sample_weight=ones)
+            torch.testing.assert_close(weighted, unweighted)
+
+    def test_scale_invariance_of_mean(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        weight = torch.rand(16, 4) + 0.1
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+
+        base = fn(logits, targets, sample_weight=weight)
+        scaled = fn(logits, targets, sample_weight=weight * 7.0)
+        torch.testing.assert_close(scaled, base)
+
+    def test_scale_linear_for_sum(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        weight = torch.rand(16, 4) + 0.1
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="sum")
+
+        base = fn(logits, targets, sample_weight=weight)
+        scaled = fn(logits, targets, sample_weight=weight * 3.0)
+        torch.testing.assert_close(scaled, base * 3.0)
+
+    def test_negative_weight_raises(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 4)
+        weight[0, 0] = -0.5
+        with pytest.raises(ValueError, match="non-negative"):
+            SigmoidFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_mismatched_shape_raises(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 5)  # not broadcastable to (8, 4)
+        with pytest.raises(ValueError, match="broadcastable"):
+            SigmoidFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_all_zero_weight_warns_once_zero_loss_finite_grad(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4, requires_grad=True)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.zeros(8, 4)
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+
+        with pytest.warns(UserWarning, match="sample_weight"):
+            loss = fn(logits, targets, sample_weight=weight)
+        assert loss.item() == 0.0
+        loss.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+
+        # Second call must not warn again (one-shot per instance).
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            fn(logits.detach().requires_grad_(True), targets, sample_weight=weight)
+
+    def test_sample_weight_detached_no_grad(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4, requires_grad=True)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 4, requires_grad=True)
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+
+        loss = fn(logits, targets, sample_weight=weight)
+        loss.backward()
+        assert weight.grad is None
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+        assert logits.grad.abs().sum() > 0
+
+    def test_unweighted_call_unaffected(self):
+        """No sample_weight kwarg -> identical to the pre-existing call."""
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        fn = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+        assert torch.equal(fn(logits, targets), fn(logits, targets, sample_weight=None))
+
+
+# ===========================================================================
+# 13. SoftmaxFocalLoss – sample_weight
+# ===========================================================================
+
+
+class TestSoftmaxFocalLossSampleWeight:
+    def test_mean_weighted_oracle_2d(self):
+        torch.manual_seed(SEED)
+        N, C = 32, 5
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        weight = torch.rand(N) + 0.1
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / weight.sum()
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+
+    def test_mean_weighted_oracle_3d(self):
+        torch.manual_seed(SEED)
+        N, C, L = 4, 6, 16
+        logits = torch.randn(N, C, L)
+        targets = torch.randint(0, C, (N, L))
+        weight = torch.rand(N, L) + 0.1
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / weight.sum()
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+
+    def test_mean_weighted_oracle_4d(self):
+        torch.manual_seed(SEED)
+        N, C, H, W = 2, 5, 4, 4
+        logits = torch.randn(N, C, H, W)
+        targets = torch.randint(0, C, (N, H, W))
+        weight = torch.rand(N, H, W) + 0.1
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / weight.sum()
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+
+    def test_mean_positive_weighted_oracle(self):
+        """Negatives stay in the numerator; only positive weight mass normalizes."""
+        torch.manual_seed(SEED)
+        N, C = 32, 5
+        logits = torch.randn(N, C)
+        targets = torch.zeros(N, dtype=torch.long)
+        targets[:8] = torch.randint(1, C, (8,))
+        weight = torch.rand(N) + 0.1
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none", background_class=0)(logits, targets)
+        positive_mask = targets != 0
+        expected = (loss_none * weight).sum() / (weight * positive_mask).sum()
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+
+        # Negatives really are in the numerator: zeroing their weight changes
+        # the value (they contributed loss*1 before, loss*0 after), while
+        # the denominator (positive weight mass) is untouched by the change.
+        weight_neg_zeroed = weight.clone()
+        weight_neg_zeroed[8:] = 0.0
+        actual_neg_zeroed = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)(
+            logits, targets, sample_weight=weight_neg_zeroed
+        )
+        assert not torch.allclose(actual, actual_neg_zeroed)
+
+    def test_sum_weighted_oracle(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        weight = torch.rand(N) + 0.1
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum()
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="sum")(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+
+    def test_none_weighted_oracle(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        weight = torch.rand(N) + 0.1
+
+        loss_none_unweighted = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = loss_none_unweighted * weight
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+
+    def test_ignore_index_rows_zero_regardless_of_weight_and_excluded_from_denominator(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        targets[10:] = -100
+        # Give the ignored rows a large weight -- must not matter at all.
+        weight = torch.rand(N) + 0.1
+        weight[10:] = 1000.0
+
+        loss = SoftmaxFocalLoss(gamma=2.0, reduction="none", ignore_index=-100)(
+            logits, targets, sample_weight=weight
+        )
+        assert (loss[10:] == 0).all()
+
+        loss_mean = SoftmaxFocalLoss(gamma=2.0, reduction="mean", ignore_index=-100)(
+            logits, targets, sample_weight=weight
+        )
+        expected = loss[:10].sum() / weight[:10].sum()
+        torch.testing.assert_close(loss_mean, expected)
+
+    def test_all_ones_matches_unweighted(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.zeros(N, dtype=torch.long)
+        targets[:6] = torch.randint(1, C, (6,))
+        ones = torch.ones(N)
+
+        for reduction in ["none", "mean", "mean_positive", "sum"]:
+            fn = SoftmaxFocalLoss(gamma=2.0, reduction=reduction, background_class=0)
+            unweighted = fn(logits, targets)
+            weighted = fn(logits, targets, sample_weight=ones)
+            torch.testing.assert_close(weighted, unweighted)
+
+    def test_scale_invariance_of_mean(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        weight = torch.rand(N) + 0.1
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean")
+
+        base = fn(logits, targets, sample_weight=weight)
+        scaled = fn(logits, targets, sample_weight=weight * 5.0)
+        torch.testing.assert_close(scaled, base)
+
+    def test_scale_invariance_of_mean_positive(self):
+        torch.manual_seed(SEED)
+        N, C = 32, 5
+        logits = torch.randn(N, C)
+        targets = torch.zeros(N, dtype=torch.long)
+        targets[:8] = torch.randint(1, C, (8,))
+        weight = torch.rand(N) + 0.1
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)
+
+        base = fn(logits, targets, sample_weight=weight)
+        scaled = fn(logits, targets, sample_weight=weight * 4.0)
+        torch.testing.assert_close(scaled, base)
+
+    def test_scale_linear_for_sum(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        weight = torch.rand(N) + 0.1
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="sum")
+
+        base = fn(logits, targets, sample_weight=weight)
+        scaled = fn(logits, targets, sample_weight=weight * 2.0)
+        torch.testing.assert_close(scaled, base * 2.0)
+
+    def test_negative_weight_raises(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(8)
+        weight[0] = -1.0
+        with pytest.raises(ValueError, match="non-negative"):
+            SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_mismatched_shape_raises(self):
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(9)
+        with pytest.raises(ValueError, match="targets shape"):
+            SoftmaxFocalLoss()(logits, targets, sample_weight=weight)
+
+    def test_all_zero_weight_warns_once_zero_loss_finite_grad(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4, requires_grad=True)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.zeros(8)
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean")
+
+        with pytest.warns(UserWarning, match="sample_weight"):
+            loss = fn(logits, targets, sample_weight=weight)
+        assert loss.item() == 0.0
+        loss.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+
+        # Second call must not warn again (one-shot per instance).
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            fn(logits.detach().requires_grad_(True), targets, sample_weight=weight)
+
+    def test_all_zero_weight_mean_positive_zero_loss_finite_grad(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C, requires_grad=True)
+        targets = torch.zeros(N, dtype=torch.long)
+        targets[:4] = torch.randint(1, C, (4,))
+        weight = torch.zeros(N)
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)
+
+        with pytest.warns(UserWarning, match="sample_weight"):
+            loss = fn(logits, targets, sample_weight=weight)
+        assert loss.item() == 0.0
+        loss.backward()
+        assert torch.isfinite(logits.grad).all()
+
+    def test_no_positives_with_sample_weight_mean_positive_no_explosion(self):
+        """
+        Regression (fix cycle 2): an all-background batch (structurally zero
+        positives) combined with an ordinary nonzero sample_weight under
+        mean_positive must NOT explode. The RetinaNet asymmetry keeps
+        negatives' weighted loss in the numerator even though the positive
+        weight mass is zero; the denominator floors to 1 (mirroring the
+        unweighted `.clamp(min=1)` convention, not an eps floor), so the
+        result is the plain weighted sum over the negatives -- finite, and
+        equal to the unweighted value when weights are all-ones. Mirrors
+        the unweighted `test_no_positives_no_nan` above, with a weight added.
+        """
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C, requires_grad=True)
+        targets = torch.zeros(N, dtype=torch.long)  # all background, no positives
+        weight = torch.rand(N) + 0.1  # ordinary nonzero weight, no zeros
+
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none", background_class=0)(
+            logits.detach(), targets
+        )
+
+        loss = fn(logits, targets, sample_weight=weight)
+        # Positive mass is 0 -> floored to 1 -> denominator is exactly 1, so
+        # the value is the plain weighted sum over the (all-negative) batch.
+        expected = (loss_none * weight).sum()
+        torch.testing.assert_close(loss, expected)
+        assert not torch.isnan(loss)
+        assert not torch.isinf(loss)
+        # Not exploded: a true upper bound via the triangle inequality
+        # (the eps-floor bug this regresses produced values around 1e8 for
+        # a batch this size, several orders past this bound).
+        assert loss.abs() <= loss_none.abs().sum() * weight.max() + 1e-6
+
+        loss.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+        assert logits.grad.abs().sum() > 0
+
+        # All-ones weight must equal the unweighted value exactly (both
+        # floor their zero positive-mass denominator to 1).
+        unweighted = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)(
+            logits.detach(), targets
+        )
+        ones_weighted = fn(logits.detach(), targets, sample_weight=torch.ones(N))
+        torch.testing.assert_close(ones_weighted, unweighted)
+
+    def test_sample_weight_detached_no_grad(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4, requires_grad=True)
+        targets = torch.randint(0, 4, (8,))
+        weight = torch.rand(8, requires_grad=True)
+        fn = SoftmaxFocalLoss(gamma=2.0, reduction="mean")
+
+        loss = fn(logits, targets, sample_weight=weight)
+        loss.backward()
+        assert weight.grad is None
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+        assert logits.grad.abs().sum() > 0
+
+    def test_unweighted_call_unaffected(self):
+        """No sample_weight kwarg -> identical to the pre-existing call, including
+        the now-consolidated 'mean' path (no more inline short-circuit)."""
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C)
+        targets = torch.randint(0, C, (N,))
+        targets[12:] = -100
+        for reduction in ["none", "mean", "mean_positive", "sum"]:
+            fn = SoftmaxFocalLoss(gamma=2.0, reduction=reduction, ignore_index=-100)
+            assert torch.equal(fn(logits, targets), fn(logits, targets, sample_weight=None))
+
+
+# ===========================================================================
+# 14. sample_weight – DDP gather (single-process gloo fixture)
+# ===========================================================================
+
+
+class TestSampleWeightGatherDistributed:
+    """
+    Forces ``_gather_resolved = True`` under the real single-process gloo
+    group so ``all_gather_with_grad``/``all_gather_no_grad`` genuinely
+    execute the gather branch -- including gathering ``sample_weight`` right
+    after ``targets`` -- rather than being skipped by ``_should_gather()``
+    returning False at world_size=1 (as it does for every other test in this
+    module). At world_size=1 the gather is an identity, so the result must
+    match the non-gathering path exactly.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    def test_sigmoid_gathers_weight(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4, requires_grad=True)
+        targets = torch.randint(0, 2, (16, 4)).float()
+        weight = torch.rand(16, 4) + 0.1
+
+        fn_gathered = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")
+        fn_gathered._gather_resolved = True
+        fn_off = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean", gather_distributed=False)
+
+        loss_gathered = fn_gathered(logits, targets, sample_weight=weight)
+        loss_off = fn_off(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_gathered, loss_off)
+        loss_gathered.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+
+    def test_softmax_gathers_weight(self):
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4, requires_grad=True)
+        targets = torch.randint(0, 4, (16,))
+        weight = torch.rand(16) + 0.1
+
+        fn_gathered = SoftmaxFocalLoss(gamma=2.0, reduction="mean")
+        fn_gathered._gather_resolved = True
+        fn_off = SoftmaxFocalLoss(gamma=2.0, reduction="mean", gather_distributed=False)
+
+        loss_gathered = fn_gathered(logits, targets, sample_weight=weight)
+        loss_off = fn_off(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_gathered, loss_off)
+        loss_gathered.backward()
+        assert logits.grad is not None
+        assert torch.isfinite(logits.grad).all()
+
+    def test_softmax_mean_positive_gathers_weight(self):
+        torch.manual_seed(SEED)
+        N, C = 16, 4
+        logits = torch.randn(N, C, requires_grad=True)
+        targets = torch.zeros(N, dtype=torch.long)
+        targets[:4] = torch.randint(1, C, (4,))
+        weight = torch.rand(N) + 0.1
+
+        fn_gathered = SoftmaxFocalLoss(gamma=2.0, reduction="mean_positive", background_class=0)
+        fn_gathered._gather_resolved = True
+        fn_off = SoftmaxFocalLoss(
+            gamma=2.0, reduction="mean_positive", background_class=0, gather_distributed=False
+        )
+
+        loss_gathered = fn_gathered(logits, targets, sample_weight=weight)
+        loss_off = fn_off(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(loss_gathered, loss_off)
