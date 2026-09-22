@@ -905,6 +905,33 @@ class TestSigmoidFocalLossSampleWeight:
             weighted = fn(logits, targets, sample_weight=ones)
             torch.testing.assert_close(weighted, unweighted)
 
+    def test_mean_sub_unit_weight_mass_is_not_floored(self):
+        """
+        A weight mass strictly between 0 and 1 is a legitimate denominator,
+        not a degenerate one: only an exactly-zero mass is floored to 1.
+        Normalized importance weights (summing to 1 or less across a batch)
+        land here on every step, and flooring them would silently scale the
+        loss down by the mass.
+        """
+        torch.manual_seed(SEED)
+        logits = torch.randn(8, 4)
+        targets = torch.randint(0, 2, (8, 4)).float()
+        weight = torch.rand(8, 4) + 0.1
+        weight = weight * (0.3 / weight.sum())  # mass approximately 0.3
+        mass = weight.sum()
+        assert 0.0 < float(mass) < 1.0, "the test's premise is a sub-unit mass"
+
+        loss_none = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / mass
+
+        actual = SigmoidFocalLoss(alpha=0.25, gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+        # A floored denominator would divide by 1 instead, i.e. scale the
+        # loss by the mass.
+        assert not torch.allclose(actual, (loss_none * weight).sum())
+
     def test_scale_invariance_of_mean(self):
         torch.manual_seed(SEED)
         logits = torch.randn(16, 4)
@@ -1144,6 +1171,56 @@ class TestSoftmaxFocalLossSampleWeight:
             logits, targets, sample_weight=weight
         )
         torch.testing.assert_close(actual, expected)
+
+    def test_mean_sub_unit_weight_mass_is_not_floored(self):
+        """Sub-unit valid-weight mass divides the numerator, unfloored."""
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 4, (16,))
+        weight = torch.rand(16) + 0.1
+        weight = weight * (0.3 / weight.sum())  # mass approximately 0.3
+        mass = weight.sum()
+        assert 0.0 < float(mass) < 1.0, "the test's premise is a sub-unit mass"
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none")(logits, targets)
+        expected = (loss_none * weight).sum() / mass
+
+        actual = SoftmaxFocalLoss(gamma=2.0, reduction="mean")(
+            logits, targets, sample_weight=weight
+        )
+        torch.testing.assert_close(actual, expected)
+        assert not torch.allclose(actual, (loss_none * weight).sum())
+
+    def test_mean_positive_sub_unit_weight_mass_is_not_floored(self):
+        """
+        ``mean_positive`` reaches a sub-unit denominator whenever the
+        positives are few and lightly weighted, while the numerator still
+        sums the (ordinarily weighted) negatives. Flooring the positive mass
+        to 1 there would silently shrink the loss.
+        """
+        torch.manual_seed(SEED)
+        logits = torch.randn(16, 4)
+        targets = torch.randint(0, 4, (16,))
+        positive_mask = targets != 0
+        assert bool(positive_mask.any()) and not bool(positive_mask.all())
+
+        # Negatives keep ordinary weights; the positives' mass is ~0.3.
+        weight = torch.ones(16)
+        pos_weight = torch.rand(int(positive_mask.sum())) + 0.1
+        weight[positive_mask] = pos_weight * (0.3 / pos_weight.sum())
+        mass = weight[positive_mask].sum()
+        assert 0.0 < float(mass) < 1.0, "the test's premise is a sub-unit mass"
+
+        loss_none = SoftmaxFocalLoss(gamma=2.0, reduction="none", background_class=0)(
+            logits, targets
+        )
+        expected = (loss_none * weight).sum() / mass
+
+        actual = SoftmaxFocalLoss(
+            gamma=2.0, reduction="mean_positive", background_class=0
+        )(logits, targets, sample_weight=weight)
+        torch.testing.assert_close(actual, expected)
+        assert not torch.allclose(actual, (loss_none * weight).sum())
 
     def test_ignore_index_rows_zero_regardless_of_weight_and_excluded_from_denominator(self):
         torch.manual_seed(SEED)

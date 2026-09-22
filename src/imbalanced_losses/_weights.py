@@ -13,28 +13,56 @@ Private module -- nothing here is part of the public API.
 
 from __future__ import annotations
 
+import os
+import sys
 import warnings
 
 import torch
 
-# Frame budget for the one-shot whole-zero UserWarning.  Counting outward
-# from ``warnings.warn`` inside ``_accept_sample_weight``:
-#   1 = _accept_sample_weight (this module)
-#   2 = the _check_sample_weight_* contract method that called it
-#   3 = the ``forward`` that called that
-#   4 = ``forward``'s caller
-# 4 therefore attributes the warning to ``forward``'s immediate caller
-# rather than to this module.  One value for every loss family and every
-# contract: the ladder above is fixed, since every path into the warning
-# runs through exactly one contract method.
-#
-# Under ``nn.Module.__call__`` that immediate caller is torch's own
-# ``_call_impl``, as it was before this module existed.  Counting further
-# out to reach the user's own frame would couple the constant to torch's
-# call-wrapper depth and would then misfire wherever that ladder differs:
-# a direct ``loss.forward(...)`` call, or ``PAUCAtBudgetLoss.forward``
-# delegating through ``super().forward``.
-_WARN_STACKLEVEL = 4
+# Directories whose frames a user-facing warning must never be blamed on:
+# this library's own modules, and torch's Module.__call__ machinery.
+_LIBRARY_DIR = os.path.dirname(os.path.abspath(__file__))
+_TORCH_DIR = os.path.dirname(os.path.abspath(torch.__file__))
+
+
+def _caller_stacklevel() -> int:
+    """Frames to skip so a warning lands on the caller's own code.
+
+    ``warnings.warn``'s ``stacklevel`` is a frame count, and no single
+    constant is correct here, because the ladder between the warning and
+    the user differs per entry point:
+
+    - ``SigmoidFocalLoss(...)(x, t)`` goes user -> ``Module.__call__`` ->
+      ``_call_impl`` -> ``forward`` -> contract method -> here;
+    - ``PAUCAtBudgetLoss.forward`` adds one more frame, since it delegates
+      to ``_QueuedRankingLoss.forward`` through ``super()``;
+    - ``LossWarmupWrapper`` adds more again;
+    - a direct ``loss.forward(...)`` call skips torch's two wrappers.
+
+    A fixed value therefore has to be wrong somewhere, and a value tuned
+    for the common path blamed ``pauc_loss.py`` itself for a caller's
+    misconfiguration.  Walking out to the first frame that belongs to
+    neither this library nor torch is correct for every one of those
+    ladders, and stays correct when a new wrapper is added between them.
+
+    Returns
+    -------
+    int
+        The ``stacklevel`` to pass to ``warnings.warn`` from the *calling*
+        frame, counted the way ``warnings`` counts it (1 = the caller of
+        this function).
+    """
+    level = 1
+    frame = sys._getframe(1)  # the frame that will issue the warning
+    while frame is not None:
+        if not frame.f_code.co_filename.startswith((_LIBRARY_DIR, _TORCH_DIR)):
+            return level
+        frame = frame.f_back
+        level += 1
+    # Every frame on the stack belongs to the library or to torch, which
+    # happens only when there is no user frame to blame (an import-time
+    # call).  Point at the outermost frame rather than guessing.
+    return level
 
 
 class _SampleWeightMixin:
@@ -202,7 +230,7 @@ class _SampleWeightMixin:
                     f"its zero-weight-mass degenerate path, contributing no gradient. "
                     f"(This warning is shown once per instance.)",
                     UserWarning,
-                    stacklevel=_WARN_STACKLEVEL,
+                    stacklevel=_caller_stacklevel(),
                 )
                 self._sample_weight_warned = True
         return sample_weight.to(dtype=dtype)
