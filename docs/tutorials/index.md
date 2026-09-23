@@ -4,8 +4,8 @@ Tutorials teach by doing. Each one walks you through a complete, working example
 
 ## Available tutorials
 
-- [**Getting Started**](getting-started.md) — Train a binary classifier on an imbalanced dataset, progressing from vanilla BCE to Smooth-AP with warmup. By the end you will have a working training loop and a visible improvement in AUCPR.
-- [**Multiclass Classification**](multiclass-classification.md) — Train a 5-class classifier with exponential class imbalance, progressing from CrossEntropyLoss to SoftmaxFocalLoss with per-class alpha to SmoothAPLoss with warmup. Shows correct target format and warmup hook usage for multiclass tasks.
+- [**Getting Started**](getting-started.md): Train a binary classifier on an imbalanced dataset, progressing from vanilla BCE to Smooth-AP with warmup. By the end you will have a working training loop and a visible improvement in AUCPR.
+- [**Multiclass Classification**](multiclass-classification.md): Train a 5-class classifier with exponential class imbalance, progressing from CrossEntropyLoss to SoftmaxFocalLoss with per-class alpha to SmoothAPLoss with warmup. Shows correct target format and warmup hook usage for multiclass tasks.
 
 ## What you need
 

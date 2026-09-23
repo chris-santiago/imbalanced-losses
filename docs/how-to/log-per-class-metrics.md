@@ -35,7 +35,7 @@ def training_step(self, batch, batch_idx):
     return loss
 ```
 
-Only classes in `valid` are logged — degenerate classes (all-positive or all-negative in the current pool) have `nan` values and are skipped automatically by the `valid` mask.
+Only classes in `valid` are logged: degenerate classes (all-positive or all-negative in the current pool) have `nan` values and are skipped automatically by the `valid` mask.
 
 ## Use with RecallAtQuantileLoss
 
@@ -97,7 +97,7 @@ def training_step(self, batch, batch_idx):
 
 ## Use with LossWarmupWrapper
 
-`**kwargs` (including `return_per_class=True`) are forwarded to `main_loss` only when `main_weight >= 1.0` — i.e. `final_main_weight == 1.0` (default) and the blend period has ended. During warmup, blend, or when `final_main_weight < 1.0`, they are silently ignored:
+`**kwargs` (including `return_per_class=True`) are forwarded to `main_loss` only when `main_weight >= 1.0`, i.e. `final_main_weight == 1.0` (default) and the blend period has ended. During warmup, blend, or when `final_main_weight < 1.0`, they are silently ignored:
 
 ```python
 result = self.loss_fn(logits, targets, return_per_class=True)
@@ -116,4 +116,4 @@ return loss
 
 ## See also
 
-[`examples/per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py) — runnable script demonstrating `return_per_class=True` for `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern. `PAUCAtBudgetLoss` uses the same pattern and additionally accepts `return_diagnostics=True`.
+[`examples/per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py): runnable script demonstrating `return_per_class=True` for `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern. `PAUCAtBudgetLoss` uses the same pattern and additionally accepts `return_diagnostics=True`.

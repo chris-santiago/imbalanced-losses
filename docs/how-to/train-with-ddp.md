@@ -88,7 +88,7 @@ Unweighted steps issue no additional collective, so an all-`None` weighted-but-c
 
 ## Confirm distributed setup
 
-Both helpers raise `RuntimeError` if called before `dist.init_process_group` — even on a single GPU. Once a process group is initialized with `world_size == 1`, they are no-ops (return the input unchanged):
+Both helpers raise `RuntimeError` if called before `dist.init_process_group`, even on a single GPU. Once a process group is initialized with `world_size == 1`, they are no-ops (return the input unchanged):
 
 ```python
 import torch.distributed as dist

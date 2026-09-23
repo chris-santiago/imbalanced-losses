@@ -61,4 +61,4 @@ loss_fn.reset_queue()
 
 ## Complexity note
 
-The core computation is O(|P| × M) where |P| is the number of positives and M = batch_size + queue_size. At low positive rates this is much less than O(M²) — roughly 200× cheaper at 0.5% positives.
+The core computation is O(|P| × M) where |P| is the number of positives and M = batch_size + queue_size. At low positive rates this is much less than O(M²), roughly 200× cheaper at 0.5% positives.

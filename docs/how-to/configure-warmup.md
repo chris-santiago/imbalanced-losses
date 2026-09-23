@@ -2,7 +2,7 @@
 
 `LossWarmupWrapper` manages a three-phase training schedule: warmup, optional linear blend, and main (ranking) phase with geometric temperature decay.
 
-Warmup and blend can be specified in **epochs** or **steps** — use whichever maps more naturally to your training setup. The two styles are mutually exclusive per axis (`warmup_epochs` vs `warmup_steps`, `blend_epochs` vs `blend_steps`).
+Warmup and blend can be specified in **epochs** or **steps**. Use whichever maps more naturally to your training setup. The two styles are mutually exclusive per axis (`warmup_epochs` vs `warmup_steps`, `blend_epochs` vs `blend_steps`).
 
 ## Epoch-based warmup
 
@@ -68,7 +68,7 @@ loss_fn = LossWarmupWrapper(
 )
 ```
 
-In step mode **only `on_train_batch_start` is required** — the epoch hook is optional (only needed for `reset_queue_each_epoch`):
+In step mode **only `on_train_batch_start` is required**; the epoch hook is optional (only needed for `reset_queue_each_epoch`):
 
 ```python
 for step, batch in enumerate(dataloader):
@@ -130,7 +130,7 @@ loss_fn = LossWarmupWrapper(
 
 ## Hold a permanent mix with `final_main_weight`
 
-By default the blend ramp ends at `main_weight = 1.0` (pure main loss). Set `final_main_weight` to hold a permanent split instead — the ramp scales to that target and stays there.
+By default the blend ramp ends at `main_weight = 1.0` (pure main loss). Set `final_main_weight` to hold a permanent split instead. The ramp scales to that target and stays there.
 
 ```python
 loss_fn = LossWarmupWrapper(
@@ -153,7 +153,7 @@ loss_fn = LossWarmupWrapper(
 | 7 | blend | 0.5625 |
 | 8+ | main | 0.75 |
 
-Works without a blend too — the hard switch lands at `final_main_weight` instead of `1.0`:
+Works without a blend too. The hard switch lands at `final_main_weight` instead of `1.0`:
 
 ```python
 loss_fn = LossWarmupWrapper(
@@ -229,5 +229,5 @@ loss_fn = LossWarmupWrapper(
 
 ## See also
 
-- [`examples/compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py) — side-by-side AUCPR for warmup-only, AP-only (no warmup), and warmup+blend+AP so you can see the effect of each phase
-- [`examples/toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py) — minimal end-to-end binary training loop using `LossWarmupWrapper` with per-epoch loss and AUCPR output
+- [`examples/compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py): side-by-side AUCPR for warmup-only, AP-only (no warmup), and warmup+blend+AP so you can see the effect of each phase
+- [`examples/toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py): minimal end-to-end binary training loop using `LossWarmupWrapper` with per-epoch loss and AUCPR output

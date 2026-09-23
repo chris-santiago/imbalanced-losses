@@ -5,7 +5,7 @@ For a given quantile q (e.g. 0.005 = top 50bps), the threshold θ is the
 (1-q) quantile of ALL scores in the pool (live batch + queue). Recall@q is
 then approximated as the fraction of positives scoring above θ:
 
-    θ = quantile(scores, 1 - q)                     [detached — no grad]
+    θ = quantile(scores, 1 - q)                     [detached, no grad]
     soft_recall = (1/|P|) · Σ_{i∈P} σ((s_i − θ) / τ)
     loss = 1 − soft_recall
 
@@ -64,7 +64,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         Default: 0.005.
     queue_size : int, optional
         Circular buffer size (rows). Larger queues stabilise the quantile
-        estimate — at 50 bps you need at least ~200 samples for a
+        estimate: at 50 bps you need at least ~200 samples for a
         meaningful 99.5th percentile. Set to 0 to disable. Default: 1024.
 
         **DDP note:** when ``gather_distributed=True``, the all-gather runs
@@ -95,7 +95,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         so safe to construct before ``dist.init_process_group``. Default: None.
     quantile_interpolation : str, optional
         Interpolation method passed to torch.quantile. 'higher' is the
-        conservative default — the threshold never undershoots the true
+        conservative default: the threshold never undershoots the true
         cutoff. One of ('linear', 'lower', 'higher', 'nearest', 'midpoint').
         Default: 'higher'.
     max_pool_size : int or None, optional
@@ -104,7 +104,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         minimum-quota subsampling caps it at ``max_pool_size`` rows: each
         observed class is guaranteed an equal quota (``max_pool_size //
         (2 * n_classes)``), then the remaining budget is filled uniformly at
-        random.  This is not proportional sampling — rare classes are
+        random.  This is not proportional sampling: rare classes are
         over-represented relative to their natural frequency.  Effective
         ``|P_c| ≈ max_pool_size // (2 * n_classes)``; size accordingly.
         ``None`` (default) disables the cap.

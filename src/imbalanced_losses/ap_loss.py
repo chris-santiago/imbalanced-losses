@@ -30,7 +30,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
     Approximates AP using soft sigmoid-based rank estimation (Smooth-AP,
     Brown et al. 2020). Supports multi-class (one-vs-rest) and binary
     (num_classes=1) classification. Expects logits [N, C] and targets [N];
-    this class is agnostic to sequence structure — flatten upstream.
+    this class is agnostic to sequence structure; flatten upstream.
 
     Inherits queue management, DDP gather, ignore-index filtering,
     subsampling, and reduction logic from ``_QueuedRankingLoss``.
@@ -80,18 +80,18 @@ class SmoothAPLoss(_QueuedRankingLoss):
         minimum-quota subsampling is applied: each observed class is guaranteed
         an equal quota of rows (``max_pool_size // (2 * n_classes)``), then
         the remaining budget is filled uniformly at random.  This is not
-        proportional sampling — rare classes are over-represented relative to
+        proportional sampling: rare classes are over-represented relative to
         their natural frequency.  Effective ``|P_c| ≈ max_pool_size //
         (2 * n_classes)``; size accordingly.  ``None`` (default) disables
         the cap.
 
         Use this for seq2seq tasks where flattened inputs produce very large
         pools. The pairwise matrix in ``_compute_smooth_ap`` is ``[P, M]``
-        where ``M`` is the pool size — at M=15 000 the gradient memory is
+        where ``M`` is the pool size. At M=15 000 the gradient memory is
         O(M^2) and easily OOMs.  Recommended: 2048–4096 for seq2seq.
 
         .. note::
-            Subsampling is a stochastic approximation — the loss value will
+            Subsampling is a stochastic approximation: the loss value will
             vary across steps even for the same batch.  Use the largest value
             your GPU allows for the most stable gradient estimates.
 
@@ -112,7 +112,7 @@ class SmoothAPLoss(_QueuedRankingLoss):
     In DDP, set ``gather_distributed=False`` to opt out; otherwise the loss
     auto-detects and all-gathers on first forward when world_size > 1.
     Because the gather happens *before* the enqueue, every rank stores
-    identical global-batch rows — queues stay in sync automatically, but
+    identical global-batch rows, so queues stay in sync automatically, but
     the pool per step is ``global_batch_size + queue_size``. At large
     global batch sizes the queue contribution may be negligible; prefer
     ``queue_size=0`` when the global batch already provides a stable pool.

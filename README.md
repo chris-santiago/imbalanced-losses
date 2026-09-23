@@ -1,26 +1,26 @@
 # imbalanced-losses
 
-**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification and ranking-metric optimization — Focal Loss, plus differentiable surrogates for Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget — with built-in DDP all-gather support for globally-correct rank estimation across multi-GPU training. (Imbalance is the design center — the memory queue and DDP gather exist for stable estimation at low positive rates — but the ranking losses optimize ranking/operating-point metrics more generally.)
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification and ranking-metric optimization. It provides Focal Loss, plus differentiable surrogates for Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget, all with built-in DDP all-gather support for globally-correct rank estimation across multi-GPU training. Imbalance is the design center (the memory queue and DDP gather exist for stable estimation at low positive rates), but the ranking losses optimize ranking/operating-point metrics more generally.
 
 **What's in it:**
 
-- **`SigmoidFocalLoss`** — Binary/multi-label focal loss (Lin et al., ICCV 2017). Sigmoid activation; `alpha` re-balances pos/neg, `gamma` down-weights easy examples. Drop-in replacement for `BCEWithLogitsLoss`.
-- **`SoftmaxFocalLoss`** — Multiclass focal loss with softmax. Supports `mean_positive` reduction (RetinaNet convention: normalize by positive count), per-class `alpha` weighting, label smoothing, and arbitrary spatial/sequence input shapes.
-- **`SmoothAPLoss`** — Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(|P|×M) where |P| is the positive count and M = batch + queue size. Supports multi-class, binary, and seq2seq settings.
-- **`RecallAtQuantileLoss`** — Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
-- **`PAUCAtBudgetLoss`** — Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point (e.g. FPR ≈ 0.005). Useful when the business constraint is a fixed false-alarm budget (fraud, screening, alerting).
-- **`LossWarmupWrapper`** — Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
+- **`SigmoidFocalLoss`**: Binary/multi-label focal loss (Lin et al., ICCV 2017). Sigmoid activation; `alpha` re-balances pos/neg, `gamma` down-weights easy examples. Drop-in replacement for `BCEWithLogitsLoss`.
+- **`SoftmaxFocalLoss`**: Multiclass focal loss with softmax. Supports `mean_positive` reduction (RetinaNet convention: normalize by positive count), per-class `alpha` weighting, label smoothing, and arbitrary spatial/sequence input shapes.
+- **`SmoothAPLoss`**: Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(|P|×M) where |P| is the positive count and M = batch + queue size. Supports multi-class, binary, and seq2seq settings.
+- **`RecallAtQuantileLoss`**: Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
+- **`PAUCAtBudgetLoss`**: Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point (e.g. FPR ≈ 0.005). Useful when the business constraint is a fixed false-alarm budget (fraud, screening, alerting).
+- **`LossWarmupWrapper`**: Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
 
 **Design points:**
-- Circular memory queue stabilizes gradient estimates across small batches — critical at low positive rates (e.g. 0.5%)
+- Circular memory queue stabilizes gradient estimates across small batches, which is critical at low positive rates (e.g. 0.5%)
 - Compatible with PyTorch Lightning via `on_train_epoch_start` / `on_train_batch_start` hooks
 - `max_pool_size` caps the pairwise matrix for seq2seq / large-pool settings without reducing batch size
-- Variable dim-0 DDP all-gather — no `drop_last=True` required; unequal last-batch sizes across ranks are handled automatically
+- Variable dim-0 DDP all-gather: no `drop_last=True` required; unequal last-batch sizes across ranks are handled automatically
 - Six runnable example scripts covering binary, multiclass, focal, per-class logging, and warmup workflows
 
 ## Losses
 
-### `SigmoidFocalLoss` — Focal Loss, binary / multi-label (Lin et al., 2017)
+### `SigmoidFocalLoss`: Focal Loss, binary / multi-label (Lin et al., 2017)
 
 Replaces `BCEWithLogitsLoss` for imbalanced binary or multi-label classification. `gamma` suppresses the contribution of easy (well-classified) examples so training focuses on hard ones; `alpha` re-weights the positive class:
 
@@ -39,7 +39,7 @@ loss = loss_fn(logits, targets)
 loss.backward()
 ```
 
-### `SoftmaxFocalLoss` — Focal Loss, multiclass (Lin et al., 2017)
+### `SoftmaxFocalLoss`: Focal Loss, multiclass (Lin et al., 2017)
 
 Extends focal loss to mutually-exclusive classification via softmax. Supports all standard input shapes `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, etc.
 
@@ -65,7 +65,7 @@ loss = loss_fn(logits, targets)
 
 **`mean_positive` reduction:** The numerator sums loss over *all* valid (non-ignored) positions including background. The denominator counts only non-background valid positions. This matches the RetinaNet convention and stabilizes the loss scale when the vast majority of samples are background.
 
-### `SmoothAPLoss` — Smooth Average Precision (Brown et al., 2020)
+### `SmoothAPLoss`: Smooth Average Precision (Brown et al., 2020)
 
 Approximates AP using sigmoid-based soft rank estimation. For each positive *i* in the pool:
 
@@ -78,7 +78,7 @@ loss = 1 − AP
 
 **Complexity:** O(|P|×M) where |P| is the number of positives and M = batch + queue size. At a 0.5% positive rate this is ~200× cheaper than O(M²). Use `max_pool_size` to cap M for seq2seq or other large-pool settings without reducing batch size.
 
-### `RecallAtQuantileLoss` — Recall at Quantile
+### `RecallAtQuantileLoss`: Recall at Quantile
 
 Optimizes recall above a score threshold set at the *q*-th quantile of the pooled score distribution. The threshold is treated as a stop-gradient constant each forward pass:
 
@@ -90,7 +90,7 @@ loss = 1 − soft_recall
 
 Gradient flows only through positive scores, pushing them above the cutoff. Useful for alert/detection settings (e.g. `quantile=0.005` = top 50 bps).
 
-### `PAUCAtBudgetLoss` — Partial AUC at Budget
+### `PAUCAtBudgetLoss`: Partial AUC at Budget
 
 Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point, rather than the full curve or a single threshold. The band edges are estimated as score quantiles of the iid negatives (stop-gradient), so `beta` tracks population FPR even as score scale changes. Loss = `1 - pAUC`.
 
@@ -103,7 +103,7 @@ loss    = 1 − pAUC
 
 `PAUCAtBudgetLoss` sits between `SmoothAPLoss` (whole PR/ROC curve) and `RecallAtQuantileLoss` (single threshold): it optimizes a *band* of the ROC. Reach for it when the business constraint is a fixed false-alarm budget.
 
-*Background:* this is an original loss, but partial AUC has a long lineage — as a metric (McClish, *Medical Decision Making* 1989; Dodd & Pepe, *Biometrics* 2003) and as a learning objective (Narasimhan & Agarwal, *ICML* 2013; Zhu et al., *ICML* 2022). See the [reference page](https://chris-santiago.github.io/imbalanced-losses/reference/pauc-at-budget-loss/) for full citations.
+*Background:* this is an original loss, but partial AUC has a long lineage: as a metric (McClish, *Medical Decision Making* 1989; Dodd & Pepe, *Biometrics* 2003) and as a learning objective (Narasimhan & Agarwal, *ICML* 2013; Zhu et al., *ICML* 2022). See the [reference page](https://chris-santiago.github.io/imbalanced-losses/reference/pauc-at-budget-loss/) for full citations.
 
 ```python
 from imbalanced_losses import PAUCAtBudgetLoss
@@ -123,25 +123,25 @@ loss.backward()
 **All losses** support DDP all-gather via `gather_distributed` (auto-detected by default).
 
 **Focal losses** (`SigmoidFocalLoss`, `SoftmaxFocalLoss`):
-- Arbitrary input shapes — `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, …
-- `ignore_index` masking — padded positions contribute zero loss and zero gradient
+- Arbitrary input shapes: `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, …
+- `ignore_index` masking: padded positions contribute zero loss and zero gradient
 - `mean` reduction divides by valid (non-ignored) count, not total tensor size
-- `mean_positive` reduction (softmax only) — normalizes by positive count for detection tasks
-- `alpha` — scalar (sigmoid) or per-class tensor (softmax) class reweighting
-- `label_smoothing` (softmax only) — forwarded directly to `F.cross_entropy`
-- `sample_weight` — optional per-observation weight passed to `forward()`; replaces the count-based denominator with weight mass. `None` (default) leaves the loss and its gradient bitwise unchanged.
+- `mean_positive` reduction (softmax only): normalizes by positive count for detection tasks
+- `alpha`: scalar (sigmoid) or per-class tensor (softmax) class reweighting
+- `label_smoothing` (softmax only): forwarded directly to `F.cross_entropy`
+- `sample_weight`: optional per-observation weight passed to `forward()`; replaces the count-based denominator with weight mass. `None` (default) leaves the loss and its gradient bitwise unchanged.
 
 **Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`, `PAUCAtBudgetLoss`):
-- **Memory queue** — circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
-- **Multi-class** — one-vs-rest per class using `logits[:, c]`
-- **Binary** — set `num_classes=1` with targets in `{0, 1}`
-- **Seq2seq** — flatten `[B, T, C]` → `[B*T, C]` upstream before passing
-- **Pool size cap** — `max_pool_size` applies minimum-quota subsampling after the gather+queue merge, bounding pairwise matrix memory for large M (e.g. seq2seq with long sequences)
-- **Padding** — `ignore_index` rows are excluded from ranking and the positive set
-- **Eval queue freeze** — `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue
-- **Reductions** — `'mean'` (default), `'sum'`, or `'none'` (per-class tensor; degenerate classes are `nan`)
-- **Per-class logging** — `return_per_class=True` returns `(loss, per_class, valid_mask)` without a second forward pass
-- **`sample_weight`** — optional per-observation weight passed to `forward()`; only positives' weights enter the objective (thresholds, ranks, and the pAUC band never see it). Persists through the memory queue, DDP gather, `ignore_index` filtering, and `max_pool_size` subsampling. `None` (default) leaves the loss and its gradient bitwise unchanged. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/).
+- **Memory queue**: circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
+- **Multi-class**: one-vs-rest per class using `logits[:, c]`
+- **Binary**: set `num_classes=1` with targets in `{0, 1}`
+- **Seq2seq**: flatten `[B, T, C]` → `[B*T, C]` upstream before passing
+- **Pool size cap**: `max_pool_size` applies minimum-quota subsampling after the gather+queue merge, bounding pairwise matrix memory for large M (e.g. seq2seq with long sequences)
+- **Padding**: `ignore_index` rows are excluded from ranking and the positive set
+- **Eval queue freeze**: `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue
+- **Reductions**: `'mean'` (default), `'sum'`, or `'none'` (per-class tensor; degenerate classes are `nan`)
+- **Per-class logging**: `return_per_class=True` returns `(loss, per_class, valid_mask)` without a second forward pass
+- **`sample_weight`**: optional per-observation weight passed to `forward()`; only positives' weights enter the objective (thresholds, ranks, and the pAUC band never see it). Persists through the memory queue, DDP gather, `ignore_index` filtering, and `max_pool_size` subsampling. `None` (default) leaves the loss and its gradient bitwise unchanged. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/).
 
 ## Installation
 
@@ -246,19 +246,19 @@ loss_fn.reset_queue()
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss, PAUCAtBudgetLoss)* `torch.quantile` interpolation method |
 | `alpha` | `0.0` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, covering all top false-positives. |
 | `beta` | `0.005` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; set to your target operating-point FPR. |
-| `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives — for wide/volatile bands |
+| `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives (for wide/volatile bands) |
 | `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
 | `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
-| `pos_numerator` | `"pool"` | *(PAUCAtBudgetLoss only)* Positives in the soft-TPR numerator: `"pool"` (all pooled) or `"live"` (live-batch only). `"live"` removes the memory queue's gradient dilution at extreme imbalance — most useful for the `"trapezoid"` surrogate; `"pairwise"` usually prefers `"pool"` to keep enough positives in the contrast |
+| `pos_numerator` | `"pool"` | *(PAUCAtBudgetLoss only)* Positives in the soft-TPR numerator: `"pool"` (all pooled) or `"live"` (live-batch only). `"live"` removes the memory queue's gradient dilution at extreme imbalance and is most useful for the `"trapezoid"` surrogate; `"pairwise"` usually prefers `"pool"` to keep enough positives in the contrast |
 | `budget_basis` | `"fpr"` | *(PAUCAtBudgetLoss only)* Reference population for the band-edge quantiles: `"fpr"` (iid negatives only, so `beta` is true FPR) or `"population"` (all pooled scores, so `beta` is a top-k alert budget over the whole population) |
 
-**Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training — do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
+**Temperature guidance:** `0.005–0.05` is the practical range for `SmoothAPLoss` and `RecallAtQuantileLoss`. Lower values approximate the true discontinuous rank more closely but produce harder gradients. `PAUCAtBudgetLoss` uses a **dimensionless** temperature multiplier (default `0.1`) applied to a robust scale of the iid negatives (`tau_eff = temperature * scale`), keeping kernel sharpness constant in FPR units as the model's score scale changes during training. Do not compare this default directly to the raw-logit `temperature=0.01` of the other ranking losses.
 
 **Queue size guidance:** For `quantile=0.005` (top 50 bps) you need at least ~200 samples in the pool for a meaningful 99.5th percentile estimate. For `PAUCAtBudgetLoss` with the recommended `alpha=0, beta=budget`, only `t_beta = quantile(neg, 1 - beta)` requires adequate pool coverage (`~1/beta` iid negatives); `t_alpha = max(neg_iid)` requires no tail-quantile estimation. Check the `band_neg_count` diagnostic.
 
 **`sample_weight` (forward-time, not a constructor parameter):** every ranking loss accepts an optional trailing keyword argument, `sample_weight`, shape `[N]` float, non-negative, on the logits device. It rides the same rail as `iid_mask`: DDP gather, memory-queue persistence across steps and checkpoints, `ignore_index` filtering, and `max_pool_size` subsampling all carry it correctly. Only positives' weights enter the objective (a queue row's weight is the weight it was enqueued with, default `1`); thresholds, ranks, and the pAUC band are never weighted, so a zero-weight positive contributes nothing to the loss but still occupies its place in ranks and band membership. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/) for a worked dollar-weighted example.
 
-## `LossWarmupWrapper` — BCE/CE warmup + loss blending + geometric temperature decay
+## `LossWarmupWrapper`: BCE/CE warmup + loss blending + geometric temperature decay
 
 A wrapper that trains with a standard loss (e.g. `CrossEntropyLoss`) for a warmup period, optionally blends both losses over a transition period, then switches to the ranking loss with a geometrically decaying temperature schedule.
 
@@ -368,7 +368,7 @@ In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `
 | `all_gather_with_grad(tensor)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** so autograd works correctly. Variable dim-0 sizes across ranks are supported. |
 | `all_gather_no_grad(tensor)` | Gathers tensors without gradient tracking; use for integer targets/labels. Variable dim-0 sizes across ranks are supported. |
 
-`all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached — matching standard DDP semantics where each worker optimizes its own parameters via all-reduced gradients.
+`all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached, matching standard DDP semantics where each worker optimizes its own parameters via all-reduced gradients.
 
 **Variable batch sizes:** Both helpers handle unequal dim-0 sizes across ranks (e.g. the last batch without `drop_last=True`). Tensors are zero-padded to the maximum size for the collective, then trimmed before concatenation. An equal-size fast path skips the overhead when all ranks contribute the same number of rows.
 
@@ -419,7 +419,7 @@ uv sync --extra demo
 # or: pip install scikit-learn
 ```
 
-### [`toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py) — single-run trace
+### [`toy_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/toy_demo.py): single-run trace
 
 Trains one model (warmup → blend → AP) and prints epoch-by-epoch phase, main_weight, temperature, loss, and AUCPR.
 
@@ -429,7 +429,7 @@ python examples/toy_demo.py --blend-epochs 0   # hard switch (no blend)
 python examples/toy_demo.py --pos-rate 0.05    # easier problem
 ```
 
-### [`focal_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/focal_demo.py) — BCE vs focal loss comparison
+### [`focal_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/focal_demo.py): BCE vs focal loss comparison
 
 Trains four models on the same imbalanced data and prints per-epoch AUCPR:
 
@@ -437,8 +437,8 @@ Trains four models on the same imbalanced data and prints per-epoch AUCPR:
 |---|---|
 | BCE | Vanilla `BCEWithLogitsLoss`; easy negatives dominate |
 | BCE+weight | `BCEWithLogitsLoss` with `pos_weight = n_neg/n_pos` |
-| focal α γ | `SigmoidFocalLoss(alpha=0.25, gamma=2)` — RetinaNet defaults |
-| focal γ only | `SigmoidFocalLoss(alpha=-1, gamma=2)` — focusing only, no alpha |
+| focal α γ | `SigmoidFocalLoss(alpha=0.25, gamma=2)` (RetinaNet defaults) |
+| focal γ only | `SigmoidFocalLoss(alpha=-1, gamma=2)` (focusing only, no alpha) |
 
 ```bash
 python examples/focal_demo.py
@@ -446,7 +446,7 @@ python examples/focal_demo.py --pos-rate 0.02   # easier problem
 python examples/focal_demo.py --gamma 5 --alpha 0.5
 ```
 
-### [`compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py) — side-by-side comparison
+### [`compare_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/compare_demo.py): side-by-side comparison
 
 Trains three models on the same data and seed and prints a per-epoch AUCPR table:
 
@@ -464,7 +464,7 @@ python examples/compare_demo.py --warmup-epochs 5 --blend-epochs 3
 
 Key flags (both scripts): `--pos-rate`, `--warmup-epochs`, `--blend-epochs`, `--total-epochs`, `--batch-size`, `--queue-size`, `--temp-start`, `--temp-end`, `--lr`, `--seed`.
 
-### [`binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py) — positive-rate sweep
+### [`binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py): positive-rate sweep
 
 Sweeps positive rates from 25% down to 0.5% and compares `SmoothAPLoss`, `BCEWithLogitsLoss`, and `SigmoidFocalLoss`. Shows where SmoothAP's ranking advantage over BCE becomes meaningful.
 
@@ -473,7 +473,7 @@ python examples/binary_imbalance_demo.py --sweep          # summary table across
 python examples/binary_imbalance_demo.py --positive-rate 0.005  # per-epoch curve at 0.5%
 ```
 
-### [`multiclass_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/multiclass_demo.py) — CE vs Focal vs SmoothAP (multiclass)
+### [`multiclass_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/multiclass_demo.py): CE vs Focal vs SmoothAP (multiclass)
 
 Trains three models on the same imbalanced multiclass data and prints a per-epoch macro-AP table: `CrossEntropyLoss`, `SoftmaxFocalLoss`, and `SmoothAPLoss` with warmup.
 
@@ -482,7 +482,7 @@ python examples/multiclass_demo.py
 python examples/multiclass_demo.py --n-classes 8 --pos-rate 0.05
 ```
 
-### [`per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py) — per-class AP logging
+### [`per_class_metrics_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/per_class_metrics_demo.py): per-class AP logging
 
 Demonstrates `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuantileLoss`, including the `valid_mask` guard pattern for degenerate classes.
 
@@ -490,9 +490,9 @@ Demonstrates `return_per_class=True` for both `SmoothAPLoss` and `RecallAtQuanti
 python examples/per_class_metrics_demo.py
 ```
 
-### [`coverage_at_budget_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/coverage_at_budget_demo.py) — coverage@budget with PAUCAtBudgetLoss
+### [`coverage_at_budget_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/coverage_at_budget_demo.py): coverage@budget with PAUCAtBudgetLoss
 
-On an extreme-imbalance (<1% positives) problem with a *contested top*, compares weighted CE, SmoothAP, and `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget — the alert/review metric, distinct from whole-curve AUCPR. Shows PAUC pairwise recovering coverage CE leaves behind, the trapezoid-vs-pairwise surrogate choice, and the `pos_numerator="live"` gradient-dilution effect. Needs `numpy` + `scikit-learn`.
+On an extreme-imbalance (<1% positives) problem with a *contested top*, compares weighted CE, SmoothAP, and `PAUCAtBudgetLoss` (both surrogates × `pos_numerator` pool/live) on coverage at a 50 bps budget: the alert/review metric, distinct from whole-curve AUCPR. Shows PAUC pairwise recovering coverage CE leaves behind, the trapezoid-vs-pairwise surrogate choice, and the `pos_numerator="live"` gradient-dilution effect. Needs `numpy` + `scikit-learn`.
 
 ```bash
 python examples/coverage_at_budget_demo.py --n-seeds 5

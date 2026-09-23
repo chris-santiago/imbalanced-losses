@@ -1,6 +1,6 @@
 # imbalanced-losses
 
-**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification and ranking-metric optimization. It provides Focal Loss for reweighting, plus differentiable surrogates for ranking and operating-point metrics — Smooth Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget — all with built-in DDP all-gather support for globally-correct estimation across multi-GPU training. Imbalance is the design center (the memory queue and DDP gather exist for stable estimation at low positive rates), but the ranking losses apply to ranking/operating-point objectives more broadly.
+**imbalanced-losses** is a PyTorch library of training losses for class-imbalanced classification and ranking-metric optimization. It provides Focal Loss for reweighting, plus differentiable surrogates for ranking and operating-point metrics: Smooth Average Precision (Smooth-AP), Recall-at-Quantile, and Partial-AUC-at-Budget. All losses have built-in DDP all-gather support for globally-correct estimation across multi-GPU training. Imbalance is the design center (the memory queue and DDP gather exist for stable estimation at low positive rates), but the ranking losses apply to ranking/operating-point objectives more broadly.
 
 ## When to use it
 
@@ -54,7 +54,7 @@ Before deploying, read [Assumptions and Failure Modes](explanation/assumptions-a
 
 ## Documentation sections
 
-- [**Tutorials**](tutorials/index.md) — hands-on walkthroughs that take you from zero to a working training loop
-- [**How-To Guides**](how-to/index.md) — goal-oriented recipes for common tasks
-- [**Reference**](reference/index.md) — full API documentation for every public class and function
-- [**Explanation**](explanation/index.md) — background on design decisions, trade-offs, and non-obvious behavior
+- [**Tutorials**](tutorials/index.md): hands-on walkthroughs that take you from zero to a working training loop
+- [**How-To Guides**](how-to/index.md): goal-oriented recipes for common tasks
+- [**Reference**](reference/index.md): full API documentation for every public class and function
+- [**Explanation**](explanation/index.md): background on design decisions, trade-offs, and non-obvious behavior
