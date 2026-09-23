@@ -50,7 +50,7 @@ loss = loss_fn(logits, targets)
 | `gamma` | `2.0` | Higher = harder focus; `0` = vanilla cross-entropy |
 | `reduction` | `"mean"` | `"mean_positive"` normalizes by foreground count (detection tasks) |
 | `background_class` | `0` | Class excluded from `mean_positive` denominator |
-| `ignore_index` | `-100` | Padded positions — zero loss, zero gradient |
+| `ignore_index` | `-100` | Padded positions (zero loss, zero gradient) |
 | `label_smoothing` | `0.0` | Forwarded to `F.cross_entropy` |
 
 ### mean_positive reduction semantics

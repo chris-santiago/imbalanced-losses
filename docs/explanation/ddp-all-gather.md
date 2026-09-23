@@ -4,7 +4,7 @@
 
 In standard DDP training, each GPU processes `N / world_size` samples. Each GPU computes the loss independently on its own shard, and gradients are all-reduced across workers before the optimizer step.
 
-This works for losses that decompose across samples — cross-entropy, BCE, MSE. Each sample's loss is independent, so sharding is equivalent to computing on the full batch.
+This works for losses that decompose across samples: cross-entropy, BCE, MSE. Each sample's loss is independent, so sharding is equivalent to computing on the full batch.
 
 Ranking losses do not decompose. `SmoothAPLoss` estimates the rank of each positive within a pool. A positive on GPU 0 is ranked relative to the `N / world_size` samples on GPU 0, not the full `N` samples. With 4 GPUs and a 1% positive rate, each GPU may see 0 or 1 positives per batch. The rank estimate is not just noisy — it's qualitatively wrong.
 
@@ -18,11 +18,11 @@ Ranking losses do not decompose. `SmoothAPLoss` estimates the rank of each posit
 
 All-gather collects tensors from all workers and concatenates them before the loss computation. Every worker sees the full global batch, computes the same ranks and thresholds, and produces the same loss value. Gradient all-reduction then works correctly because the loss is the same function of each worker's local parameters.
 
-One caveat: if `max_pool_size` subsampling triggers, each rank draws its own random subset (the `torch.randperm` in the subsampler is unseeded and per-rank), so the loss value can differ slightly across ranks on those steps. The queues stay identical regardless, because the full post-gather batch — not the subsampled pool — is enqueued.
+One caveat: if `max_pool_size` subsampling triggers, each rank draws its own random subset (the `torch.randperm` in the subsampler is unseeded and per-rank), so the loss value can differ slightly across ranks on those steps. The queues stay identical regardless, because the full post-gather batch, not the subsampled pool, is enqueued.
 
 ## Why gradient flow is non-trivial
 
-Standard `dist.all_gather` writes into fresh output buffers that have no connection to the computation graph — every gathered slice comes back detached, including the local rank's own. If you simply all-gathered logits and passed them to the loss, *zero* gradient would flow back to the model parameters. The loss value would be correct and training would silently do nothing.
+Standard `dist.all_gather` writes into fresh output buffers that have no connection to the computation graph: every gathered slice comes back detached, including the local rank's own. If you simply all-gathered logits and passed them to the loss, *zero* gradient would flow back to the model parameters. The loss value would be correct and training would silently do nothing.
 
 `all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the original tensor (which is connected to the computation graph), while keeping other workers' slices detached:
 
@@ -34,7 +34,7 @@ Each rank therefore backpropagates only through its own 1/world_size of the glob
 
 ## Variable batch sizes across ranks
 
-By default, `dist.all_gather` requires every rank to contribute a tensor with exactly the same shape. This breaks when ranks have different batch sizes — for example, the last batch of an epoch when the dataset size is not evenly divisible by the number of GPUs, or when using variable-length data without padding.
+By default, `dist.all_gather` requires every rank to contribute a tensor with exactly the same shape. This breaks when ranks have different batch sizes: for example, the last batch of an epoch when the dataset size is not evenly divisible by the number of GPUs, or when using variable-length data without padding.
 
 Both gather helpers handle this automatically using a **pad-to-max-then-trim** strategy:
 
@@ -45,7 +45,7 @@ Both gather helpers handle this automatically using a **pad-to-max-then-trim** s
 
 Gradient flow is unaffected: the local rank's slice is still replaced with the original (unpadded) tensor, which carries the autograd graph.
 
-When all ranks contribute the same number of rows, an **equal-size fast path** detects this and skips padding and trimming entirely — no overhead compared to the previous behavior.
+When all ranks contribute the same number of rows, an **equal-size fast path** detects this and skips padding and trimming entirely, adding no overhead compared to the previous behavior.
 
 This means `drop_last=True` in `DistributedSampler` is no longer required for correctness, though it remains a useful optimization to minimize wasted computation from padding.
 
@@ -63,14 +63,14 @@ Focal losses (`SigmoidFocalLoss`, `SoftmaxFocalLoss`) follow the same rule at a 
 
 ## Queue synchronization under DDP
 
-Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same full global batch. After any number of training steps, all workers have identical queues — no additional synchronization is needed. This would not hold if each worker enqueued only its local shard.
+Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same full global batch. After any number of training steps, all workers have identical queues, so no additional synchronization is needed. This would not hold if each worker enqueued only its local shard.
 
 ## Auto-detection vs. explicit control
 
-The default `gather_distributed=None` resolves gathering on the very first forward call, and the result is cached permanently — the check happens once, not on every forward. This means the process group must already be initialized when that first forward runs:
+The default `gather_distributed=None` resolves gathering on the very first forward call, and the result is cached permanently: the check happens once, not on every forward. This means the process group must already be initialized when that first forward runs:
 
 1. `dist.is_initialized()` returns `False` before `init_process_group` is called
-2. If the first forward happens before `init_process_group` — e.g. a dry-run or shape-check forward during setup — auto-detection resolves to "no gathering" and stays that way for the life of the instance, even after the process group comes up
+2. If the first forward happens before `init_process_group` (e.g. a dry-run or shape-check forward during setup), auto-detection resolves to "no gathering" and stays that way for the life of the instance, even after the process group comes up
 
 If your training setup performs any forward pass before `init_process_group`, pass `gather_distributed=True` explicitly.
 

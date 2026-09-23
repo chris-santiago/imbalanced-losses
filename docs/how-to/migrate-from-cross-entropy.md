@@ -31,7 +31,7 @@ loss = loss_fn(logits, targets.float())
 
 **What stays the same:**
 - Input and target shapes
-- `.backward()` call — no changes to your training loop
+- `.backward()` call (no changes to your training loop)
 
 **Where to start:** `alpha=0.25, gamma=2.0` are the RetinaNet defaults and a reasonable
 first try. Set `gamma=0` if you want alpha-weighted BCE without focusing.
@@ -81,7 +81,7 @@ loss_fn = SoftmaxFocalLoss(alpha=alpha, gamma=2.0)
 ## BCE / CE → SmoothAPLoss, RecallAtQuantileLoss, or PAUCAtBudgetLoss
 
 Ranking losses require a warm start because their gradients are nearly zero when the model is
-random. **Do not** switch cold — wrap with `LossWarmupWrapper` to run BCE or CE for the first
+random. **Do not** switch cold; wrap with `LossWarmupWrapper` to run BCE or CE for the first
 few epochs first.
 
 ### Binary

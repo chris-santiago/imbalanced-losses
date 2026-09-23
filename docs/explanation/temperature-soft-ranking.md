@@ -2,7 +2,7 @@
 
 ## Why the rank function is not differentiable
 
-Average Precision is defined in terms of ranks: for each positive, what fraction of all higher-ranked samples are also positive? A sample's rank is the count of samples with strictly higher scores — a step function. Step functions have zero gradient everywhere and are undefined at ties. You cannot backpropagate through them.
+Average Precision is defined in terms of ranks: for each positive, what fraction of all higher-ranked samples are also positive? A sample's rank is the count of samples with strictly higher scores. This is a step function. Step functions have zero gradient everywhere and are undefined at ties. You cannot backpropagate through them.
 
 `SmoothAPLoss` replaces the hard rank with a soft approximation using the sigmoid function.
 
@@ -14,7 +14,7 @@ The hard indicator `1[s_j > s_i]` (1 if j ranks above i, 0 otherwise) is replace
 σ((s_j - s_i) / τ)
 ```
 
-where τ is the temperature. As τ → 0, σ((s_j - s_i) / τ) converges to the hard indicator. As τ → ∞, it converges to 0.5 everywhere — no rank information.
+where τ is the temperature. As τ → 0, σ((s_j - s_i) / τ) converges to the hard indicator. As τ → ∞, it converges to 0.5 everywhere: no rank information.
 
 The soft rank of a positive i is then:
 
@@ -59,9 +59,9 @@ Low τ: gradients flow mainly from positives right at the boundary (hard push, c
 tau_eff = temperature * scale
 ```
 
-where `scale` is a detached (stop-gradient) robust dispersion of the iid negatives — the IQR of their scores by default (`tau_scale="iqr"`), or the band width `t_alpha - t_beta` (`tau_scale="band"`). Because `scale` is in the same units as the model's logits, `tau_eff` adapts automatically as the score distribution expands or contracts during training.
+where `scale` is a detached (stop-gradient) robust dispersion of the iid negatives: the IQR of their scores by default (`tau_scale="iqr"`), or the band width `t_alpha - t_beta` (`tau_scale="band"`). Because `scale` is in the same units as the model's logits, `tau_eff` adapts automatically as the score distribution expands or contracts during training.
 
-The `temperature` parameter in `PAUCAtBudgetLoss` is therefore **dimensionless** (default `0.1`), unlike the raw-logit `temperature=0.01` of `SmoothAPLoss` and `RecallAtQuantileLoss`. A temperature of `0.1` means the sigmoid kernel is tuned to a transition region of `0.1 × IQR` in score space — if the IQR is 2.0, the effective tau is 0.2. As training progresses and the IQR widens to 5.0, tau_eff automatically becomes 0.5, maintaining the same relative sharpness in FPR units.
+The `temperature` parameter in `PAUCAtBudgetLoss` is therefore **dimensionless** (default `0.1`), unlike the raw-logit `temperature=0.01` of `SmoothAPLoss` and `RecallAtQuantileLoss`. A temperature of `0.1` means the sigmoid kernel is tuned to a transition region of `0.1 × IQR` in score space. If the IQR is 2.0, the effective tau is 0.2. As training progresses and the IQR widens to 5.0, tau_eff automatically becomes 0.5, maintaining the same relative sharpness in FPR units.
 
 This design prevents a common failure mode in long training runs: a fixed small temperature that worked at initialization becomes too sharp as score scale inflates, saturating the soft kernels and producing nearly zero gradients.
 
@@ -84,7 +84,7 @@ Use `"iqr"` for most cases. Switch to `"band"` when the band is very wide and yo
 
 The `LossWarmupWrapper` defaults (`temp_start=0.05`, `temp_end=0.005`) decay from the stable mid-training range into the late-training refinement range over the main phase. Raise `temp_start` toward 0.1–0.5 if the main phase begins with weakly separated scores.
 
-If you schedule temperature yourself rather than through the wrapper, note that `temperature` is a plain attribute and is **not** saved in `state_dict()` — it reverts to its constructor value on every resume. See [Assumptions and failure modes](assumptions-and-failure-modes.md#losswarmupwrapper) and [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
+If you schedule temperature yourself rather than through the wrapper, note that `temperature` is a plain attribute and is **not** saved in `state_dict()`: it reverts to its constructor value on every resume. See [Assumptions and failure modes](assumptions-and-failure-modes.md#losswarmupwrapper) and [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
 
 ## Connection to the discontinuous rank
 

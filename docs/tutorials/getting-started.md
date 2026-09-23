@@ -12,7 +12,7 @@ This tutorial trains a binary classifier on a highly imbalanced dataset. You wil
 pip install "imbalanced-losses[demo]"
 ```
 
-## Step 1 — Generate imbalanced data
+## Step 1: Generate imbalanced data
 
 ```python
 import torch
@@ -48,7 +48,7 @@ print(f"Train size: {len(X_train)}, positives: {int(y_train.sum())}")
 Train size: 8000, positives: 391
 ```
 
-## Step 2 — Define a simple model
+## Step 2: Define a simple model
 
 ```python
 model = nn.Sequential(
@@ -58,7 +58,7 @@ model = nn.Sequential(
 )
 ```
 
-## Step 3 — Train with vanilla BCE (baseline)
+## Step 3: Train with vanilla BCE (baseline)
 
 ```python
 torch.manual_seed(0)
@@ -85,9 +85,9 @@ with torch.no_grad():
 BCE  AUCPR: 0.2013
 ```
 
-The model learns but is dominated by the majority class — easy negatives suppress gradient signal to positives.
+The model learns but is dominated by the majority class: easy negatives suppress gradient signal to positives.
 
-## Step 4 — Switch to Focal Loss
+## Step 4: Switch to Focal Loss
 
 Focal loss down-weights well-classified easy examples, forcing the model to focus on the hard positives.
 
@@ -120,7 +120,7 @@ Focal AUCPR: 0.2097
 
 A modest improvement. Now let's go further by directly optimizing AP.
 
-## Step 5 — Use Smooth-AP with warmup
+## Step 5: Use Smooth-AP with warmup
 
 Ranking losses need a warm start because their gradients are flat when the model is random. `LossWarmupWrapper` runs BCE for the first few epochs, then blends into Smooth-AP.
 
@@ -207,8 +207,8 @@ You trained the same model architecture with three different loss strategies and
 
 ## Next steps
 
-- [Use Focal Loss](../how-to/use-focal-loss.md) — detailed options for `SigmoidFocalLoss` and `SoftmaxFocalLoss`
-- [Use Ranking Losses](../how-to/use-ranking-losses.md) — queue sizing, temperature, binary vs. multi-class
-- [Configure Warmup and Blending](../how-to/configure-warmup.md) — tuning the phase schedule
-- [Train with DDP](../how-to/train-with-ddp.md) — multi-GPU setup
-- [`examples/binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py) — sweeps positive rates from 25 % down to 0.5 % to show where `SmoothAPLoss` earns its largest gains
+- [Use Focal Loss](../how-to/use-focal-loss.md): detailed options for `SigmoidFocalLoss` and `SoftmaxFocalLoss`
+- [Use Ranking Losses](../how-to/use-ranking-losses.md): queue sizing, temperature, binary vs. multi-class
+- [Configure Warmup and Blending](../how-to/configure-warmup.md): tuning the phase schedule
+- [Train with DDP](../how-to/train-with-ddp.md): multi-GPU setup
+- [`examples/binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py): sweeps positive rates from 25 % down to 0.5 % to show where `SmoothAPLoss` earns its largest gains

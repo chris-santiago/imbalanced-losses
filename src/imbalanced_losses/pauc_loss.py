@@ -109,8 +109,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
     so the band covers every false-positive that falls above the budget
     threshold, i.e. all negatives scoring at or above the operating point.
 
-    The older convention ``[budget/2, 1.5·budget]`` — e.g. ``[0.0025, 0.0075]``
-    for a 50 bps point — excludes the highest-scoring (worst) negatives via its
+    The older convention ``[budget/2, 1.5·budget]`` (e.g. ``[0.0025, 0.0075]``
+    for a 50 bps point) excludes the highest-scoring (worst) negatives via its
     lower edge ``alpha = budget/2`` and extends below the operating threshold via
     its upper edge ``beta = 1.5·budget``.  A band sweep (8 seeds, synthetic
     contested-top extreme-imbalance data, 50 bps budget) found coverage@budget

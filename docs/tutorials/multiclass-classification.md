@@ -15,7 +15,7 @@ optimize per-class average precision. Every step prints a metric so you can see 
 pip install "imbalanced-losses[demo]"
 ```
 
-## Step 1 — Generate imbalanced multiclass data
+## Step 1: Generate imbalanced multiclass data
 
 Exponentially decreasing class weights put ~51% of samples in class 0 and only ~3% in class 4.
 
@@ -66,9 +66,9 @@ Train size: 7500
 Class counts: [3817, 1931, 1004, 498, 250]
 ```
 
-## Step 2 — Define a simple model
+## Step 2: Define a simple model
 
-The model outputs `[N, C]` logits — one score per class.
+The model outputs `[N, C]` logits: one score per class.
 
 ```python
 model = nn.Sequential(
@@ -80,7 +80,7 @@ model = nn.Sequential(
 )
 ```
 
-## Step 3 — Define the macro-AP metric
+## Step 3: Define the macro-AP metric
 
 `average_precision_score` with `average='macro'` computes one-vs-rest AP for each class
 and averages. This is more informative than accuracy for imbalanced problems.
@@ -96,7 +96,7 @@ def compute_macro_ap(model, X, y_np):
     return float(ap)
 ```
 
-## Step 4 — Train with CrossEntropyLoss (baseline)
+## Step 4: Train with CrossEntropyLoss (baseline)
 
 ```python
 def run(loss_fn, total_epochs=20, batch_size=256):
@@ -127,7 +127,7 @@ print(f"CE  macro-AP: {ce_ap:.4f}")
 CE  macro-AP: 0.9716
 ```
 
-## Step 5 — Add per-class alpha with SoftmaxFocalLoss
+## Step 5: Add per-class alpha with SoftmaxFocalLoss
 
 `CrossEntropyLoss` treats every class equally. `SoftmaxFocalLoss` with `alpha` set to inverse
 class frequency gives more gradient weight to rare classes and applies a focusing modulator
@@ -153,17 +153,17 @@ Focal macro-AP: 0.9573
 ```
 
 The alpha values show class 4 (rarest) gets 15× the gradient weight of class 0. The overall
-macro-AP is similar to CE — that's expected on this task. The difference shows up in tail-class
+macro-AP is similar to CE. That's expected on this task. The difference shows up in tail-class
 AP when you look per class (see [Log Per-Class Metrics](../how-to/log-per-class-metrics.md)).
 
-## Step 6 — Use SmoothAPLoss with warmup
+## Step 6: Use SmoothAPLoss with warmup
 
 `SmoothAPLoss` directly optimizes average precision rather than cross-entropy. Ranking losses
-need a warm start — their gradients are nearly flat when the model is random. `LossWarmupWrapper`
+need a warm start because their gradients are nearly flat when the model is random. `LossWarmupWrapper`
 runs `CrossEntropyLoss` for the first few epochs, then blends into `SmoothAPLoss`.
 
 Note that both `CrossEntropyLoss` and `SmoothAPLoss` accept the same input format:
-`[N, C]` logits and `[N]` long integer targets — no conversion needed.
+`[N, C]` logits and `[N]` long integer targets, so no conversion is needed.
 
 ```python
 from imbalanced_losses import SmoothAPLoss, LossWarmupWrapper
@@ -248,7 +248,7 @@ You trained the same architecture with three loss strategies on a 5-class imbala
 **Why are the numbers close?** With the rarest class at ~3% frequency, this dataset sits in the
 *mild-to-moderate* imbalance range. `CrossEntropyLoss` is surprisingly competitive here
 because even the majority class provides some gradient signal toward the tail. `SmoothAPLoss`
-earns its largest gains under more extreme imbalance — where positives are so rare that
+earns its largest gains under more extreme imbalance, where positives are so rare that
 cross-entropy gradients from easy negatives dominate, not because the dataset is hard, but
 because the easy negatives vastly outnumber the informative positives. The binary
 [Getting Started tutorial](getting-started.md) shows a 5% positive rate case where
@@ -260,14 +260,14 @@ often the simpler choice with comparable results.
 
 **Key multiclass-specific points:**
 - Targets must be `torch.long` class indices `[N]`, not float or one-hot
-- `SmoothAPLoss` and `CrossEntropyLoss` share the same input format — no dtype conversion in the warmup wrapper
+- `SmoothAPLoss` and `CrossEntropyLoss` share the same input format; no dtype conversion in the warmup wrapper
 - `queue_size` accumulates logits across batches; use at least 4–8× your typical batch size
 
 ## Next steps
 
-- [Use Ranking Losses](../how-to/use-ranking-losses.md) — queue sizing, temperature, and quantile selection
-- [Configure Warmup and Blending](../how-to/configure-warmup.md) — tune warmup/blend schedules
-- [Log Per-Class Metrics](../how-to/log-per-class-metrics.md) — monitor per-class AP without a second forward pass
-- [Migrate from BCE / CrossEntropyLoss](../how-to/migrate-from-cross-entropy.md) — drop-in migration checklist
-- [`examples/binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py) — sweep positive rates 25 % → 0.5 % to see where `SmoothAPLoss` gains are largest
-- [`examples/multiclass_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/multiclass_demo.py) — same CE vs Focal vs SmoothAP comparison with a configurable number of classes (`--n-classes`) and per-epoch macro-AP table
+- [Use Ranking Losses](../how-to/use-ranking-losses.md): queue sizing, temperature, and quantile selection
+- [Configure Warmup and Blending](../how-to/configure-warmup.md): tune warmup/blend schedules
+- [Log Per-Class Metrics](../how-to/log-per-class-metrics.md): monitor per-class AP without a second forward pass
+- [Migrate from BCE / CrossEntropyLoss](../how-to/migrate-from-cross-entropy.md): drop-in migration checklist
+- [`examples/binary_imbalance_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/binary_imbalance_demo.py): sweep positive rates 25 % → 0.5 % to see where `SmoothAPLoss` gains are largest
+- [`examples/multiclass_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/multiclass_demo.py): same CE vs Focal vs SmoothAP comparison with a configurable number of classes (`--n-classes`) and per-epoch macro-AP table

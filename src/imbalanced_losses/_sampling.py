@@ -31,8 +31,8 @@ def subsample_pool(
     every observed class an equal quota regardless of frequency.  A dominant
     class (e.g. background) and a rare class receive the same reserved count.
     The consequence is that rare classes are over-represented relative to their
-    natural frequency — intentionally so, to ensure they contribute gradient
-    signal — while the remainder of the budget is filled uniformly.
+    natural frequency (intentionally so, to ensure they contribute gradient
+    signal), while the remainder of the budget is filled uniformly.
 
     Selection is weight-blind: ``batch.sample_weight`` is transported, never
     consulted, when deciding which rows to keep (spec section 3).
@@ -41,7 +41,7 @@ def subsample_pool(
     ----------
     batch : PooledBatch
         Pool rows (live batch + queue, already filtered for ignore_index).
-        ``logits`` may carry gradients — the returned rows preserve them.
+        ``logits`` may carry gradients; the returned rows preserve them.
         Every tensor the batch carries is re-indexed by the same selection,
         so no supplied tensor can be dropped or left misaligned.
     max_size : int

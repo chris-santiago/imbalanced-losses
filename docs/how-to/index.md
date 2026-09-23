@@ -1,13 +1,13 @@
 # How-To Guides
 
-How-to guides are goal-oriented recipes. Each one solves a specific task — assume you already know the basics from the [Getting Started tutorial](../tutorials/getting-started.md).
+How-to guides are goal-oriented recipes. Each one solves a specific task and assumes you already know the basics from the [Getting Started tutorial](../tutorials/getting-started.md).
 
 ## Available guides
 
-- [**Use Focal Loss**](use-focal-loss.md) — `SigmoidFocalLoss` for binary/multi-label, `SoftmaxFocalLoss` for multiclass, with `alpha`, `gamma`, and `mean_positive` reduction
-- [**Use Ranking Losses**](use-ranking-losses.md) — `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` with queue sizing, band selection, and temperature guidance
-- [**Weight Samples by Value**](weight-samples.md) — `sample_weight` for value-weighted objectives (e.g. dollar-weighted recall@budget) across every loss
-- [**Configure Warmup and Blending**](configure-warmup.md) — tune phase schedules, blend epochs, and temperature decay in `LossWarmupWrapper`
-- [**Train with DDP**](train-with-ddp.md) — multi-GPU all-gather setup for all losses
-- [**Log Per-Class Metrics**](log-per-class-metrics.md) — retrieve per-class loss tensors without a second forward pass
-- [**Migrate from BCE / CrossEntropyLoss**](migrate-from-cross-entropy.md) — drop-in migration checklist, common mistakes, and a decision table for choosing the right loss
+- [**Use Focal Loss**](use-focal-loss.md): `SigmoidFocalLoss` for binary/multi-label, `SoftmaxFocalLoss` for multiclass, with `alpha`, `gamma`, and `mean_positive` reduction
+- [**Use Ranking Losses**](use-ranking-losses.md): `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` with queue sizing, band selection, and temperature guidance
+- [**Weight Samples by Value**](weight-samples.md): `sample_weight` for value-weighted objectives (e.g. dollar-weighted recall@budget) across every loss
+- [**Configure Warmup and Blending**](configure-warmup.md): tune phase schedules, blend epochs, and temperature decay in `LossWarmupWrapper`
+- [**Train with DDP**](train-with-ddp.md): multi-GPU all-gather setup for all losses
+- [**Log Per-Class Metrics**](log-per-class-metrics.md): retrieve per-class loss tensors without a second forward pass
+- [**Migrate from BCE / CrossEntropyLoss**](migrate-from-cross-entropy.md): drop-in migration checklist, common mistakes, and a decision table for choosing the right loss

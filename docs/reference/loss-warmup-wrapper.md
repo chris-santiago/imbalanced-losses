@@ -41,7 +41,7 @@ loss_fn = LossWarmupWrapper(
 
 ## PyTorch Lightning integration
 
-**Epoch mode** — call both hooks:
+**Epoch mode.** Call both hooks:
 
 ```python
 class MyModel(pl.LightningModule):
@@ -65,7 +65,7 @@ class MyModel(pl.LightningModule):
         return loss
 ```
 
-**Step mode** — only the batch hook is required:
+**Step mode.** Only the batch hook is required:
 
 ```python
 class MyModel(pl.LightningModule):
@@ -79,7 +79,7 @@ class MyModel(pl.LightningModule):
 
 ## Phase schedule
 
-**Epoch mode** — with `warmup_epochs=5, blend_epochs=2, final_main_weight=1.0` (default):
+**Epoch mode**, with `warmup_epochs=5, blend_epochs=2, final_main_weight=1.0` (default):
 
 | Epoch range | Phase | `in_warmup` | `in_blend` | `main_weight` |
 |---|---|---|---|---|
@@ -88,7 +88,7 @@ class MyModel(pl.LightningModule):
 | 6 | blend | `False` | `True` | `0.667` |
 | 7+ | main | `False` | `False` | `1.0` |
 
-**Step mode** — with `warmup_steps=500, blend_steps=3, final_main_weight=1.0` (default):
+**Step mode**, with `warmup_steps=500, blend_steps=3, final_main_weight=1.0` (default):
 
 | Step range | Phase | `in_warmup` | `in_blend` | `main_weight` |
 |---|---|---|---|---|
@@ -98,7 +98,7 @@ class MyModel(pl.LightningModule):
 | 502 | blend | `False` | `True` | `0.75` |
 | 503+ | main | `False` | `False` | `1.0` |
 
-**Permanent mix** — with `warmup_epochs=5, blend_epochs=2, final_main_weight=0.75`:
+**Permanent mix**, with `warmup_epochs=5, blend_epochs=2, final_main_weight=0.75`:
 
 | Epoch range | Phase | `in_warmup` | `in_blend` | `main_weight` |
 |---|---|---|---|---|
@@ -121,7 +121,7 @@ The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end
 
 ## Checkpointing and resume
 
-`LossWarmupWrapper` persists its schedule state — the current epoch, global step, phase-switch step, and temperature — in `state_dict()` under the standard `_extra_state` key, via PyTorch's `get_extra_state`/`set_extra_state`. Resuming from a checkpoint restores the phase, continues the temperature decay from the correct elapsed step, resumes a blend ramp mid-way, and leaves the restored memory queue intact.
+`LossWarmupWrapper` persists its schedule state (the current epoch, global step, phase-switch step, and temperature) in `state_dict()` under the standard `_extra_state` key, via PyTorch's `get_extra_state`/`set_extra_state`. Resuming from a checkpoint restores the phase, continues the temperature decay from the correct elapsed step, resumes a blend ramp mid-way, and leaves the restored memory queue intact.
 
 Checkpoints written before this state was persisted still load under `strict=True`. They restart the temperature schedule on resume, which is the behavior they were saved with.
 

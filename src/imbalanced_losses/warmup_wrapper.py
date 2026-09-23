@@ -1,5 +1,5 @@
 """
-LossWarmupWrapper — phase-switching loss with geometric temperature decay.
+LossWarmupWrapper: phase-switching loss with geometric temperature decay.
 
 Usage in a LightningModule (epoch-based warmup)
 ------------------------------------------------
@@ -65,12 +65,12 @@ class LossWarmupWrapper(nn.Module):
     """
     Wraps a warmup loss and a main ranking loss with two features:
 
-    1. **Phase switching** — ``warmup_loss`` is active during the warmup
+    1. **Phase switching**: ``warmup_loss`` is active during the warmup
        phase; ``main_loss`` is active thereafter.  The warmup phase can be
        defined in **epochs** (``warmup_epochs``) or **steps**
        (``warmup_steps``), but not both.
 
-    2. **Geometric temperature decay** — ``main_loss.temperature`` decays
+    2. **Geometric temperature decay**: ``main_loss.temperature`` decays
        from ``temp_start`` to ``temp_end`` over ``temp_decay_steps``
        global training steps, starting from the moment of phase switch::
 
@@ -83,8 +83,8 @@ class LossWarmupWrapper(nn.Module):
     from the corresponding PyTorch Lightning hooks (or your training loop).
     In step mode, :meth:`on_train_epoch_start` is optional (only needed
     when ``reset_queue_each_epoch=True``).  :meth:`on_train_batch_start`
-    is **required** whenever ``main_loss`` exposes a ``temperature`` —
-    in **epoch mode as well as step mode** — because it is the only thing
+    is **required** whenever ``main_loss`` exposes a ``temperature``
+    (in **epoch mode as well as step mode**), because it is the only thing
     that drives the temperature schedule.  Omitting it leaves the
     temperature undecayed (it never moves toward ``temp_end``); a one-time
     ``UserWarning`` is emitted from :meth:`forward` if this is detected.
@@ -128,7 +128,7 @@ class LossWarmupWrapper(nn.Module):
         hard switch if no blend is configured).  Must be in ``(0, 1]``.
         Default: ``1.0`` (pure ``main_loss`` after warmup).
 
-        Use this when you want a permanent mix — e.g.
+        Use this when you want a permanent mix, e.g.
         ``final_main_weight=0.75`` keeps a 75 / 25 main / warmup split
         indefinitely after the blend ramp completes.
     reset_queue_each_epoch : bool, optional

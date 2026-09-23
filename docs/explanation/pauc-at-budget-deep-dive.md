@@ -1,6 +1,6 @@
 # PAUCAtBudgetLoss: a deep dive
 
-A technical write-up of `PAUCAtBudgetLoss` — what it optimizes, how each piece
+A technical write-up of `PAUCAtBudgetLoss`: what it optimizes, how each piece
 works, where it helps, and where it does not. It is candid about limitations:
 on easy problems a well-weighted cross-entropy is hard to beat, and the gains
 are regime-specific.
@@ -13,9 +13,9 @@ budget), rather than the whole ROC/PR curve or a single score threshold. The ban
 edges are estimated as **stop-gradient score quantiles of the iid negatives**, so
 `β` keeps meaning population FPR even when a caller densifies the batch. A
 **scale-aware temperature** keeps the surrogate's sharpness constant in FPR units as
-the model's score scale drifts during training. Two surrogates are provided — a
+the model's score scale drifts during training. Two surrogates are provided: a
 **trapezoid** estimator (soft-TPR integrated over the band) and a **pairwise**
-estimator (band-restricted Smooth-AP) — and a `pos_numerator` switch controls
+estimator (band-restricted Smooth-AP). A `pos_numerator` switch controls
 whether the numerator uses all pooled positives or only the live, gradient-carrying
 ones. The loss is an original design; the partial-AUC objective it targets has a
 long published lineage (see [References](#references)).
@@ -23,9 +23,9 @@ long published lineage (see [References](#references)).
 ## 1. Motivation
 
 For an alerting or review workload, the metric that matters is **coverage at a
-budget**: if you can action the top `b` fraction of scores (say the top 0.5 % —
+budget**: if you can action the top `b` fraction of scores (say the top 0.5 %, or
 "50 bps"), what fraction of positives do you catch? At extreme imbalance this is
-approximately recall at a fixed low false-positive rate — the two coincide as
+approximately recall at a fixed low false-positive rate. The two coincide as
 positives become a negligible share of the population, but they are not the same
 quantity (the top-`b` budget is a fraction of *all* samples, FPR a fraction of
 *negatives*; see the technical report §1.3 for the small gap). This is decided
@@ -38,8 +38,8 @@ optimize it directly:
 - **AUCPR / Smooth-AP** optimize the *whole* precision–recall curve.
 - **Recall-at-Quantile** optimizes a *single* threshold.
 
-A common symptom motivates this loss: improving a model — scaling up capacity, more
-training, better features — can **raise mid-range AUCPR while leaving, or even
+A common symptom motivates this loss: improving a model (scaling up capacity, more
+training, better features) can **raise mid-range AUCPR while leaving, or even
 degrading, coverage at the operating point.** The model gets better in the bulk of
 the score distribution and no better, or worse, exactly where it is deployed.
 Whole-curve and per-sample objectives have no special pull on the top of the
@@ -105,7 +105,7 @@ thresholds. The surrogate itself costs `O(|P| × n_knots)`. For a narrow band,
 `n_knots = 2` is accurate (trapezoid error scales as `(β − α)³ · TPR''`); use
 `n_knots ≥ 3` for wide bands.
 
-**Pairwise** (`surrogate="pairwise"`). Band-restricted Smooth-AP — compare positives
+**Pairwise** (`surrogate="pairwise"`). Band-restricted Smooth-AP. It compares positives
 against the negatives that land *inside* the band, which carry gradient:
 
 ```
@@ -121,8 +121,8 @@ realistic queue sizes, by the `torch.quantile` call that resolves the thresholds
 that sorts the reference population, `O(M log M)` per class, where `M` is the pooled
 reference count. The band itself holds only `(β − α)` of the reference mass, so
 `|band|` stays small by construction and the pairwise matrix is rarely the
-bottleneck. Since 0.5.2 every level a class needs — knots, band edges, and the IQR
-dispersion pair — is resolved in a *single* `torch.quantile` call rather than the
+bottleneck. Since 0.5.2 every level a class needs (knots, band edges, and the IQR
+dispersion pair) is resolved in a *single* `torch.quantile` call rather than the
 four or five separate sorts used previously. At batch 4096 with a 32k queue on CPU
 that is worth roughly 3–3.7× for the trapezoid surrogate and 2–2.9× for pairwise;
 the exact ratio is machine-dependent, and the pairwise figure also depends on the
@@ -150,7 +150,7 @@ against, since such a band resolves essentially one threshold.
 τ_eff = temperature × scale          (scale detached)
 ```
 
-where `scale` is a robust dispersion of the iid negatives — `IQR` by default
+where `scale` is a robust dispersion of the iid negatives: `IQR` by default
 (`tau_scale="iqr"`), or the band width `t_α − t_β` (`tau_scale="band"`).
 `temperature` is therefore a **dimensionless** multiplier (default `0.1`), unlike the
 raw-logit `temperature=0.01` of the sibling losses.
@@ -166,19 +166,19 @@ memory queue); `"live"` averages over the live-batch positives only. See §3.3.
 
 Because the edges depend only on rows flagged `iid_mask=True`, appending non-iid
 negatives (caller-side hard-negative mining / class-balanced sampling) does not move
-`t_α` / `t_β`. With `iid_mask=None` (the default) every negative is treated as iid —
-correct for any pipeline that never densifies negatives by class. The mask is
+`t_α` / `t_β`. With `iid_mask=None` (the default) every negative is treated as iid,
+which is correct for any pipeline that never densifies negatives by class. The mask is
 gathered across DDP ranks and stored per-row in the queue, so the edges are computed
 from the **global** iid-negative pool. *(Verified: the thresholds are bit-invariant to
 injected non-iid negatives for both surrogates; the loss is bit-invariant for the
 trapezoid surrogate only. The pairwise surrogate deliberately contrasts positives
-against every negative that lands in the band — iid or not — so injected non-iid
+against every negative that lands in the band, iid or not, so injected non-iid
 negatives that fall in the band do change its loss.)*
 
 ### 3.2 Scale invariance (the τ design)
 
 A fixed raw-logit temperature silently hardens as a model's score scale inflates
-during training — the sigmoid saturates and band gradient vanishes exactly when
+during training: the sigmoid saturates and band gradient vanishes exactly when
 overfitting begins. Since `τ_eff ∝ scale` (a detached statistic of the negatives),
 the ratio `(s − t)/τ_eff` is held roughly constant: scaling all logits by a constant
 leaves the normalized loss and the gradient *direction* unchanged. *(Verified: loss
@@ -190,7 +190,7 @@ bit-identical and gradient-direction cosine 1.0 under score scaling, for both
 The trapezoid numerator is a mean over positives. At extreme imbalance a minibatch
 holds only a handful of live (gradient-carrying) positives, while the memory queue
 holds many *detached* ones. Under `pos_numerator="pool"` the live gradient is scaled
-by `1/|P_pool|` and the soft-TPR value is dominated by stale queue positives — the
+by `1/|P_pool|` and the soft-TPR value is dominated by stale queue positives, so the
 trapezoid surrogate underperforms or destabilizes. `pos_numerator="live"` computes
 the numerator over the live positives only (the queue still feeds the thresholds),
 restoring an undiluted gradient. This is **surrogate-dependent**: it rescues the
@@ -201,7 +201,7 @@ its positive × band-negative contrast to a few live positives starves it.
 
 If the iid-negative dispersion is ≈ 0 (near-constant negatives, or a band collapsed
 because too few iid negatives resolve the tail quantile), the class is marked invalid
-and excluded from the reduction, with a one-time warning — instead of producing a
+and excluded from the reduction with a one-time warning, rather than producing a
 signal-free or exploding gradient. Relatedly, the band edges approximate population
 FPR only when the pooled iid-negative count comfortably resolves the band's smaller
 nonzero edge: **substantially exceeding `1/β`** with the default `α=0` (where
@@ -220,13 +220,13 @@ No mathematical errors were found.
 
 ## 4. Experiments
 
-These are small, controlled, CPU-scale synthetic studies — **not** large-scale
+These are small, controlled, CPU-scale synthetic studies, **not** large-scale
 benchmark claims. They come in two tiers, and the second is the stronger basis for
 everything that follows:
 
-1. **The shipped demo** (`examples/coverage_at_budget_demo.py`) — a single,
+1. **The shipped demo** (`examples/coverage_at_budget_demo.py`): a single,
    reproducible contested-top instance you can run in one command (§4.3).
-2. **A controlled investigation** — a CI-backed ablation (8 seeds, bootstrap-over-seed
+2. **A controlled investigation**: a CI-backed ablation (8 seeds, bootstrap-over-seed
    paired CIs) that isolates *what* makes the advantage appear and characterizes it
    across cue form, budget, surrogate, and capacity. This is far more informative than
    any single demo run: it identifies the **binding variable** and underwrites the
@@ -253,14 +253,14 @@ difficulty, capacity, or class ratio — is the determinant:
 A **linear** cue is cheap for cross-entropy to capture, so its coverage stays high
 (0.86) and PAUC adds almost nothing (+0.015). A **nonlinear** cue that is relevant
 only to the rare top is one cross-entropy's bulk-dominated gradient never invests in
-(coverage 0.43–0.58), and the band-focused PAUC gradient drives the MLP to learn it —
-an **order-of-magnitude larger** lift that **replicates across two distinct nonlinear
+(coverage 0.43–0.58), and the band-focused PAUC gradient drives the MLP to learn it.
+The result is an **order-of-magnitude larger** lift that **replicates across two distinct nonlinear
 forms** with intervals that do not overlap the linear cue's. This is the headline
 result of the investigation, and §5 explains the mechanism behind it.
 
 Two qualifiers come from the same study:
 
-- **Operating-point specific.** Across these cells AUROC stays ~0.99 — the loss moves
+- **Operating-point specific.** Across these cells AUROC stays ~0.99: the loss moves
   coverage at the budget without making a globally better-ranked model. The advantage
   is concentrated exactly where you deploy, which is the whole point.
 - **Budget-dependent.** The nonlinear-product lift falls from **+0.216 at 50 bps** to
@@ -274,7 +274,7 @@ Two qualifiers come from the same study:
 Within the nonlinear regime the surrogate choice is not a free parameter. The
 **pairwise** surrogate carries the entire advantage; the **trapezoid** surrogate
 collapses to the trivial floor, because it only lifts positives toward detached
-thresholds and never suppresses the band negatives — the wrong tool when the top is
+thresholds and never suppresses the band negatives, which makes it the wrong tool when the top is
 contested by hard *negatives*. `SmoothAPLoss`, a strong whole-curve ranking baseline
 that sees the same data, reaches ~0.72 in the favorable regime but is beaten on
 coverage@budget by the band-restricted pairwise surrogate (~0.79), exactly as
@@ -295,7 +295,7 @@ over-using it costs AUCPR). Weighted CE protects the bulk and under-resolves the
 | **PAUC pairwise** | ~0.54 | **0.772 ± 0.051** |
 
 The pairwise surrogate recovers coverage CE leaves on the table (**+35 %**,
-seed-stable) — the same effect the CI-backed ablation in §4.1 isolates, here in a
+seed-stable). This is the same effect the CI-backed ablation in §4.1 isolates, here in a
 form you can reproduce in one command.
 
 ### 4.4 The `pos_numerator` rescue (non-contested top)
@@ -303,7 +303,7 @@ form you can reproduce in one command.
 On easier data where the top is not contested by hard negatives, the trapezoid is
 the natural surrogate, but with a large queue and few live positives it is
 gradient-diluted under `"pool"`. Switching to `pos_numerator="live"` restores it to
-competitive coverage. (On the contested-negative data of §4.3, the opposite holds —
+competitive coverage. (On the contested-negative data of §4.3, the opposite holds:
 pairwise wants `"pool"`.)
 
 ### 4.5 Where the gap closes
@@ -322,14 +322,14 @@ table. This section explains *why*, and the explanation is deflationary in a use
 way: the win is a **gradient-allocation effect**, not a property unique to the
 partial-AUC objective. The evidence below comes from a controlled investigation on
 contested-top synthetic data (a nonlinear, rarely-relevant cue; 8 seeds, bootstrap
-CIs over paired per-seed differences) — the same regime as §4.1, run with the
+CIs over paired per-seed differences). This is the same regime as §4.1, run with the
 diagnostics instrumented.
 
 ### 5.1 The mechanism: the band *is* a hard-negative miner
 
 The pairwise surrogate contrasts each positive against the negatives whose scores
 fall in the FPR band around the budget. **By construction those band negatives are
-the decoys** — they are the only negatives that reach the top of the ranking — so
+the decoys** (they are the only negatives that reach the top of the ranking), so
 almost all of the loss's gradient is spent on the positives-versus-decoy contrast,
 which is exactly the comparison the cue is needed to resolve. Cross-entropy
 optimizes average log-loss; it sees the decoys as ~1.2 % of all negatives and never
@@ -339,12 +339,12 @@ distinction that decides coverage at the budget.
 Two diagnostics on **identical data and scores** make this concrete:
 
 - **Band enrichment.** The pairwise band is **~73 % decoys against a 1.2 % base
-  rate** — roughly **60× enrichment** — and it selects them **with no decoy
+  rate** (roughly **60× enrichment**), and it selects them **with no decoy
   labels.** The band is a label-free hard-negative miner.
 - **Gradient mass.** PAUC places **~96 % of its negative-gradient mass on decoys**,
   versus **~58 % for cross-entropy** scored on the same model outputs.
 
-### 5.2 It is allocation, not capacity — and a label-free rule reproduces it
+### 5.2 It is allocation, not capacity, and a label-free rule reproduces it
 
 If the advantage were that PAUC *represents* the cue better, giving cross-entropy the
 same gradient concentration would not help. It does. On the contested-top cell
@@ -354,36 +354,36 @@ same gradient concentration would not help. It does. On the contested-top cell
 |---|---|---|
 | Weighted CE | 0.576 | baseline |
 | CE + oracle decoy up-weight ×10 | 0.767 | uses decoy labels |
-| CE + label-free top-score HNM | 0.765 | no labels — mines the top of the negative ranking |
+| CE + label-free top-score HNM | 0.765 | no labels; mines the top of the negative ranking |
 | **PAUC pairwise** | **0.792** | adaptive, label-free |
 
-Concentrating cross-entropy's gradient — whether by an oracle decoy up-weight or a
-label-free top-score hard-negative-mining rule — **recovers ~90 % of the advantage**
+Concentrating cross-entropy's gradient, whether by an oracle decoy up-weight or a
+label-free top-score hard-negative-mining rule, **recovers ~90 % of the advantage**
 (the −0.216 gap collapses to ≈ −0.025). A complementary check rules out the capacity
 story directly: a **linear probe** separating positives from decoys on the
-penultimate activations scores **0.895 (CE) vs 0.910 (PAUC)** — nearly equal, so both
+penultimate activations scores **0.895 (CE) vs 0.910 (PAUC)**. These are nearly equal, so both
 models *encode* the cue and differ only in whether the objective **acts on it at the
 budget.** And the concentration must be *bounded*: crude over-concentration degrades a
 pointwise loss (oracle ×30 < ×10 in every cell; ×50 → 0.702, ×200 → 0.632), whereas
 PAUC's bounded contrast over an adaptively tracking band does not.
 
 The effect **transfers** across cue form (product, radial) and budget (50, 100 bps):
-concentrating cross-entropy's gradient closes the CE→PAUC gap in all four cells —
+concentrating cross-entropy's gradient closes the CE→PAUC gap in all four cells:
 **≈ 89 % in the product/50-bps cell and past 100 % (overshooting PAUC) in the other
-three** — and a label-free HNM-CE **matches or beats PAUC in three of the four.** So
+three**. A label-free HNM-CE **matches or beats PAUC in three of the four.** So
 the partial-AUC objective has no categorically higher ceiling here. Its distinct
 contribution is delivering the concentration **adaptively and stably, without a tuned
-up-weight factor and without decoy labels** — the band tracks the operating point as
+up-weight factor and without decoy labels**: the band tracks the operating point as
 the score scale drifts, where a hand-set mining factor does not.
 
-### 5.3 Band escape — why the default `α` leaves coverage on the table
+### 5.3 Band escape: why the default `α` leaves coverage on the table
 
 The same mechanism explains where the *default* band underperforms, and the fix is
 one knob. The decoys pile up at the very top of the negative score distribution, but
 the pairwise gradient only reaches the FPR band `[α, β]`. With the older default
 `[budget/2, 1.5·budget]`, that band contains only **40–48 % of the decoys** while
 **21 % (50 bps) to 41 % (100 bps) escape *above* it** (above `t_α`) and receive no
-gradient at all — compared with **92–94 %** captured by a top-2 % miner.
+gradient at all, compared with **92–94 %** captured by a top-2 % miner.
 
 ```
 default band [budget/2, 1.5·budget]:   t_β        t_α
@@ -394,13 +394,13 @@ score axis  ──────────────┼──── band ─�
 ```
 
 Because `α = budget/2` caps the band below the top, the highest-scoring
-false-positives — the decoys that most hurt coverage — sit *above* `t_α` and are
+false-positives, the decoys that most hurt coverage, sit *above* `t_α` and are
 never pushed down. **Lowering `α` toward 0 widens the band up to `t_α = max(neg_iid)`,
 covering the escaped top decoys.** This improves PAUC in every cell (**+0.017 to
 +0.056** over the default) and makes wide-band PAUC match or beat the HNM rule in
 three of four cells. A full sweep over both edges and four positive rates finds the
-robust optimum at **`α = 0, β = budget`** — precisely the band of false-positives at
-the operating point — which is why that is now the recommended default (§6). The gain
+robust optimum at **`α = 0, β = budget`** (precisely the band of false-positives at
+the operating point), which is why that is now the recommended default (§6). The gain
 concentrates at `pos_rate ≪ budget` and vanishes once `pos_rate ≥ budget`, where
 coverage@budget is capped at `budget / pos_rate`.
 
@@ -412,18 +412,18 @@ HNM pipeline, you are most of the way there.
 
 ### 5.4 FPR vs population band basis (`budget_basis`)
 
-The band edges default to quantiles of the iid **negatives** (`budget_basis="fpr"`), so `β` is a false-positive rate. But the deployment metric — coverage@budget — is a top-k over the *whole population* (recall among the top `⌈budget·N⌉` of all scores, positives included). Setting `budget_basis="population"` aligns the loss's band with that metric by taking the edge quantiles over the pooled population (positives + negatives) instead of the negatives only. The band still selects only negatives for the pairwise contrast; only the reference set for the edges moves. (With `surrogate="trapezoid"`, `budget_basis="population"` is approximately `RecallAtQuantileLoss` — a band-averaged soft recall over population quantiles.)
+The band edges default to quantiles of the iid **negatives** (`budget_basis="fpr"`), so `β` is a false-positive rate. But the deployment metric, coverage@budget, is a top-k over the *whole population* (recall among the top `⌈budget·N⌉` of all scores, positives included). Setting `budget_basis="population"` aligns the loss's band with that metric by taking the edge quantiles over the pooled population (positives + negatives) instead of the negatives only. The band still selects only negatives for the pairwise contrast; only the reference set for the edges moves. (With `surrogate="trapezoid"`, `budget_basis="population"` is approximately `RecallAtQuantileLoss`, a band-averaged soft recall over population quantiles.)
 
-Whether that alignment helps is an empirical question, and the answer is **mostly no** — for the same reason the top-k and FPR *metric* estimators nearly coincide at extreme imbalance. On the nonlinear-product headline cell (8 seeds, the `budget_basis_ab` slice):
+Whether that alignment helps is an empirical question, and the answer is **mostly no**, for the same reason the top-k and FPR *metric* estimators nearly coincide at extreme imbalance. On the nonlinear-product headline cell (8 seeds, the `budget_basis_ab` slice):
 
 | band | `fpr` | `population` | Δ (pop − fpr) |
 |---|---:|---:|---:|
 | `α=0, β=budget` (recommended) | 0.814 | 0.814 | ≈ 0 |
 | `α=budget/2, β=1.5·budget` (older) | 0.792 | 0.803 | +0.012 |
 
-With `α=0`, `t_α = max` spans every top negative regardless of basis, so the population edge changes nothing (Δ ≈ 0). The population basis gives a small lift only at the narrow high-`α` band, where it shifts the band upward toward the escaped top decoys (§5.3) — a weaker version of the band-escape fix that lowering `α` provides in full. `α=0` (either basis) still dominates both. (These are 8-seed point estimates; the +0.012 is plausibly within seed noise, and there is no bootstrap CI on the fpr-vs-population delta.)
+With `α=0`, `t_α = max` spans every top negative regardless of basis, so the population edge changes nothing (Δ ≈ 0). The population basis gives a small lift only at the narrow high-`α` band, where it shifts the band upward toward the escaped top decoys (§5.3). This is a weaker version of the band-escape fix that lowering `α` provides in full. `α=0` (either basis) still dominates both. (These are 8-seed point estimates; the +0.012 is plausibly within seed noise, and there is no bootstrap CI on the fpr-vs-population delta.)
 
-**Takeaway.** Keep the default `budget_basis="fpr"`. `"population"` is available for the alert-budget reading (`β` as a fraction of the whole population), but it does not beat the recommended `α=0` band — which already makes the basis moot.
+**Takeaway.** Keep the default `budget_basis="fpr"`. `"population"` is available for the alert-budget reading (`β` as a fraction of the whole population), but it does not beat the recommended `α=0` band, which already makes the basis moot.
 
 ## 6. When to use it (and when not)
 
@@ -432,13 +432,13 @@ With `α=0`, `t_α = max` spans every top negative regardless of basis, so the p
 - Your deployment metric is recall at a fixed, low false-positive **budget** (alerting,
   screening, fraud review), not whole-curve AP.
 - The operating point is **contested by hard negatives** the model must learn to push
-  down — use `surrogate="pairwise"`.
+  down. Use `surrogate="pairwise"`.
 - You are at extreme imbalance but the pool (batch + queue, with DDP gather) holds far
   more than `1/β` iid negatives (and far more than `1/α` too, if you set `α > 0`).
 
 **Prefer something else when:**
 
-- The top is already cleanly separable — a well-weighted CE or `SmoothAPLoss` is hard
+- The top is already cleanly separable: a well-weighted CE or `SmoothAPLoss` is hard
   to beat, and the extra machinery buys little.
 - You care about the **whole** ranking → `SmoothAPLoss`; or a **single hard
   threshold** → `RecallAtQuantileLoss`.
@@ -504,14 +504,14 @@ See also the [`PAUCAtBudgetLoss` reference](../reference/pauc-at-budget-loss.md)
 
 ## Further reading: the regime study
 
-The regime characterization here — when the PAUC win is large versus when it vanishes — is drawn
+The regime characterization here (when the PAUC win is large versus when it vanishes) is drawn
 from a controlled, CI-backed synthetic study. For the full methodology, results, mechanism, and
 limitations, and to reproduce the numbers yourself:
 
-- [**Technical report**](https://github.com/chris-santiago/imbalanced-losses/blob/main/lab/pauc_vs_ce_regimes/reports/TECHNICAL_REPORT.md)
-  — `PAUCAtBudgetLoss` vs well-tuned cross-entropy on coverage@budget: cue nonlinearity as the binding
+- [**Technical report**](https://github.com/chris-santiago/imbalanced-losses/blob/main/lab/pauc_vs_ce_regimes/reports/TECHNICAL_REPORT.md):
+  `PAUCAtBudgetLoss` vs well-tuned cross-entropy on coverage@budget: cue nonlinearity as the binding
   variable, the operating-point-specific mechanism, surrogate and `pos_numerator` ablations, and the
   boundary conditions where the advantage disappears.
-- [**Reproducible pipeline**](https://github.com/chris-santiago/imbalanced-losses/tree/main/lab/pauc_vs_ce_regimes)
-  — the self-contained Metaflow + Hydra reproducer (`flow/pauc_flow.py`, configs in `conf/`, validator
+- [**Reproducible pipeline**](https://github.com/chris-santiago/imbalanced-losses/tree/main/lab/pauc_vs_ce_regimes):
+  the self-contained Metaflow + Hydra reproducer (`flow/pauc_flow.py`, configs in `conf/`, validator
   at `flow/validate.py`). All evidence is synthetic.

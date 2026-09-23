@@ -2,7 +2,7 @@
 
 ## Binary / multi-label: SigmoidFocalLoss
 
-> **Multi-label vs. multiclass:** `SigmoidFocalLoss` applies sigmoid *independently* to each logit — every output is a separate binary prediction. This covers binary tasks (one logit) and multi-label tasks (many logits, where a sample can match several classes at once). If your classes are mutually exclusive and each sample has exactly one correct label, use [SoftmaxFocalLoss](#multiclass-softmaxfocalloss) instead.
+> **Multi-label vs. multiclass:** `SigmoidFocalLoss` applies sigmoid *independently* to each logit. Every output is a separate binary prediction. This covers binary tasks (one logit) and multi-label tasks (many logits, where a sample can match several classes at once). If your classes are mutually exclusive and each sample has exactly one correct label, use [SoftmaxFocalLoss](#multiclass-softmaxfocalloss) instead.
 
 ### Drop-in replacement for BCEWithLogitsLoss
 
@@ -115,7 +115,7 @@ $$\mathcal{L}_{\text{focal}} = -\alpha_t (1 - p_t)^\gamma \log p_t$$
 
 where $p_t$ is the model's predicted probability for the true class, $\alpha_t$ is a class-balance weight, and $\gamma \geq 0$ is the focusing exponent. At $\gamma = 0$ this reduces to standard weighted cross-entropy.
 
-The focusing term $(1 - p_t)^\gamma$ downweights examples the model classifies confidently and upweights examples it finds difficult. This is most beneficial when easy examples are numerous enough to dominate the gradient. That is the regime focal loss was designed for: RetinaNet trains on all anchors with no sampling at an extreme foreground-background imbalance (roughly 1:1000), where the sheer mass of easy background anchors would otherwise swamp the loss. Crucially, every image in that setting still contributes a meaningful number of foreground anchors per batch, so the positive class retains substantial aggregate gradient even after focusing. **When per-batch positive counts fall to the single digits — e.g. positive rates ≪ 1% under random sampling — the same mechanism can backfire.**
+The focusing term $(1 - p_t)^\gamma$ downweights examples the model classifies confidently and upweights examples it finds difficult. This is most beneficial when easy examples are numerous enough to dominate the gradient. That is the regime focal loss was designed for: RetinaNet trains on all anchors with no sampling at an extreme foreground-background imbalance (roughly 1:1000), where the sheer mass of easy background anchors would otherwise swamp the loss. Crucially, every image in that setting still contributes a meaningful number of foreground anchors per batch, so the positive class retains substantial aggregate gradient even after focusing. **When per-batch positive counts fall to the single digits (e.g. positive rates ≪ 1% under random sampling), the same mechanism can backfire.**
 
 ### Why the focusing term hurts at very low positive rates
 
@@ -125,7 +125,7 @@ When a positive is well-classified ($p_t$ high), the base gradient is already sm
 
 **2. The focusing acts almost entirely on negatives.**
 
-When positives are rare, the hard examples that $\gamma$ upweights are predominantly hard negatives — samples near the decision boundary where the model is uncertain. Whether these are the most informative examples is domain-dependent; in many cases they represent label noise or genuine ambiguity. Either way, the intended purpose of focal loss — amplifying signal from hard *positives* — is structurally undermined when nearly all hard examples are negative by construction.
+When positives are rare, the hard examples that $\gamma$ upweights are predominantly hard negatives: samples near the decision boundary where the model is uncertain. Whether these are the most informative examples is domain-dependent; in many cases they represent label noise or genuine ambiguity. Either way, the intended purpose of focal loss (amplifying signal from hard *positives*) is structurally undermined when nearly all hard examples are negative by construction.
 
 ### Alpha does the real work
 
@@ -151,4 +151,4 @@ One caveat on the `gamma=0` equivalence: per-sample losses match `nn.CrossEntrop
 
 ## See also
 
-[`examples/focal_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/focal_demo.py) — side-by-side AUCPR comparison of BCE, `BCEWithLogitsLoss` with `pos_weight`, `SigmoidFocalLoss(alpha, gamma)`, and `SigmoidFocalLoss(gamma)` (no alpha) on the same imbalanced dataset, so you can isolate the contribution of each component.
+[`examples/focal_demo.py`](https://github.com/chris-santiago/imbalanced-losses/blob/main/examples/focal_demo.py): side-by-side AUCPR comparison of BCE, `BCEWithLogitsLoss` with `pos_weight`, `SigmoidFocalLoss(alpha, gamma)`, and `SigmoidFocalLoss(gamma)` (no alpha) on the same imbalanced dataset, so you can isolate the contribution of each component.
