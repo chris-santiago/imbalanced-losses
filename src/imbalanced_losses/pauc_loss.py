@@ -1116,16 +1116,6 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             band negatives.
         """
         if self.num_classes == 1:
-            # Binary mode: warn on out-of-range targets
-            bad = targets[(targets != 0) & (targets != 1)]
-            if bad.numel() > 0:
-                warnings.warn(
-                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
-                    f"but found values: {bad[:8].tolist()}. "
-                    "Non-zero values are treated as positive.",
-                    UserWarning,
-                    stacklevel=4,
-                )
             pauc, is_valid, diag = self._pauc_for_class(
                 0, logits, targets.bool(), is_iid, is_live, sample_weight, thresholds
             )

@@ -14,7 +14,6 @@ Padding:     ignore_index=-100 rows dropped before ranking.
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal
 
 import torch
@@ -331,16 +330,6 @@ class SmoothAPLoss(_QueuedRankingLoss):
             True for classes with at least one positive and one negative.
         """
         if self.num_classes == 1:
-            # Binary mode: warn on out-of-range targets
-            bad = targets[(targets != 0) & (targets != 1)]
-            if bad.numel() > 0:
-                warnings.warn(
-                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
-                    f"but found values: {bad[:8].tolist()}. "
-                    "Non-zero values are treated as positive.",
-                    UserWarning,
-                    stacklevel=4,
-                )
             ap, is_valid = self._compute_smooth_ap(
                 logits[:, 0], targets.bool(), self.temperature,
                 sample_weight=sample_weight,

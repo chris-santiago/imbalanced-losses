@@ -20,7 +20,7 @@ import torch.nn as nn
 
 from imbalanced_losses._queue import PooledBatch, _MemoryQueue
 from imbalanced_losses._sampling import subsample_pool
-from imbalanced_losses._weights import _SampleWeightMixin
+from imbalanced_losses._weights import _SampleWeightMixin, _caller_stacklevel
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
@@ -291,7 +291,13 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         count as a negative for every class.  Queued rows are checked
         along with the live batch, so a queue restored from a checkpoint
         saved before this check existed raises until :meth:`reset_queue`
-        drops its rows.  Binary mode is not checked here.
+        drops its rows.
+
+        With ``num_classes == 1``, a target outside ``{0, 1}`` emits one
+        ``UserWarning`` per call (listing at most eight of the offending
+        values) and the row still counts as positive.  The warning is
+        attributed to the first frame outside this library and torch, so it
+        points at the caller's own line.  An empty pool does not warn.
 
         Overrides that add checks should call
         ``super()._validate_filtered_targets(targets, is_live=is_live)``
@@ -306,7 +312,17 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             Selects which remedy the error message names; when omitted,
             both remedies are named.
         """
-        if self.num_classes > 1:
+        if self.num_classes == 1:
+            bad = targets[(targets != 0) & (targets != 1)]
+            if bad.numel() > 0:
+                warnings.warn(
+                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
+                    f"but found values: {bad[:8].tolist()}. "
+                    "Non-zero values are treated as positive.",
+                    UserWarning,
+                    stacklevel=_caller_stacklevel(),
+                )
+        elif self.num_classes > 1:
             is_bad = (targets < 0) | (targets >= self.num_classes)
             bad = targets[is_bad]
             if bad.numel() > 0:
@@ -511,22 +527,15 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             )
 
         # --- empty pool check ------------------------------------------------
+        # _compute_per_class is never called on an empty pool; the result is
+        # the same one a pool of all-degenerate classes reduces to.
         if pool.logits.size(0) == 0:
-            nan_per_class = logits.new_full((self.num_classes,), float("nan"))
-            if self.reduction == "none":
-                # Same sentinel as a non-empty pool of all-degenerate classes.
-                out = nan_per_class
-            else:
-                out = logits.sum() * 0.0
-            if return_per_class:
-                return (
-                    out,
-                    nan_per_class.clone(),
-                    torch.zeros(
-                        self.num_classes, dtype=torch.bool, device=logits.device
-                    ),
-                )
-            return out
+            return self._reduce(
+                logits.new_zeros((self.num_classes,)),
+                torch.zeros(self.num_classes, dtype=torch.bool, device=logits.device),
+                logits,
+                return_per_class,
+            )
 
         # --- per-class compute -----------------------------------------------
         # The keyword is passed only when the hook produced something, so a
@@ -551,7 +560,39 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
                 sample_weight=None if sample_weight is None else sample_weight[keep],
             )
 
-        # --- reduction -------------------------------------------------------
+        return self._reduce(loss_vec, valid_vec, logits, return_per_class)
+
+    def _reduce(
+        self,
+        loss_vec: torch.Tensor,
+        valid_vec: torch.Tensor,
+        logits: torch.Tensor,
+        return_per_class: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reduce per-class losses to the value ``forward`` returns.
+
+        Shared by the general path and the empty-pool early return.
+        ``reduction='none'`` masks invalid classes to ``nan`` (so a result
+        with no valid class is a ``nan`` vector with no gradient path unless
+        *loss_vec* has one).  ``'mean'`` and ``'sum'`` reduce over valid
+        classes only; with none valid they return ``logits.sum() * 0.0``,
+        a zero that keeps a gradient path to the caller's logits.  The
+        ``per_class`` element is always a fresh tensor, never the loss
+        itself.
+
+        Parameters
+        ----------
+        loss_vec : torch.Tensor, shape [C]
+            Per-class losses; entries of invalid classes are ignored.
+        valid_vec : torch.Tensor, shape [C], dtype=bool
+            True for classes with a meaningful loss.
+        logits : torch.Tensor
+            Compute-dtype logits of this call; anchors the zero returned
+            when no class is valid.
+        return_per_class : bool
+            Also return the masked per-class vector and *valid_vec*.
+        """
         if self.reduction == "none":
             out = loss_vec.masked_fill(~valid_vec, float("nan"))
         else:

@@ -7,6 +7,7 @@ concrete losses; later tests in this file reuse it.
 
 from __future__ import annotations
 
+import inspect
 import warnings
 
 import pytest
@@ -1451,3 +1452,180 @@ class TestGoldenFixtureCompare:
         result = self._run_compare(golden, old, tmp_path)
         assert result.returncode != 0
         assert "extra|dtype=float32|step=0|loss" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Binary-mode target check (owned by _QueuedRankingLoss._validate_filtered_targets)
+# ---------------------------------------------------------------------------
+
+BINARY_WARNING = "expects targets in"
+ENTRY_PATHS = pytest.mark.parametrize("entry", ["call", "forward", "wrapper"])
+
+
+def _binary_batch(n: int = 40, seed: int = 0):
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.randn(n, 1, generator=g)
+    targets = (torch.rand(n, generator=g) < 0.4).long()
+    targets[0], targets[1] = 0, 1  # both classes present
+    return logits, targets
+
+
+def _binary_warnings(caught):
+    return [w for w in caught if BINARY_WARNING in str(w.message)]
+
+
+def _record(fn):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = fn()
+    return out, _binary_warnings(caught)
+
+
+class TestBinaryTargetCheck:
+    @RANKING_LOSSES
+    @ENTRY_PATHS
+    def test_bad_target_warns_once_at_the_callers_line(self, loss_name, entry):
+        from imbalanced_losses import LossWarmupWrapper
+
+        logits, targets = _binary_batch()
+        targets[5] = 2
+        loss = make_loss(loss_name, 1, 0)
+        wrapper = LossWarmupWrapper(
+            warmup_loss=torch.nn.CrossEntropyLoss(), main_loss=loss, warmup_epochs=0
+        )
+        wrapper.on_train_batch_start(0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if entry == "call":
+                expected = inspect.currentframe().f_lineno + 1
+                loss(logits, targets)
+            elif entry == "forward":
+                expected = inspect.currentframe().f_lineno + 1
+                loss.forward(logits, targets)
+            else:
+                expected = inspect.currentframe().f_lineno + 1
+                wrapper(logits, targets)
+        hits = _binary_warnings(caught)
+        assert len(hits) == 1
+        assert issubclass(hits[0].category, UserWarning)
+        assert hits[0].filename == __file__
+        assert hits[0].lineno == expected
+
+    @RANKING_LOSSES
+    @pytest.mark.parametrize("queue_size", [0, 64])
+    def test_valid_binary_targets_do_not_warn(self, loss_name, queue_size):
+        logits, targets = _binary_batch()
+        loss = make_loss(loss_name, 1, queue_size)
+        _, hits = _record(lambda: [loss(logits, targets) for _ in range(2)])
+        assert hits == []
+
+    @RANKING_LOSSES
+    def test_all_ignored_binary_batch_does_not_warn(self, loss_name):
+        logits, _ = _binary_batch()
+        targets = torch.full((logits.size(0),), -100, dtype=torch.long)
+        loss = make_loss(loss_name, 1, 0)
+        _, hits = _record(lambda: loss(logits, targets))
+        assert hits == []
+
+    @RANKING_LOSSES
+    def test_float_targets_zero_and_one_do_not_warn(self, loss_name):
+        logits, targets = _binary_batch()
+        loss = make_loss(loss_name, 1, 0)
+        _, hits = _record(lambda: loss(logits, targets.float()))
+        assert hits == []
+
+    @RANKING_LOSSES
+    def test_float_target_half_warns(self, loss_name):
+        logits, targets = _binary_batch()
+        targets = targets.float()
+        targets[5] = 0.5
+        loss = make_loss(loss_name, 1, 0)
+        _, hits = _record(lambda: loss(logits, targets))
+        assert len(hits) == 1
+        assert "[0.5]" in str(hits[0].message)
+
+    @RANKING_LOSSES
+    def test_minus_one_with_default_ignore_index_warns_and_counts_positive(self, loss_name):
+        logits, targets = _binary_batch()
+        bad = targets.clone()
+        bad[5] = -1
+        as_positive = targets.clone()
+        as_positive[5] = 1
+        out, hits = _record(lambda: make_loss(loss_name, 1, 0, ignore_index=-100)(logits, bad))
+        assert len(hits) == 1
+        assert "[-1]" in str(hits[0].message)
+        assert torch.equal(
+            out, make_loss(loss_name, 1, 0, ignore_index=-100)(logits, as_positive)
+        )
+
+    @RANKING_LOSSES
+    def test_several_bad_rows_give_one_warning_listing_at_most_eight_values(self, loss_name):
+        logits, targets = _binary_batch(n=60)
+        targets[2:14] = torch.arange(2, 14)  # twelve bad rows
+        loss = make_loss(loss_name, 1, 0)
+        _, hits = _record(lambda: loss(logits, targets))
+        assert len(hits) == 1
+        message = str(hits[0].message)
+        assert "found values: [2, 3, 4, 5, 6, 7, 8, 9]." in message
+        assert message.endswith("Non-zero values are treated as positive.")
+
+    @RANKING_LOSSES
+    def test_lone_bad_target_warns_on_every_call_despite_subsampling(self, loss_name):
+        g = torch.Generator().manual_seed(3)
+        logits = torch.randn(400, 1, generator=g)
+        targets = (torch.rand(400, generator=g) < 0.4).long()
+        targets[123] = 2
+        warned = 0
+        for _ in range(30):
+            loss = make_loss(loss_name, 1, 0, max_pool_size=2)
+            _, hits = _record(lambda: loss(logits, targets))
+            warned += len(hits) == 1
+        assert warned == 30
+
+    @RANKING_LOSSES
+    def test_bad_target_only_in_the_queue_warns(self, loss_name):
+        logits, targets = _binary_batch()
+        loss = make_loss(loss_name, 1, 64)
+        loss(logits, targets)
+        loss._queue._q_targets[0] = 2
+        _, hits = _record(lambda: loss(logits, targets))
+        assert len(hits) == 1
+
+    @RANKING_LOSSES
+    def test_bad_target_loss_equals_the_loss_with_that_target_set_to_one(self, loss_name):
+        logits, targets = _binary_batch()
+        bad = targets.clone()
+        bad[5] = 2
+        as_positive = targets.clone()
+        as_positive[5] = 1
+        out, _ = _record(lambda: make_loss(loss_name, 1, 0)(logits, bad))
+        assert torch.equal(out, make_loss(loss_name, 1, 0)(logits, as_positive))
+
+    @RANKING_LOSSES
+    def test_multiclass_has_no_binary_warning_and_still_raises(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        targets[3] = 7
+        loss = make_loss(loss_name, 3, 0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="outside"):
+                loss(logits, targets)
+        assert _binary_warnings(caught) == []
+
+    def test_override_without_super_gets_no_binary_warning(self):
+        class NoCheck(SmoothAPLoss):
+            def _validate_filtered_targets(self, targets, *, is_live=None):
+                pass
+
+        logits, targets = _binary_batch()
+        targets[5] = 2
+        _, hits = _record(lambda: NoCheck(num_classes=1, queue_size=0)(logits, targets))
+        assert hits == []
+
+    @pytest.mark.parametrize("module", ["ap_loss", "recall_loss", "pauc_loss"])
+    def test_per_loss_modules_do_not_carry_the_warning_text(self, module):
+        import importlib
+        import pathlib
+
+        source = pathlib.Path(importlib.import_module(f"imbalanced_losses.{module}").__file__)
+        assert "Binary mode (num_classes=1)" not in source.read_text()

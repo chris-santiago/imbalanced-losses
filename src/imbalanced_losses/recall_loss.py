@@ -27,7 +27,6 @@ literature.
 
 from __future__ import annotations
 
-import warnings
 from typing import Literal
 
 import torch
@@ -381,16 +380,6 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             True for classes with at least one positive in the pool.
         """
         if self.num_classes == 1:
-            # Binary mode: warn on out-of-range targets
-            bad = targets[(targets != 0) & (targets != 1)]
-            if bad.numel() > 0:
-                warnings.warn(
-                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
-                    f"but found values: {bad[:8].tolist()}. "
-                    "Non-zero values are treated as positive.",
-                    UserWarning,
-                    stacklevel=4,
-                )
             recall, is_valid = self._soft_recall_at_quantile(
                 logits[:, 0], targets.bool(), sample_weight=sample_weight,
                 theta=None if thresholds is None else thresholds[0],
