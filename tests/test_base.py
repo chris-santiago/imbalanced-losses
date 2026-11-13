@@ -7,6 +7,8 @@ concrete losses; later tests in this file reuse it.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -424,7 +426,7 @@ class TestMultiClassTargetRange:
         seen: list[int] = []
 
         class NoCheck(SmoothAPLoss):
-            def _validate_filtered_targets(self, targets):
+            def _validate_filtered_targets(self, targets, **_):
                 seen.append(targets.numel())
 
         n, max_pool = 200, 20
@@ -435,8 +437,19 @@ class TestMultiClassTargetRange:
             loss(logits, targets)  # subsampling ran, so the hook ran before it
         assert seen == [n]
 
-    def test_recall_loss_no_longer_overrides_the_hook(self):
-        assert "_validate_filtered_targets" not in RecallAtQuantileLoss.__dict__
+    @pytest.mark.parametrize("max_pool_size", [None, 20])
+    def test_recall_loss_raises_the_shared_message(self, max_pool_size):
+        logits, targets = _multiclass_batch(200)
+        targets[137] = 5
+        loss = RecallAtQuantileLoss(
+            num_classes=3, queue_size=0, max_pool_size=max_pool_size
+        )
+        with pytest.raises(
+            ValueError, match=r"targets contain class ids outside \[0, 3\); examples: \[5\]"
+        ):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                loss(logits, targets)
 
 
 class TestEmptyPoolSentinel:
@@ -637,3 +650,54 @@ class TestQueuedBadTargetIsActionable:
         assert "examples: [5]" in message
         loss.reset_queue()
         assert torch.isfinite(loss(logits, targets))
+
+
+class TestRangeErrorRemedyMatchesSource:
+    @RANKING_LOSSES
+    @pytest.mark.parametrize("queue_size", [0, 64])
+    def test_live_only_bad_row_names_ignore_index_not_reset_queue(
+        self, loss_name, queue_size
+    ):
+        logits, targets = _multiclass_batch(30)
+        targets[3] = 5
+        loss = make_loss(loss_name, 3, queue_size)
+        with pytest.raises(ValueError, match="outside") as excinfo:
+            loss(logits, targets)
+        message = str(excinfo.value)
+        assert "ignore_index" in message
+        assert "reset_queue" not in message
+
+    @RANKING_LOSSES
+    def test_queue_only_bad_row_names_reset_queue(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        loss = make_loss(loss_name, 3, 64)
+        loss(logits, targets)
+        loss._queue._q_targets[0] = 5
+        with pytest.raises(ValueError, match="outside") as excinfo:
+            loss(logits, targets)
+        message = str(excinfo.value)
+        assert "reset_queue" in message
+        assert "ignore_index" not in message
+        loss.reset_queue()
+        assert torch.isfinite(loss(logits, targets))
+
+    @RANKING_LOSSES
+    def test_both_sources_name_both_remedies(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        loss = make_loss(loss_name, 3, 64)
+        loss(logits, targets)
+        loss._queue._q_targets[0] = 5
+        bad = targets.clone()
+        bad[3] = 7
+        with pytest.raises(ValueError, match="outside") as excinfo:
+            loss(logits, bad)
+        message = str(excinfo.value)
+        assert "ignore_index" in message
+        assert "reset_queue" in message
+
+    def test_hook_callable_with_targets_alone(self):
+        loss = make_loss("smooth_ap", 3, 0)
+        with pytest.raises(ValueError, match="outside") as excinfo:
+            loss._validate_filtered_targets(torch.tensor([0, 5]))
+        message = str(excinfo.value)
+        assert "ignore_index" in message and "reset_queue" in message

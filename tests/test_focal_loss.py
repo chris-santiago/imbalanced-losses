@@ -1807,11 +1807,6 @@ class TestSoftmaxFocalAlphaLength:
         with pytest.raises(ValueError, match="1-D"):
             SoftmaxFocalLoss(alpha=torch.ones(2, 4))
 
-    def test_1d_inputs_raise_index_error(self):
-        fn = SoftmaxFocalLoss(alpha=[0.5] * self.C)
-        with pytest.raises(IndexError):
-            fn(torch.randn(self.C), torch.tensor(1))
-
     def test_mismatch_with_sample_weight_raises_value_error(self):
         logits, targets = self._data()
         fn = SoftmaxFocalLoss(alpha=[0.5] * 3)

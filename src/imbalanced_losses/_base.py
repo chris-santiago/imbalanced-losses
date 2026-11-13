@@ -79,10 +79,13 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     """
     Abstract base for ranking losses that use a memory queue.
 
-    Subclasses implement :meth:`_compute_per_class` (and optionally
-    :meth:`_validate_filtered_targets`); everything else -- validation,
+    Subclasses implement :meth:`_compute_per_class`; everything else --
+    validation,
     DDP gather, queue merge, ignore-index filtering, subsampling,
-    reduction, and ``return_per_class`` -- is handled here.
+    reduction, and ``return_per_class`` -- is handled here.  The
+    target-range rule lives in :meth:`_validate_filtered_targets`, which
+    subclasses may override; an override that adds checks should call
+    ``super()._validate_filtered_targets(...)`` to keep the range rule.
 
     Parameters
     ----------
@@ -245,32 +248,58 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             least one positive and one negative).
         """
 
-    def _validate_filtered_targets(self, targets: torch.Tensor) -> None:
+    def _validate_filtered_targets(
+        self, targets: torch.Tensor, *, is_live: torch.Tensor | None = None
+    ) -> None:
         """
         Validate target range on the pooled, ``ignore_index``-filtered rows.
 
         Called once per forward, after ignore-index filtering and before
         ``max_pool_size`` subsampling, so the check sees every live and
-        queued row.  With ``num_classes > 1``, raises ``ValueError`` if any
-        target lies outside ``[0, num_classes)``; such a row would count as
-        a negative for every class.  Queued rows are checked along with the
-        live batch, so a queue restored from a checkpoint saved before this
-        check existed raises until :meth:`reset_queue` drops its rows.  Binary mode is not checked here.
-        Subclasses may override this to change the rule.
+        queued row.  With ``num_classes > 1``, raises ``ValueError`` if
+        any target lies outside ``[0, num_classes)``; such a row would
+        count as a negative for every class.  Queued rows are checked
+        along with the live batch, so a queue restored from a checkpoint
+        saved before this check existed raises until :meth:`reset_queue`
+        drops its rows.  Binary mode is not checked here.
+
+        Overrides that add checks should call
+        ``super()._validate_filtered_targets(targets, is_live=is_live)``
+        to keep this rule, and must accept (and may ignore) ``is_live``.
 
         Parameters
         ----------
         targets : torch.Tensor, shape [M]
             Filtered targets (no ignore-index values); may be empty.
+        is_live : torch.Tensor, shape [M], dtype=bool, optional
+            True for rows from the current batch, False for queued rows.
+            Selects which remedy the error message names; when omitted,
+            both remedies are named.
         """
         if self.num_classes > 1:
-            bad = targets[(targets < 0) | (targets >= self.num_classes)]
+            is_bad = (targets < 0) | (targets >= self.num_classes)
+            bad = targets[is_bad]
             if bad.numel() > 0:
+                if is_live is None:
+                    in_live = in_queue = True
+                else:
+                    in_live = bool(is_live[is_bad].any())
+                    in_queue = bool((~is_live[is_bad]).any())
+                remedies = []
+                if in_live:
+                    remedies.append(
+                        "mark rows in the current batch with ignore_index "
+                        "or fix their labels"
+                    )
+                if in_queue:
+                    remedies.append(
+                        "call reset_queue() to drop queued rows restored "
+                        "from an older checkpoint"
+                    )
                 raise ValueError(
                     f"targets contain class ids outside [0, {self.num_classes}); "
-                    f"examples: {bad[:8].tolist()}. Queued rows are checked too; "
-                    f"call reset_queue() to drop rows restored from an older "
-                    f"checkpoint."
+                    f"examples: {bad[:8].tolist()}. "
+                    + "; ".join(remedies).capitalize() + "."
                 )
 
     # ------------------------------------------------------------------
@@ -428,7 +457,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         all_is_live = all_is_live[valid]
 
         # --- validate the whole pool, before subsampling can hide a row -------
-        self._validate_filtered_targets(pool.targets)
+        self._validate_filtered_targets(pool.targets, is_live=all_is_live)
 
         # --- subsample if pool exceeds max_pool_size -------------------------
         if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
