@@ -18,7 +18,7 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from imbalanced_losses._queue import _MemoryQueue
+from imbalanced_losses._queue import PooledBatch, _MemoryQueue
 from imbalanced_losses._sampling import subsample_pool
 from imbalanced_losses._weights import _SampleWeightMixin
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
@@ -105,7 +105,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     gather_distributed : bool or None
         DDP all-gather flag (``None`` = auto-detect).
     max_pool_size : int or None
-        Cap on ranking-pool rows after ignore-index filtering.
+        Cap on ranking-pool rows after ignore-index filtering.  Losses
+        with pool-level thresholds (see :meth:`_estimate_thresholds`)
+        estimate them from the full pool before the cap is applied.
     """
 
     def __init__(
@@ -208,6 +210,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
         sample_weight: torch.Tensor | None = None,
+        thresholds: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute loss and validity for each class.
@@ -237,6 +240,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             weighted arithmetic; only positives' weights participate in
             the ranking objective, negatives' weights are never used, and
             thresholds/ranks/bands never see it.
+        thresholds : object, optional
+            Whatever :meth:`_estimate_thresholds` returned for this call.
+            Passed as a keyword only when subsampling ran and the hook
+            returned a non-``None`` value, so an implementation that never
+            overrides the hook need not accept it.  When absent, compute
+            the thresholds from *logits* itself.
 
         Returns
         -------
@@ -247,6 +256,27 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             True for classes that had a meaningful computation (e.g. at
             least one positive and one negative).
         """
+
+    def _estimate_thresholds(self, pool: PooledBatch) -> object | None:
+        """
+        Estimate score thresholds from the full pool before subsampling.
+
+        Called at most once per forward, and only when ``max_pool_size``
+        subsampling is about to run, with the ``ignore_index``-filtered,
+        pre-subsampling pool.  A loss whose thresholds depend on the pool
+        overrides this so that capping the pool does not move its operating
+        point; the result is handed to :meth:`_compute_per_class` as the
+        ``thresholds`` keyword.  Implementations must not modify *pool*, and
+        the result must carry no gradient.
+
+        Returns
+        -------
+        object or None
+            ``None`` (the default) means the loss has no pool-level
+            thresholds, and ``_compute_per_class`` is called without the
+            ``thresholds`` keyword.
+        """
+        return None
 
     def _validate_filtered_targets(
         self, targets: torch.Tensor, *, is_live: torch.Tensor | None = None
@@ -460,6 +490,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         self._validate_filtered_targets(pool.targets, is_live=all_is_live)
 
         # --- subsample if pool exceeds max_pool_size -------------------------
+        thresholds = None
         if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
             if not self._subsample_warned:
                 warnings.warn(
@@ -471,6 +502,10 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
                     stacklevel=2,
                 )
                 self._subsample_warned = True
+            # Thresholds come from the whole filtered pool, so the cap does
+            # not move the operating point; the per-class compute then runs
+            # over the subsample against them.
+            thresholds = self._estimate_thresholds(pool)
             pool, all_is_live = subsample_pool(
                 pool, self.max_pool_size, is_live=all_is_live
             )
@@ -494,9 +529,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             return out
 
         # --- per-class compute -----------------------------------------------
+        # The keyword is passed only when the hook produced something, so a
+        # _compute_per_class without a ``thresholds`` parameter keeps working.
+        extra = {} if thresholds is None else {"thresholds": thresholds}
         loss_vec, valid_vec = self._compute_per_class(
             pool.logits, pool.targets, pool.is_iid, all_is_live,
-            sample_weight=pool.sample_weight,
+            sample_weight=pool.sample_weight, **extra,
         )
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------

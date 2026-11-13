@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from imbalanced_losses import PAUCAtBudgetLoss, RecallAtQuantileLoss, SmoothAPLoss
-from imbalanced_losses._base import _to_compute_dtype
+from imbalanced_losses._base import _QueuedRankingLoss, _to_compute_dtype
 
 # (class, constructor kwargs). PAUC uses a wide band so a small batch has
 # a non-degenerate negative band.
@@ -701,3 +701,437 @@ class TestRangeErrorRemedyMatchesSource:
             loss._validate_filtered_targets(torch.tensor([0, 5]))
         message = str(excinfo.value)
         assert "ignore_index" in message and "reset_queue" in message
+
+
+# ---------------------------------------------------------------------------
+# Thresholds estimated on the full pool before max_pool_size subsampling
+# ---------------------------------------------------------------------------
+
+THRESHOLD_LOSSES = pytest.mark.parametrize(
+    "loss_name", ["recall_at_quantile", "pauc_at_budget"]
+)
+DTYPES = pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64], ids=["float32", "float64"]
+)
+
+
+def _skewed_batch(
+    num_classes: int, n: int, n_pos: int, seed: int, dtype: torch.dtype = torch.float32
+):
+    """Imbalanced batch; ``n_pos`` positives when binary, 80/10/10 when C=3."""
+    g = torch.Generator().manual_seed(seed)
+    if num_classes == 1:
+        targets = torch.zeros(n, dtype=torch.long)
+        targets[torch.randperm(n, generator=g)[:n_pos]] = 1
+        logits = torch.randn(n, 1, generator=g) + 1.5 * targets.unsqueeze(1)
+    else:
+        probs = torch.tensor([0.8] + [0.2 / (num_classes - 1)] * (num_classes - 1))
+        targets = torch.multinomial(probs, n, replacement=True, generator=g)
+        one_hot = torch.nn.functional.one_hot(targets, num_classes).float()
+        logits = torch.randn(n, num_classes, generator=g) + 1.5 * one_hot
+    return logits.to(dtype), targets
+
+
+def _spy_estimator(loss):
+    """Wrap ``loss._estimate_thresholds``; return the list of recorded calls."""
+    calls = []
+    original = loss._estimate_thresholds
+
+    def spy(pool):
+        fields = [t for t in pool if t is not None]
+        before = [(t.data_ptr(), tuple(t.shape), t.clone()) for t in fields]
+        result = original(pool)
+        calls.append({
+            "rows": pool.logits.size(0),
+            "result": result,
+            "pool_unchanged": all(
+                t.data_ptr() == ptr and tuple(t.shape) == shape and torch.equal(t, copy)
+                for t, (ptr, shape, copy) in zip(fields, before)
+            ),
+        })
+        return result
+
+    loss._estimate_thresholds = spy
+    return calls
+
+
+def _spy_compute(loss):
+    """Wrap ``loss._compute_per_class``; return the keyword dict of every call."""
+    seen = []
+    original = loss._compute_per_class
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return original(*args, **kwargs)
+
+    loss._compute_per_class = spy
+    return seen
+
+
+def _flat_tensors(thresholds) -> list[torch.Tensor]:
+    """Every tensor inside a thresholds object (a tensor, or per-class tuples)."""
+    if isinstance(thresholds, torch.Tensor):
+        return [thresholds]
+    out = []
+    for entry in thresholds:
+        if entry is None:
+            continue
+        out.extend(f for f in entry if isinstance(f, torch.Tensor))
+    return out
+
+
+def _capped_and_uncapped(loss_name, num_classes, cap, **kwargs):
+    capped = make_loss(loss_name, num_classes, 0, max_pool_size=cap, **kwargs)
+    uncapped = make_loss(loss_name, num_classes, 0, **kwargs)
+    return capped, uncapped
+
+
+class _PlainRankingLoss(_QueuedRankingLoss):
+    """Subclass with neither a hook override nor a ``thresholds`` parameter."""
+
+    def _compute_per_class(self, logits, targets, is_iid, is_live, sample_weight=None):
+        return logits.mean(dim=0), torch.ones(
+            self.num_classes, dtype=torch.bool, device=logits.device
+        )
+
+
+PAUC_GRID = pytest.mark.parametrize(
+    "surrogate,budget_basis,tau_scale",
+    [
+        (s, b, t)
+        for s in ("trapezoid", "pairwise")
+        for b in ("fpr", "population")
+        for t in ("iqr", "band")
+    ],
+)
+
+
+class TestFullPoolThresholds:
+    def test_recall_binary_loss_matches_uncapped(self):
+        logits, targets = _skewed_batch(1, 4000, 20, seed=0)
+        capped = RecallAtQuantileLoss(1, quantile=0.05, queue_size=0, max_pool_size=512)
+        uncapped = RecallAtQuantileLoss(1, quantile=0.05, queue_size=0)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            out = capped(logits, targets)
+        assert abs(out.item() - uncapped(logits, targets).item()) < 1e-6
+
+    def test_recall_multiclass_thresholds_are_full_filtered_pool_quantiles(self):
+        logits, targets = _skewed_batch(3, 1200, 0, seed=1)
+        # Ignored rows carry extreme scores: unfiltered they would move every quantile.
+        targets[::25] = -100
+        logits[::25] = 1e3
+        loss = RecallAtQuantileLoss(3, quantile=0.05, queue_size=0, max_pool_size=256)
+        seen = _spy_compute(loss)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            loss(logits, targets)
+        kept = logits[targets != -100]
+        expected = torch.stack([
+            torch.quantile(kept[:, c], 0.95, interpolation="higher") for c in range(3)
+        ])
+        assert torch.equal(seen[0]["thresholds"], expected)
+
+    @PAUC_GRID
+    @NUM_CLASSES
+    def test_pauc_diagnostics_equal_uncapped(
+        self, surrogate, budget_basis, tau_scale, num_classes
+    ):
+        logits, targets = _skewed_batch(num_classes, 2000 if num_classes == 1 else 1200, 20, seed=2)
+        kwargs = dict(
+            beta=0.1, surrogate=surrogate, budget_basis=budget_basis, tau_scale=tau_scale
+        )
+        capped = PAUCAtBudgetLoss(num_classes, queue_size=0, max_pool_size=256, **kwargs)
+        uncapped = PAUCAtBudgetLoss(num_classes, queue_size=0, **kwargs)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            _, stats_c = capped(logits, targets, return_diagnostics=True)
+        _, stats_u = uncapped(logits, targets, return_diagnostics=True)
+        for key in ("t_alpha", "t_beta", "tau_eff"):
+            assert torch.isfinite(stats_u[key]).all()
+            assert torch.equal(stats_c[key], stats_u[key]), key
+
+    def test_pauc_trapezoid_binary_loss_matches_uncapped(self):
+        logits, targets = _skewed_batch(1, 2000, 20, seed=3)
+        kwargs = dict(beta=0.05, surrogate="trapezoid", queue_size=0)
+        capped = PAUCAtBudgetLoss(1, max_pool_size=512, **kwargs)
+        uncapped = PAUCAtBudgetLoss(1, **kwargs)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            out = capped(logits, targets)
+        assert abs(out.item() - uncapped(logits, targets).item()) < 1e-6
+
+    @NUM_CLASSES
+    def test_pauc_non_iid_negatives_keep_full_pool_edges(self, num_classes):
+        logits, targets = _skewed_batch(num_classes, 1500, 20, seed=4)
+        g = torch.Generator().manual_seed(40)
+        iid_mask = torch.rand(logits.size(0), generator=g) < 0.5
+        capped, uncapped = _capped_and_uncapped(
+            "pauc_at_budget", num_classes, 256, beta=0.1
+        )
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            _, stats_c = capped(logits, targets, iid_mask=iid_mask, return_diagnostics=True)
+        _, stats_u = uncapped(logits, targets, iid_mask=iid_mask, return_diagnostics=True)
+        assert torch.isfinite(stats_u["t_alpha"]).all()
+        assert torch.equal(stats_c["t_alpha"], stats_u["t_alpha"])
+        assert torch.equal(stats_c["t_beta"], stats_u["t_beta"])
+
+    def test_pauc_live_numerator_with_queue_is_valid_and_edges_match(self):
+        step1 = _skewed_batch(1, 300, 15, seed=5)
+        step2 = _skewed_batch(1, 300, 15, seed=6)
+        results = {}
+        for name, cap in (("capped", 200), ("uncapped", None)):
+            loss = PAUCAtBudgetLoss(
+                1, beta=0.1, pos_numerator="live", queue_size=300, max_pool_size=cap
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                loss(*step1)
+                results[name] = loss(*step2, return_per_class=True, return_diagnostics=True)
+        _, _, valid, stats_c = results["capped"]
+        _, _, _, stats_u = results["uncapped"]
+        assert valid.all()
+        assert torch.isfinite(stats_c["t_alpha"]).all()
+        assert torch.equal(stats_c["t_alpha"], stats_u["t_alpha"])
+        assert torch.equal(stats_c["t_beta"], stats_u["t_beta"])
+
+    @pytest.mark.parametrize(
+        "pos_numerator,loss_moves", [("live", False), ("pool", True)]
+    )
+    def test_fpr_live_numerator_ignores_queued_positive_scores(
+        self, pos_numerator, loss_moves
+    ):
+        logits1, targets1 = _skewed_batch(1, 300, 15, seed=7)
+        logits1_edited = logits1.clone()
+        logits1_edited[targets1 == 1] += 3.0
+        live = _skewed_batch(1, 300, 15, seed=8)
+
+        def step2_loss(queued_logits):
+            loss = PAUCAtBudgetLoss(
+                1, beta=0.1, budget_basis="fpr", pos_numerator=pos_numerator,
+                queue_size=300, max_pool_size=200,
+            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                loss(queued_logits, targets1)
+                torch.manual_seed(123)
+                return loss(*live)
+
+        same = torch.equal(step2_loss(logits1), step2_loss(logits1_edited))
+        assert same is (not loss_moves)
+
+    def test_class_without_iid_negatives_is_nan_others_valid(self):
+        logits, targets = _skewed_batch(3, 1200, 0, seed=9)
+        # Class 0's negatives are the rows of classes 1 and 2, none of them iid.
+        iid_mask = targets == 0
+        loss = PAUCAtBudgetLoss(3, beta=0.1, queue_size=0, reduction="none", max_pool_size=256)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            out, _, valid = loss(logits, targets, iid_mask=iid_mask, return_per_class=True)
+        assert valid.tolist() == [False, True, True]
+        assert torch.isnan(out[0])
+        assert torch.isfinite(out[1:]).all()
+
+    def test_full_pool_degenerate_dispersion_is_invalid_and_warns_once(self):
+        logits, targets = _skewed_batch(1, 600, 20, seed=10)
+        logits[targets == 0] = 0.0  # every negative score equal: IQR is 0
+        loss = PAUCAtBudgetLoss(1, beta=0.1, queue_size=0, reduction="none", max_pool_size=128)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            out, _, valid = loss(logits, targets, return_per_class=True)
+            loss(logits, targets)
+        degenerate = [w for w in rec if "near-zero" in str(w.message)]
+        assert not valid.any()
+        assert torch.isnan(out).all()
+        assert len(degenerate) == 1
+
+    def test_smooth_ap_never_receives_thresholds_keyword(self):
+        logits, targets = _skewed_batch(3, 1200, 0, seed=11)
+        loss = SmoothAPLoss(3, queue_size=0, max_pool_size=256)
+        seen = _spy_compute(loss)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            loss(logits, targets)
+        assert len(seen) == 1
+        assert "thresholds" not in seen[0]
+
+    def test_subclass_without_hook_or_thresholds_parameter_runs(self):
+        logits, targets = _skewed_batch(3, 600, 0, seed=12)
+        loss = _PlainRankingLoss(num_classes=3, queue_size=0, max_pool_size=128)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            out = loss(logits, targets)
+        assert torch.isfinite(out)
+
+    @RANKING_LOSSES
+    @DTYPES
+    @pytest.mark.parametrize("cap_kind", ["none", "above", "equal"])
+    def test_untriggered_cap_skips_hook_and_is_bitwise_identical(
+        self, loss_name, dtype, cap_kind
+    ):
+        logits, targets = make_batch(3, 0)
+        logits = logits.to(dtype)
+        cap = {"none": None, "above": N + 50, "equal": N}[cap_kind]
+        reference = make_loss(loss_name, 3, 0)
+        candidate = make_loss(loss_name, 3, 0, max_pool_size=cap)
+        calls = _spy_estimator(candidate)
+        leaf_r, leaf_c = _leaf(logits), _leaf(logits)
+        out_r = reference(leaf_r, targets)
+        out_c = candidate(leaf_c, targets)
+        out_r.backward()
+        out_c.backward()
+        assert calls == []
+        assert torch.equal(out_r, out_c)
+        assert torch.equal(leaf_r.grad, leaf_c.grad)
+
+    @RANKING_LOSSES
+    def test_hook_called_once_per_forward_with_pre_subsampling_rows(self, loss_name):
+        logits, targets = _skewed_batch(3, 600, 0, seed=13)
+        targets[::15] = -100
+        n_kept = int((targets != -100).sum())
+        assert n_kept < 600
+        loss = make_loss(loss_name, 3, 0, max_pool_size=128)
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            loss(logits, targets)
+            assert [c["rows"] for c in calls] == [n_kept]
+            loss(logits, targets)
+        assert [c["rows"] for c in calls] == [n_kept, n_kept]
+
+    @RANKING_LOSSES
+    def test_hook_leaves_the_pool_unchanged(self, loss_name):
+        logits, targets = _skewed_batch(3, 600, 0, seed=14)
+        loss = make_loss(loss_name, 3, 0, max_pool_size=128)
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            loss(logits, targets)
+        assert len(calls) == 1
+        assert calls[0]["pool_unchanged"]
+
+    @THRESHOLD_LOSSES
+    @NUM_CLASSES
+    def test_thresholds_carry_no_gradient(self, loss_name, num_classes):
+        logits, targets = _skewed_batch(num_classes, 600, 20, seed=15)
+        loss = make_loss(loss_name, num_classes, 0, max_pool_size=128)
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            loss(_leaf(logits), targets)
+        tensors = _flat_tensors(calls[0]["result"])
+        assert tensors
+        assert not any(t.requires_grad for t in tensors)
+
+    @THRESHOLD_LOSSES
+    @NUM_CLASSES
+    def test_sample_weight_does_not_change_thresholds(self, loss_name, num_classes):
+        logits, targets = _skewed_batch(num_classes, 600, 20, seed=16)
+        g = torch.Generator().manual_seed(160)
+        weight = torch.rand(logits.size(0), generator=g) + 0.1
+        results = []
+        for sw in (None, weight):
+            loss = make_loss(loss_name, num_classes, 0, max_pool_size=128)
+            calls = _spy_estimator(loss)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                loss(logits, targets, sample_weight=sw)
+            results.append(_flat_tensors(calls[0]["result"]))
+        assert results[0]
+        assert len(results[0]) == len(results[1])
+        assert all(torch.equal(a, b) for a, b in zip(*results))
+
+    @THRESHOLD_LOSSES
+    @NUM_CLASSES
+    def test_half_logits_give_float32_thresholds(self, loss_name, num_classes):
+        logits, targets = _skewed_batch(num_classes, 600, 20, seed=17)
+        loss = make_loss(loss_name, num_classes, 0, max_pool_size=128)
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = loss(logits.to(torch.float16), targets)
+        assert torch.isfinite(out)
+        tensors = _flat_tensors(calls[0]["result"])
+        assert tensors
+        assert all(t.dtype == torch.float32 for t in tensors)
+
+    @THRESHOLD_LOSSES
+    @NUM_CLASSES
+    def test_nan_logit_gives_the_uncapped_nan_pattern(self, loss_name, num_classes):
+        logits, targets = _skewed_batch(num_classes, 600, 120, seed=18)
+        # A negative of class 0, so the NaN reaches its threshold whether or
+        # not subsampling keeps the row.
+        negative_targets = targets == 0 if num_classes == 1 else targets != 0
+        logits[int(negative_targets.nonzero()[0]), 0] = float("nan")
+        capped, uncapped = _capped_and_uncapped(
+            loss_name, num_classes, 128, reduction="none"
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out_u = uncapped(logits, targets)
+            out_c = capped(logits, targets)
+        assert torch.isnan(out_u[0])
+        assert torch.equal(torch.isnan(out_c), torch.isnan(out_u))
+
+    @THRESHOLD_LOSSES
+    def test_forced_gather_in_single_process_runs(self, loss_name, single_process_group):
+        logits, targets = _skewed_batch(1, 600, 20, seed=19)
+        loss = make_loss(loss_name, 1, 0, max_pool_size=128)
+        loss._gather_resolved = True
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = loss(logits, targets)
+        assert torch.isfinite(out)
+        assert len(calls) == 1
+
+    def test_direct_helper_calls_keep_their_shapes(self):
+        loss = RecallAtQuantileLoss(1, quantile=0.2, queue_size=0)
+        scores = torch.randn(50, generator=torch.Generator().manual_seed(20))
+        is_pos = torch.arange(50) < 5
+        recall, valid = loss._soft_recall_at_quantile(scores, is_pos)
+        theta = torch.quantile(scores, 0.8, interpolation="higher")
+        assert valid
+        assert torch.equal(
+            recall, torch.sigmoid((scores[is_pos] - theta) / loss.temperature).mean()
+        )
+
+        pauc = PAUCAtBudgetLoss(1, beta=0.1, queue_size=0)
+        t_k, t_alpha, t_beta, scale = pauc._band_quantiles_and_scale(scores)
+        assert t_k.shape == (2,)
+        assert torch.equal(t_alpha, torch.quantile(scores, 1.0, interpolation="higher"))
+        assert torch.equal(t_beta, torch.quantile(scores, 0.9, interpolation="higher"))
+        assert scale.ndim == 0
+
+    @RANKING_LOSSES
+    def test_subsample_warning_once_with_class_name_and_cap(self, loss_name):
+        logits, targets = make_batch(3, 0)
+        loss = make_loss(loss_name, 3, 0, max_pool_size=64)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            loss(logits, targets)
+            loss(logits, targets)
+        hits = [w for w in rec if "minimum-quota subsampling" in str(w.message)]
+        assert len(hits) == 1
+        assert type(loss).__name__ in str(hits[0].message)
+        assert "max_pool_size=64" in str(hits[0].message)
+
+    @NUM_CLASSES
+    @pytest.mark.parametrize("cap", [None, 128])
+    def test_degenerate_warning_is_not_attributed_inside_the_package(
+        self, num_classes, cap
+    ):
+        import os
+
+        import imbalanced_losses
+
+        package_dir = os.path.dirname(imbalanced_losses.__file__)
+        n = 600
+        g = torch.Generator().manual_seed(0)
+        if num_classes == 1:
+            targets = (torch.rand(n, generator=g) < 0.1).long()
+            logits = torch.randn(n, 1, generator=g)
+            logits[targets == 0] = 0.0
+        else:
+            targets = torch.randint(0, num_classes, (n,), generator=g)
+            logits = torch.zeros(n, num_classes)
+        loss = PAUCAtBudgetLoss(num_classes, beta=0.1, queue_size=0, max_pool_size=cap)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            loss(logits, targets)
+        hits = [w for w in rec if "near-zero" in str(w.message)]
+        assert len(hits) == 1
+        assert not os.path.abspath(hits[0].filename).startswith(package_dir)

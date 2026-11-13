@@ -33,6 +33,7 @@ from typing import Literal
 import torch
 
 from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._queue import PooledBatch
 from imbalanced_losses._weights import _positive_mass
 
 
@@ -110,8 +111,11 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         ``None`` (default) disables the cap.
 
         Use this for seq2seq tasks with very large flattened pool sizes.
-        Recommended: 2048–4096.  Subsampling also introduces noise into the
-        quantile threshold estimate, so use the largest value your GPU allows.
+        Recommended: 2048–4096.  The thresholds θ_c are taken from the full
+        filtered pool before subsampling, so the cap does not move the
+        operating point; soft recall is then averaged over the positives of
+        the subsampled pool, which makes the loss value a stochastic
+        approximation and favors the largest cap your GPU allows.
 
     Examples
     --------
@@ -234,11 +238,44 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
     # Core algorithm
     # ------------------------------------------------------------------
 
+    def _class_threshold(self, scores: torch.Tensor) -> torch.Tensor:
+        """
+        The ``(1 - quantile)`` score quantile of one class, detached.
+
+        The single definition of the threshold: the full-pool estimator and
+        the per-class compute both call it.
+
+        Parameters
+        ----------
+        scores : torch.Tensor, shape [M]
+            Scores of one class over every pool row (positives and
+            negatives).
+        """
+        return torch.quantile(
+            scores.detach(),
+            1.0 - self.quantile,
+            interpolation=self.quantile_interpolation,
+        )
+
+    def _estimate_thresholds(self, pool: PooledBatch) -> torch.Tensor:
+        """
+        Per-class thresholds θ_c over the full filtered pool.
+
+        Returns
+        -------
+        torch.Tensor, shape [C]
+            ``θ_c`` for each class (column 0 when binary), detached.
+        """
+        return torch.stack([
+            self._class_threshold(pool.logits[:, c]) for c in range(self.num_classes)
+        ])
+
     def _soft_recall_at_quantile(
         self,
         scores: torch.Tensor,
         is_pos: torch.Tensor,
         sample_weight: torch.Tensor | None = None,
+        theta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, bool]:
         """
         Compute soft recall above the score quantile for one class.
@@ -259,6 +296,9 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             ``Σ_i w_i · σ((s_i − θ)/τ) / Σ_i w_i``. The threshold θ is
             always the unweighted quantile of all scores; negatives'
             weights are never consulted.
+        theta : torch.Tensor, scalar, optional
+            Precomputed threshold for this class.  ``None`` (default)
+            computes it from *scores* with :meth:`_class_threshold`.
 
         Returns
         -------
@@ -286,11 +326,8 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
                 # Zero weighted positive mass: same invalid path as n_pos == 0.
                 return scores.new_zeros(()), False
 
-        theta = torch.quantile(
-            scores.detach(),
-            1.0 - self.quantile,
-            interpolation=self.quantile_interpolation,
-        )
+        if theta is None:
+            theta = self._class_threshold(scores)
         soft_above = torch.sigmoid((scores[is_pos] - theta) / self.temperature)
         if w_pos is None:
             return soft_above.mean(), True
@@ -307,6 +344,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
         sample_weight: torch.Tensor | None = None,
+        thresholds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute 1 - recall for each class via one-vs-rest decomposition.
@@ -315,7 +353,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         ----------
         logits : torch.Tensor, shape [M, C]
             Pooled logits (live batch + queue, ignore-index rows removed,
-            subsampling applied).
+            subsampling applied when ``max_pool_size`` is exceeded).
         targets : torch.Tensor, shape [M]
             Corresponding integer targets.
         is_iid : torch.Tensor, shape [M], dtype=bool
@@ -329,6 +367,11 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             weights each positive's soft-recall term by its own weight;
             the threshold and the unweighted mean/degenerate-case
             structure are unchanged.
+        thresholds : torch.Tensor, shape [C], optional
+            Per-class thresholds θ_c from :meth:`_estimate_thresholds`,
+            supplied when the pool was subsampled so that θ_c reflects the
+            full pool.  When absent, each θ_c is the ``(1 - quantile)``
+            quantile of that class's scores in *logits*.
 
         Returns
         -------
@@ -349,7 +392,8 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
                     stacklevel=4,
                 )
             recall, is_valid = self._soft_recall_at_quantile(
-                logits[:, 0], targets.bool(), sample_weight=sample_weight
+                logits[:, 0], targets.bool(), sample_weight=sample_weight,
+                theta=None if thresholds is None else thresholds[0],
             )
             loss_vals = [1.0 - recall]
             valid_mask = [is_valid]
@@ -357,7 +401,8 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
             loss_vals, valid_mask = [], []
             for c in range(self.num_classes):
                 recall, is_valid = self._soft_recall_at_quantile(
-                    logits[:, c], targets == c, sample_weight=sample_weight
+                    logits[:, c], targets == c, sample_weight=sample_weight,
+                    theta=None if thresholds is None else thresholds[c],
                 )
                 loss_vals.append(1.0 - recall)
                 valid_mask.append(is_valid)
