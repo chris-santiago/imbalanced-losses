@@ -694,18 +694,19 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             Normalized partial AUC estimate in [0, 1]. Zero (no gradient) for
             invalid classes.
         valid : bool
-            False if there are no positives, no reference-population rows
-            (iid negatives under ``budget_basis="fpr"``, or the whole iid
-            population under ``budget_basis="population"``), the reference
+            False if there are no positives, :meth:`_class_thresholds`
+            returns ``None`` (no iid negatives to anchor the band, under
+            either ``budget_basis``), the reference
             dispersion is near-zero (degenerate), (pairwise) no band
             negatives, or -- when weighted -- the numerator positives' weight
             mass is zero. When ``pos_numerator="live"``, also False if there
             are no live positives for this class (no gradient signal this
             step). Invalid classes are excluded from reduction.  With
             *band_thresholds* supplied, the reference rows and the dispersion
-            are those of the full pre-subsampling pool: a class whose pool
-            has no reference rows never reaches here, a subsample without
-            iid negatives does not invalidate the class, and the degenerate
+            are those of the full pre-subsampling pool: a class for which
+            :meth:`_class_thresholds` returned ``None`` on that pool never
+            reaches here, a subsample without iid negatives does not
+            invalidate the class, and the degenerate
             test reads the supplied scale (the band-negative and
             positive-count tests still read *scores*).
         diag : dict
