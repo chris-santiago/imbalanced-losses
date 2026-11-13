@@ -16,21 +16,33 @@ Ranking losses do not decompose. `SmoothAPLoss` estimates the rank of each posit
 
 ## The all-gather solution
 
-All-gather collects tensors from all workers and concatenates them before the loss computation. Every worker sees the full global batch, computes the same ranks and thresholds, and produces the same loss value. Gradient all-reduction then works correctly because the loss is the same function of each worker's local parameters.
+All-gather collects tensors from all workers and concatenates them before the loss computation. Every worker sees the full global batch, computes the same ranks and thresholds, and produces the same loss value. Each worker then differentiates that shared loss with respect to its own slice, and DDP combines the per-worker gradients (see [Why gradient flow is non-trivial](#why-gradient-flow-is-non-trivial) for how the scale is kept right).
 
-One caveat: if `max_pool_size` subsampling triggers, each rank draws its own random subset (the `torch.randperm` in the subsampler is unseeded and per-rank), so the loss value can differ slightly across ranks on those steps. The queues stay identical regardless, because the full post-gather batch, not the subsampled pool, is enqueued.
+One caveat: if `max_pool_size` subsampling triggers, each rank draws its own random subset (the `torch.randperm` in the subsampler is unseeded and per-rank), so the loss value can differ slightly across ranks on those steps. The thresholds do not differ: `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` estimate them on the full gathered pool before subsampling, which is identical on every rank. The queues stay identical regardless, because the non-ignored rows of the post-gather batch, not the subsampled pool, are enqueued.
 
 ## Why gradient flow is non-trivial
 
 Standard `dist.all_gather` writes into fresh output buffers that have no connection to the computation graph: every gathered slice comes back detached, including the local rank's own. If you simply all-gathered logits and passed them to the loss, *zero* gradient would flow back to the model parameters. The loss value would be correct and training would silently do nothing.
 
-`all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the original tensor (which is connected to the computation graph), while keeping other workers' slices detached:
+`all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the local tensor itself (which is connected to the computation graph), while keeping other workers' slices detached:
 
 ```python
-gathered[rank] = tensor   # restores gradient connection
+gathered[rank] = local_slice   # the local tensor: restores the gradient connection
 ```
 
-Each rank therefore backpropagates only through its own 1/world_size of the global batch. The other ranks' contributions are not lost: every rank computes the identical global loss, so each rank produces the gradient with respect to its own slice, and DDP's gradient all-reduce sums those per-slice gradients into the full-batch gradient before the optimizer step. This matches DDP semantics: each worker's optimizer step uses gradients from the local model parameters only, but the loss is computed globally.
+`local_slice` has the same values as the tensor you passed in. By default it is a view of it whose backward pass scales the gradient, which the next paragraphs explain.
+
+Each rank therefore backpropagates only through its own slice of the global batch. The other ranks' contributions are not lost: every rank computes the identical global loss, so each rank produces the gradient with respect to its own slice. `DistributedDataParallel` then **averages** parameter gradients across ranks. An average of per-slice gradients is the full-batch gradient divided by `world_size`, so on its own this would shrink every update by that factor, as if the learning rate had been divided by the number of GPUs.
+
+`all_gather_with_grad` compensates: it scales the gradient flowing into the local slice by `world_size` (the forward value is untouched), so the averaged result equals the gradient of the global loss computed in a single process. This applies to every loss that gathers: the three ranking losses and both focal losses.
+
+Pass `scale_grad=False` if your setup **sums** gradients across ranks instead of averaging them (a custom reducer, or a framework that all-reduces with a sum), or if you already compensate elsewhere:
+
+```python
+logits_global = all_gather_with_grad(logits, scale_grad=False)
+```
+
+The losses' built-in gathering always scales. To gather without scaling for a ranking or focal loss, construct it with `gather_distributed=False` and gather manually as above.
 
 ## Variable batch sizes across ranks
 
@@ -43,7 +55,7 @@ Both gather helpers handle this automatically using a **pad-to-max-then-trim** s
 3. `dist.all_gather` runs on the padded tensors (now equal shape).
 4. Each gathered slice is trimmed back to its true length before concatenation.
 
-Gradient flow is unaffected: the local rank's slice is still replaced with the original (unpadded) tensor, which carries the autograd graph.
+Gradient flow is unaffected: the local rank's slice is still replaced with the local (unpadded) tensor, which carries the autograd graph.
 
 When all ranks contribute the same number of rows, an **equal-size fast path** detects this and skips padding and trimming entirely, adding no overhead compared to the previous behavior.
 
@@ -63,7 +75,7 @@ Focal losses (`SigmoidFocalLoss`, `SoftmaxFocalLoss`) follow the same rule at a 
 
 ## Queue synchronization under DDP
 
-Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same full global batch. After any number of training steps, all workers have identical queues, so no additional synchronization is needed. This would not hold if each worker enqueued only its local shard.
+Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same rows: the non-ignored rows of the global batch. After any number of training steps, all workers have identical queues, so no additional synchronization is needed. This would not hold if each worker enqueued only its local shard.
 
 ## Auto-detection vs. explicit control
 

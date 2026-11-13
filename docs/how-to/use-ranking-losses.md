@@ -39,11 +39,7 @@ loss_fn = SmoothAPLoss(num_classes=4, queue_size=0)
 
 ### Reset the queue manually
 
-You do **not** need to reset the queue around validation: it is frozen while the model is in
-eval mode (see [Queue behavior during validation](#queue-behavior-during-validation)). Call
-`reset_queue()` when the queue's contents are genuinely stale: at the start of a new training
-phase (e.g. switching from pre-training to fine-tuning), or if you set
-`update_queue_in_eval=True` and want to drop eval-time entries before training resumes:
+Do **not** reset the queue around validation: it is frozen while the model is in eval mode, and resetting it would throw away the training rows the next epoch needs (see [Queue behavior during validation](#queue-behavior-during-validation) for how to get a validation-only loss value). Call `reset_queue()` when the queue's contents are genuinely stale: at the start of a new training phase (e.g. switching from pre-training to fine-tuning), or if you set `update_queue_in_eval=True` and want to drop eval-time entries before training resumes:
 
 ```python
 loss_fn.reset_queue()
@@ -64,7 +60,9 @@ loss = loss_fn(logits, targets)
 
 Without `max_pool_size`, a batch of 30 sequences × 512 tokens produces a pool of 15 360 rows. `SmoothAPLoss` builds a `[|P|, M]` pairwise matrix per class and retains the autograd graph across all classes simultaneously, so peak memory is O(M²) and easily OOMs on GPU.
 
-`max_pool_size` caps the pool using minimum-quota subsampling: each observed class receives an equal reserved quota of `max_pool_size // (2 × n_classes)` rows, then the remaining budget is filled uniformly at random. The queue is unaffected: it continues to accumulate the original full batch.
+`max_pool_size` caps the pool using minimum-quota subsampling: each observed class receives an equal reserved quota of `max_pool_size // (2 × n_classes)` rows, then the remaining budget is filled uniformly at random. The queue is unaffected by the cap: it continues to accumulate every non-ignored row of the batch (rows whose target is `ignore_index` are never stored).
+
+The cap does not move the operating point. `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` estimate their thresholds (the quantile threshold, or the band edges, trapezoid knots and dispersion scale) on the full pool before subsampling, then compute the loss over the subsample against those thresholds. That costs one sort of the full pool per class per step. With `surrogate="pairwise"`, band negatives are the subsample's negatives that fall inside the full-pool band, so a small cap can leave a class with none (the class is then skipped for that step); prefer the trapezoid surrogate or a larger cap when capping tightly.
 
 This is **not** proportional sampling. A dominant background class and a rare foreground class receive the same quota, so rare classes are over-represented relative to their natural frequency. The practical consequence: effective `|P_c| ≈ max_pool_size // (2 × n_classes)`, not `max_pool_size × positive_rate`. Size `max_pool_size` from the target positive count, not from memory alone.
 
@@ -171,12 +169,17 @@ loss.backward()
 The default `"trapezoid"` surrogate integrates soft-TPR over `n_knots` FPR knots within the band. Gradient flows through positives only. Use `"pairwise"` when the band is wide or the FPR boundaries are volatile. It compares positives against the negatives that land inside the band, so band negatives also carry gradient:
 
 ```python
-# Default band (alpha=0, beta=budget): trapezoid with 2 knots is accurate for narrow bands
+# Default band (alpha=0, beta=budget) with the default 2 knots
 loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, surrogate="trapezoid", n_knots=2)
+
+# Large pool (e.g. DDP-gathered batch + queue): more knots keep the value close to the true pAUC
+loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.005, surrogate="trapezoid", n_knots=5)
 
 # Wide or volatile band: pairwise is more robust
 loss_fn = PAUCAtBudgetLoss(num_classes=4, alpha=0.0, beta=0.05, surrogate="pairwise")
 ```
+
+On the `alpha=0` band, two knots under-estimate the pAUC as the pool grows (about 2% low at 1,280 rows, 25 to 30% low at 20,000 to 200,000 rows), because the first knot is the maximum negative score. Five knots are within about 4% and nine within about 1%. The default is unchanged; see the [deep dive](../explanation/pauc-at-budget-deep-dive.md) for the measurements.
 
 ### Undilute the gradient at extreme imbalance
 
@@ -244,6 +247,13 @@ By default, `SmoothAPLoss`, `RecallAtQuantileLoss`, and `PAUCAtBudgetLoss` all f
 
 **Standard training loop (keep the default `False`):** The queue retains its training-batch statistics across the validation phase and resumes cleanly when training restarts. You do not need to call `reset_queue()` between validation and the next training epoch.
 
+**A frozen queue is still used.** In eval mode the queue stops updating, but its training rows are still merged into the pool, so a loss computed with the training instance during validation ranks validation rows against training rows. If you want a validation-only loss value, use a separate instance with `queue_size=0` for validation:
+
+```python
+train_loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+val_loss_fn   = SmoothAPLoss(num_classes=4, queue_size=0)   # pool = the validation batch only
+```
+
 **Online inference or streaming (`True`):** Set `update_queue_in_eval=True` when you want the queue to adapt to the current input distribution continuously during inference.
 
 ```python
@@ -257,7 +267,7 @@ for epoch in range(epochs):
     model.eval()
     with torch.no_grad():
         for xb, yb in val_loader:
-            ...  # queue frozen, no contamination
+            ...  # queue frozen: validation rows are not stored (use val_loss_fn for a validation-only value)
 ```
 
 ## See also

@@ -4,6 +4,14 @@ Distributed utilities for imbalanced losses.
 All-gather helpers that preserve gradient flow through the local rank's slice,
 enabling globally-aware rank estimation in DDP training without breaking
 autograd.
+
+``DistributedDataParallel`` averages gradients across ranks. Every rank
+computes the same loss on the gathered global batch, but only its own slice
+carries gradient, so without correction the averaged gradient would be
+``1 / world_size`` of the single-process gradient. ``all_gather_with_grad``
+therefore multiplies the local slice's gradient by ``world_size`` (the loss
+value is untouched). Setups that sum rather than average gradients must pass
+``scale_grad=False``.
 """
 
 from __future__ import annotations
@@ -33,7 +41,20 @@ def _pad_to(tensor: torch.Tensor, target_rows: int) -> torch.Tensor:
     return torch.cat([tensor, padding], dim=0)
 
 
-def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in the forward pass; multiplies the incoming gradient by ``factor``."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, factor: float) -> torch.Tensor:
+        ctx.factor = factor
+        return tensor.view_as(tensor)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.factor, None
+
+
+def all_gather_with_grad(tensor: torch.Tensor, scale_grad: bool = True) -> torch.Tensor:
     """
     All-gather a tensor across all workers, preserving gradients for the
     local rank's slice.
@@ -44,12 +65,23 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     slices remain stop-gradient, matching DDP semantics (each worker
     optimizes its own parameters via all-reduced gradients).
 
+    DDP averages gradients across ranks, and each rank only backpropagates
+    through its own slice. To make the averaged gradient equal the
+    single-process gradient on the global batch, the gradient flowing into
+    the local slice is multiplied by ``world_size`` (identity in the forward
+    pass, so the gathered values and the loss are unchanged).
+
     Parameters
     ----------
     tensor : torch.Tensor
         Local tensor to gather. Typically ``[N, C]`` logits from one GPU.
         ``N`` (dim 0) may differ across ranks; all other dimensions must
         match.
+    scale_grad : bool, default True
+        Multiply the local slice's gradient by ``world_size`` when
+        ``world_size > 1``. Pass ``False`` for setups that sum gradients
+        across ranks instead of averaging them (or to reproduce the former
+        ``1 / world_size`` behavior). Has no effect at ``world_size == 1``.
 
     Returns
     -------
@@ -68,7 +100,8 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
 
     All workers' queues stay synchronized automatically: since every worker
     calls ``all_gather`` before passing to the loss, every worker enqueues
-    the same global-batch data. No extra synchronization is needed.
+    the same rows (the non-ignored rows of the global batch). No extra
+    synchronization is needed.
 
     Raises
     ------
@@ -77,9 +110,17 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
 
     Examples
     --------
-    Typical usage in a DDP training step::
+    Manual gathering in a DDP training step.  The loss must be constructed
+    with ``gather_distributed=False``, otherwise it gathers again: every row
+    is duplicated and the gradient is scaled by ``world_size`` twice::
 
-        from imbalanced_losses.distributed import all_gather_with_grad
+        from imbalanced_losses import SmoothAPLoss
+        from imbalanced_losses.distributed import (
+            all_gather_no_grad,
+            all_gather_with_grad,
+        )
+
+        loss_fn = SmoothAPLoss(num_classes=4, gather_distributed=False)
 
         logits_global  = all_gather_with_grad(logits)          # [sum(N_i), C]
         targets_global = all_gather_no_grad(targets)           # [sum(N_i)]
@@ -102,10 +143,14 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     local_size = tensor.size(0)
     sizes = _gather_sizes(local_size, world_size, tensor.device)
 
+    local_slice = tensor
+    if scale_grad and tensor.requires_grad:
+        local_slice = _ScaleGrad.apply(tensor, float(world_size))
+
     if sizes.eq(local_size).all():
         gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
         dist.all_gather(gathered, tensor)
-        gathered[rank] = tensor
+        gathered[rank] = local_slice
         return torch.cat(gathered, dim=0)
 
     max_size = sizes.max().item()
@@ -113,7 +158,7 @@ def all_gather_with_grad(tensor: torch.Tensor) -> torch.Tensor:
     gathered = [torch.zeros_like(padded) for _ in range(world_size)]
     dist.all_gather(gathered, padded)
     gathered = [gathered[i][: sizes[i]] for i in range(world_size)]
-    gathered[rank] = tensor
+    gathered[rank] = local_slice
     return torch.cat(gathered, dim=0)
 
 

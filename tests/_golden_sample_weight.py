@@ -31,13 +31,36 @@ step; ``run_entry`` raises if that guarantee is ever violated, because an
 invalid class would inject ``nan`` into a stored tensor and ``torch.equal``
 treats ``nan != nan``.
 
+The fixture was first captured on the tree before the ``sample_weight``
+feature, and has been regenerated once since: the ranking losses stopped
+enqueuing ``ignore_index`` rows into the memory queue, which changes what a
+``queue_size=64`` series sees once the queue wraps. Only the step-2 entries
+(``loss``, ``grad``, ``per_class``) of the ten ``queue_size=64`` configurations
+may differ from the earlier fixture; ``--compare`` checks exactly that.
+
 Usage
 -----
-Regenerate the fixture (only ever run against the unmodified tree, i.e.
-before the ``sample_weight`` feature touches any loss under
-``src/imbalanced_losses/``)::
+Regenerate the fixture. Do this only when a deliberate behavior change moves
+stored values, and prove the change with ``--compare`` against the previous
+fixture before committing the new one (after updating the allow-list, see
+below)::
 
     uv run python tests/_golden_sample_weight.py
+
+Check a regenerated fixture against the previous one (exit 0 only when the key
+sets match and every tensor has the same dtype and shape and identical bytes,
+except the keys :func:`allowed_to_differ` names)::
+
+    uv run python tests/_golden_sample_weight.py --compare OLD_FIXTURE
+
+The allow-list belongs to the one regeneration described above (the enqueue
+filter) and to no other: :func:`allowed_to_differ`, ``COMPARE_ALLOWED_STEP``
+and its ``queue_size`` filter name exactly the step-2 entries of the
+``queue_size=64`` configurations. It is not a general policy. A later
+deliberate regeneration must first rewrite :func:`allowed_to_differ` to name
+the keys its own change is expected to move. Run unedited, ``--compare``
+reports that change's legitimate differences as violations and proves nothing
+about it.
 
 ``tests/test_sample_weight_identity.py`` imports ``build_grid`` and
 ``run_entry`` from this module so the replay uses the exact same inputs the
@@ -46,8 +69,10 @@ capture used -- the fixture stores only outputs, not inputs, to stay small.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import pathlib
+import sys
 from typing import Any
 
 import torch
@@ -364,7 +389,117 @@ def capture_fixture() -> dict[str, Any]:
     return fixture
 
 
-def main() -> None:
+# The single step at which the memory queue first holds rows that the enqueue
+# filter changes for the queue_size=64 series (QUEUE_STEPS=3 steps, 0-based).
+COMPARE_ALLOWED_STEP = "2"
+
+
+def _fixture_prefix(config: GoldenConfig, dtype: torch.dtype, step_key: str) -> str:
+    dtype_str = str(dtype).rsplit(".", maxsplit=1)[-1]
+    return f"{config.name}|dtype={dtype_str}|step={step_key}"
+
+
+def allowed_to_differ() -> set[str]:
+    """Fixture keys that may differ after the enqueue-filter regeneration.
+
+    Derived from the grid: every config whose ``queue_size`` is
+    ``QUEUE_SIZE_SMALL``, at step ``COMPARE_ALLOWED_STEP``, for every dtype,
+    for each field ``run_entry`` stores for it.
+
+    This set records the enqueue-filter regeneration only; it is not a
+    general policy. A future regeneration replaces this rule with the keys
+    its own change moves before running ``--compare``.
+    """
+    allowed: set[str] = set()
+    for config in build_grid():
+        if config.loss_kwargs.get("queue_size") != QUEUE_SIZE_SMALL:
+            continue
+        if int(COMPARE_ALLOWED_STEP) >= len(config.steps):
+            raise RuntimeError(f"{config.name} has no step {COMPARE_ALLOWED_STEP}")
+        fields = ["loss", "grad"] + (["per_class"] if config.return_per_class else [])
+        for dtype in DTYPES:
+            prefix = _fixture_prefix(config, dtype, COMPARE_ALLOWED_STEP)
+            allowed.update(f"{prefix}|{field}" for field in fields)
+    return allowed
+
+
+def _bitwise_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Same dtype, same shape and identical bytes.
+
+    Stricter than ``torch.equal``, which treats ``-0.0`` and ``0.0`` as equal,
+    treats a NaN as different from itself and ignores dtype.
+    """
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    return torch.equal(
+        a.contiguous().reshape(-1).view(torch.uint8),
+        b.contiguous().reshape(-1).view(torch.uint8),
+    )
+
+
+def compare_fixtures(
+    old: dict[str, Any], new: dict[str, Any]
+) -> tuple[list[str], list[str]]:
+    """Compare two fixtures; return ``(differing, violations)``.
+
+    ``differing`` lists every tensor key whose tensors are not bitwise
+    identical (see :func:`_bitwise_identical`: dtype, shape and bytes).
+    ``violations`` names every problem: a key present in only one fixture, or
+    a differing key outside :func:`allowed_to_differ`. The comparison passes
+    when ``violations`` is empty. Non-tensor entries (the ``_meta_`` fields)
+    take part in the key-set check only.
+    """
+    violations: list[str] = []
+    for key in sorted(old.keys() - new.keys()):
+        violations.append(f"missing from new fixture: {key}")
+    for key in sorted(new.keys() - old.keys()):
+        violations.append(f"missing from old fixture: {key}")
+
+    differing = sorted(
+        key
+        for key in old.keys() & new.keys()
+        if isinstance(old[key], torch.Tensor)
+        and not (
+            isinstance(new[key], torch.Tensor)
+            and _bitwise_identical(old[key], new[key])
+        )
+    )
+    allowed = allowed_to_differ()
+    violations.extend(f"differs but not allowed: {k}" for k in differing if k not in allowed)
+    return differing, violations
+
+
+def compare_main(old_path: pathlib.Path) -> int:
+    old = torch.load(old_path, weights_only=True)
+    new = torch.load(FIXTURE_PATH, weights_only=True)
+    differing, violations = compare_fixtures(old, new)
+    allowed = allowed_to_differ()
+    print(
+        f"{len(differing)} tensor(s) differ; {len(allowed)} allowed key(s) "
+        f"(step {COMPARE_ALLOWED_STEP} of the queue_size={QUEUE_SIZE_SMALL} configs)"
+    )
+    for key in differing:
+        print(f"  differs: {key}")
+    unchanged_allowed = sorted(k for k in allowed if k in old and k not in differing)
+    for key in unchanged_allowed:
+        print(f"  allowed but identical: {key}")
+    for message in violations:
+        print(f"  VIOLATION {message}", file=sys.stderr)
+    return 1 if violations else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    parser.add_argument(
+        "--compare",
+        metavar="OLD_FIXTURE",
+        type=pathlib.Path,
+        help="compare the current fixture against OLD_FIXTURE instead of regenerating",
+    )
+    args = parser.parse_args(argv)
+    if args.compare is not None:
+        return compare_main(args.compare)
+
     fixture = capture_fixture()
     FIXTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save(fixture, FIXTURE_PATH)
@@ -374,7 +509,8 @@ def main() -> None:
         f"{fixture['_meta_num_tensor_entries']} tensor entries, "
         f"{fixture['_meta_num_configs']} configs, torch {torch.__version__})"
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

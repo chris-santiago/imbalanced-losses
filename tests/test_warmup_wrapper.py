@@ -1924,3 +1924,285 @@ class TestCheckpointRoundTrip:
         fresh.load_state_dict(w.state_dict())
         assert fresh._switch_step == 0
         assert fresh.current_temperature == pytest.approx(w.current_temperature)
+
+
+# ---------------------------------------------------------------------------
+# Temperature scheduling is opt-in (both temp_start and temp_end required)
+# ---------------------------------------------------------------------------
+
+from imbalanced_losses.pauc_loss import PAUCAtBudgetLoss  # noqa: E402
+
+_MODES = {
+    "epoch_warmup": {"warmup_epochs": 2},
+    "step_warmup": {"warmup_steps": 5},
+    "no_warmup": {},
+}
+
+
+def _no_schedule_wrapper(main_loss: nn.Module, mode: str, **kwargs) -> LossWarmupWrapper:
+    return LossWarmupWrapper(nn.CrossEntropyLoss(), main_loss, **_MODES[mode], **kwargs)
+
+
+def _enter_main_phase(w: LossWarmupWrapper, mode: str) -> int:
+    """Drive the hooks across the phase switch; return the next global step."""
+    if mode == "epoch_warmup":
+        for epoch in range(2):
+            w.on_train_epoch_start(epoch)
+            w.on_train_batch_start(epoch)
+        w.on_train_epoch_start(2)
+        w.on_train_batch_start(2)
+        return 3
+    if mode == "step_warmup":
+        for step in range(6):
+            w.on_train_batch_start(step)
+        return 6
+    w.on_train_batch_start(0)
+    return 1
+
+
+_MAIN_LOSSES = {
+    "pauc": lambda: PAUCAtBudgetLoss(num_classes=4, queue_size=0, temperature=0.1),
+    "smooth_ap": lambda: SmoothAPLoss(num_classes=4, queue_size=0, temperature=0.03),
+}
+
+
+class TestScheduleOptIn:
+    @pytest.mark.parametrize("mode", list(_MODES))
+    @pytest.mark.parametrize("loss_name", list(_MAIN_LOSSES))
+    def test_no_temperatures_never_writes_main_temperature(self, loss_name, mode):
+        main = _MAIN_LOSSES[loss_name]()
+        initial = main.temperature
+        w = _no_schedule_wrapper(main, mode)
+        assert main.temperature == initial
+        step = _enter_main_phase(w, mode)
+        assert main.temperature == initial
+        for i in range(50):
+            w.on_train_batch_start(step + i)
+            assert main.temperature == initial
+        w.on_train_batch_start(20_000)
+        assert main.temperature == initial
+        assert w.current_temperature == initial
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_explicit_none_matches_omitted(self, mode):
+        main = _MAIN_LOSSES["pauc"]()
+        w = _no_schedule_wrapper(main, mode, temp_start=None, temp_end=None)
+        assert w.temp_start is None and w.temp_end is None
+        step = _enter_main_phase(w, mode)
+        for i in range(50):
+            w.on_train_batch_start(step + i)
+        w.on_train_batch_start(20_000)
+        assert main.temperature == 0.1
+
+    @pytest.mark.parametrize("mode", list(_MODES))
+    def test_both_temperatures_follow_baseline_formula(self, mode):
+        t0, t1, n = 0.05, 0.005, 100
+        main = _MAIN_LOSSES["pauc"]()
+        w = _no_schedule_wrapper(
+            main, mode, temp_start=t0, temp_end=t1, temp_decay_steps=n
+        )
+        switch = _enter_main_phase(w, mode) - 1  # the latch call
+        assert main.temperature == pytest.approx(t0)
+        for elapsed in (0, 1, n // 2, n, n + 500):
+            w.on_train_batch_start(switch + elapsed)
+            frac = min(1.0, elapsed / n)
+            expected = t0 * math.exp(frac * math.log(t1 / t0))
+            assert main.temperature == pytest.approx(expected, rel=1e-12)
+
+    @pytest.mark.parametrize("given", ["temp_start", "temp_end"])
+    def test_exactly_one_temperature_raises_naming_both(self, given):
+        with pytest.raises(ValueError, match="temp_start") as exc:
+            LossWarmupWrapper(
+                nn.CrossEntropyLoss(), _MAIN_LOSSES["pauc"](), **{given: 0.05}
+            )
+        assert "temp_end" in str(exc.value)
+
+    @pytest.mark.parametrize("bad", [(0.0, 0.01), (-0.1, 0.01), (0.05, 0.0), (0.05, -1.0)])
+    def test_non_positive_temperature_with_other_given_raises(self, bad):
+        with pytest.raises(ValueError, match="positive"):
+            LossWarmupWrapper(
+                nn.CrossEntropyLoss(),
+                _MAIN_LOSSES["pauc"](),
+                0,
+                bad[0],
+                bad[1],
+            )
+
+    @pytest.mark.parametrize(
+        "pair",
+        [
+            (float("nan"), 0.01),
+            (0.05, float("nan")),
+            (float("inf"), 0.01),
+            (0.05, float("inf")),
+        ],
+    )
+    def test_non_finite_temperatures_behave_as_baseline(self, pair):
+        # Baseline has no finiteness check: construction succeeds and the
+        # no-warmup fast path writes temp_start verbatim.
+        main = _MAIN_LOSSES["pauc"]()
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), main, 0, pair[0], pair[1])
+        assert w.temp_start == pair[0] or (math.isnan(pair[0]) and math.isnan(w.temp_start))
+        assert w.temp_end == pair[1] or (math.isnan(pair[1]) and math.isnan(w.temp_end))
+        written = main.temperature
+        assert written == pair[0] or (math.isnan(pair[0]) and math.isnan(written))
+
+    @pytest.mark.parametrize("steps", [0, -5])
+    def test_decay_steps_validated_without_schedule(self, steps):
+        with pytest.raises(ValueError, match="temp_decay_steps"):
+            LossWarmupWrapper(
+                nn.CrossEntropyLoss(), _MAIN_LOSSES["pauc"](), temp_decay_steps=steps
+            )
+
+    def test_temperatures_accepted_positionally(self):
+        main = _MAIN_LOSSES["pauc"]()
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), main, 0, 0.2, 0.02, 50)
+        assert (w.temp_start, w.temp_end, w.temp_decay_steps) == (0.2, 0.02, 50)
+        assert main.temperature == pytest.approx(0.2)
+
+    def test_no_temperatures_attributes_are_none(self):
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), _MAIN_LOSSES["pauc"](), 1)
+        assert w.temp_start is None
+        assert w.temp_end is None
+
+    def test_no_schedule_loss_without_temperature_is_silent(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            w = LossWarmupWrapper(nn.CrossEntropyLoss(), _NoTempLoss(), 1)
+        assert w.current_temperature is None
+
+    def test_schedule_requested_loss_without_temperature_warns(self):
+        with pytest.warns(UserWarning, match="no 'temperature' attribute"):
+            LossWarmupWrapper(
+                nn.CrossEntropyLoss(), _NoTempLoss(), 1, 0.1, 0.01
+            )
+
+
+class _QueueStub(nn.Module):
+    """Main-loss stub with a temperature and a counted reset_queue."""
+
+    def __init__(self):
+        super().__init__()
+        self.temperature = 0.1
+        self.resets = 0
+
+    def forward(self, logits, targets, **kwargs):
+        return logits.sum() * 0.0
+
+    def reset_queue(self):
+        self.resets += 1
+
+
+def _batch_hook_warnings(w: LossWarmupWrapper) -> list[str]:
+    logits, targets = _batch()
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        w(logits, targets)
+        w(logits, targets)
+    return [str(r.message) for r in rec if "on_train_batch_start" in str(r.message)]
+
+
+class TestForwardBatchHookWarning:
+    def test_schedule_requested_warns_once_naming_schedule(self):
+        w = _make_wrapper(warmup_epochs=0)
+        msgs = _batch_hook_warnings(w)
+        assert len(msgs) == 1
+        assert "temperature schedule" in msgs[0]
+        assert "queue reset" not in msgs[0]
+
+    def test_schedule_requested_without_warmup_queue_reset_names_only_schedule(self):
+        w = _make_wrapper(warmup_epochs=0, main_loss=_QueueStub())
+        msgs = _batch_hook_warnings(w)
+        assert len(msgs) == 1
+        assert "temperature schedule" in msgs[0]
+        assert "queue reset" not in msgs[0]
+
+    def test_no_schedule_warmup_with_reset_queue_warns_about_queue_reset(self):
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), _QueueStub(), 1)
+        w.on_train_epoch_start(1)
+        msgs = _batch_hook_warnings(w)
+        assert len(msgs) == 1
+        assert "queue reset" in msgs[0]
+        assert "temperature schedule" not in msgs[0]
+
+    def test_schedule_and_warmup_queue_reset_names_both(self):
+        w = _make_wrapper(warmup_epochs=1, main_loss=_QueueStub())
+        w.on_train_epoch_start(1)
+        msgs = _batch_hook_warnings(w)
+        assert len(msgs) == 1
+        assert "temperature schedule" in msgs[0]
+        assert "queue reset" in msgs[0]
+
+    def test_no_schedule_no_warmup_is_silent(self):
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), _QueueStub())
+        assert _batch_hook_warnings(w) == []
+
+    def test_no_schedule_warmup_without_reset_queue_is_silent(self):
+        class _TempOnly(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.temperature = 0.1
+
+            def forward(self, logits, targets):
+                return logits.sum() * 0.0
+
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), _TempOnly(), 1)
+        w.on_train_epoch_start(1)
+        assert _batch_hook_warnings(w) == []
+
+    def test_no_schedule_switch_time_queue_reset_still_runs_once(self):
+        main = _QueueStub()
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), main, 1)
+        w.on_train_epoch_start(0)
+        w.on_train_batch_start(0)
+        assert main.resets == 0
+        w.on_train_epoch_start(1)
+        w.on_train_batch_start(1)
+        assert main.resets == 1
+        for step in range(2, 6):
+            w.on_train_batch_start(step)
+        assert main.resets == 1
+
+
+class TestNoScheduleCheckpoint:
+    def test_round_trip_leaves_temperature_unchanged(self):
+        main = _QueueStub()
+        w = LossWarmupWrapper(nn.CrossEntropyLoss(), main, 1)
+        _enter_main_phase(w, "epoch_warmup")
+        state = w.state_dict()
+        fresh_main = _QueueStub()
+        fresh = LossWarmupWrapper(nn.CrossEntropyLoss(), fresh_main, 1)
+        fresh.load_state_dict(state)
+        assert fresh_main.temperature == 0.1
+        assert fresh._switch_step == w._switch_step
+
+    def test_scheduling_state_loaded_into_no_schedule_keeps_constructor_value(self):
+        sched = _make_wrapper(warmup_epochs=1, temp_decay_steps=100)
+        sched.on_train_epoch_start(1)
+        sched.on_train_batch_start(10)
+        sched.on_train_batch_start(60)
+        assert sched.current_temperature != pytest.approx(0.1)
+        state = sched.state_dict()
+        assert state["_extra_state"]["temperature"] == sched.current_temperature
+
+        main = SmoothAPLoss(num_classes=4, queue_size=0, temperature=0.03)
+        plain = LossWarmupWrapper(nn.CrossEntropyLoss(), main, 1)
+        plain.load_state_dict(state)
+        assert main.temperature == 0.03
+        assert plain._switch_step == sched._switch_step
+
+    def test_saved_state_contents_unchanged_by_schedule_choice(self):
+        plain = LossWarmupWrapper(nn.CrossEntropyLoss(), _QueueStub(), 1)
+        sched = LossWarmupWrapper(nn.CrossEntropyLoss(), _QueueStub(), 1, 0.1, 0.01)
+        assert plain.state_dict().keys() == sched.state_dict().keys()
+        assert plain.get_extra_state().keys() == sched.get_extra_state().keys()
+
+    def test_scheduling_state_loaded_into_scheduling_wrapper_restores_temperature(self):
+        src = _make_wrapper(warmup_epochs=1, temp_decay_steps=100)
+        src.on_train_epoch_start(1)
+        src.on_train_batch_start(10)
+        src.on_train_batch_start(60)
+        decayed = src.current_temperature
+        fresh = _make_wrapper(warmup_epochs=1, temp_decay_steps=100)
+        fresh.load_state_dict(src.state_dict())
+        assert fresh.current_temperature == pytest.approx(decayed)

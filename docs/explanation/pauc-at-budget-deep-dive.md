@@ -100,10 +100,17 @@ pAUC  = ( ½·TPR̂_0 + Σ_mid TPR̂_k + ½·TPR̂_{K−1} ) / (n_knots − 1)
 loss  = 1 − pAUC
 ```
 
-Gradient flows through positives only; negatives enter solely via the detached
-thresholds. The surrogate itself costs `O(|P| × n_knots)`. For a narrow band,
-`n_knots = 2` is accurate (trapezoid error scales as `(β − α)³ · TPR''`); use
-`n_knots ≥ 3` for wide bands.
+Gradient flows through positives only; negatives enter solely via the detached thresholds. The surrogate itself costs `O(|P| × n_knots)`.
+
+How many knots are enough depends on where the band starts, not only on how wide it is. On a band that starts above zero (e.g. `[0.0025, 0.0075]`), `n_knots = 2` is within about 3% of the exact empirical pAUC at pools of 20,000 to 200,000 rows. On the default `α = 0` band it is not: the first knot is `t_α = max(neg)`, where TPR is near zero and the ROC is steepest, so the usual trapezoid error bound has no finite constant there, and half the objective weight sits on beating a single extreme order statistic that grows with pool size. Measured against the exact empirical pAUC at 2% positives on `[0, 0.005]`:
+
+| Pool rows | `n_knots=2` | `3` | `5` | `9` |
+|---|---|---|---|---|
+| 1,280 | −2% | +2% | 0% | −1% |
+| 20,000 | −25% | −9% | −3% | −1% |
+| 200,000 | −30% | −11% | −4% | −1% |
+
+At a single-GPU pool (about 1,280 rows) the default is fine. For large pools, such as a DDP-gathered batch plus queue, use `n_knots=5` or more if you want the loss value to track the true pAUC. This is a statement about the estimator's value, not about training outcomes, and the default stays at 2.
 
 **Pairwise** (`surrogate="pairwise"`). Band-restricted Smooth-AP. It compares positives
 against the negatives that land *inside* the band, which carry gradient:

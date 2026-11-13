@@ -1,5 +1,9 @@
 """
-LossWarmupWrapper: phase-switching loss with geometric temperature decay.
+LossWarmupWrapper: phase-switching loss with optional geometric temperature decay.
+
+Temperature scheduling is opt-in: pass both ``temp_start`` and ``temp_end`` to
+schedule ``main_loss.temperature``; pass neither and the wrapper never writes
+it, so the temperature configured on ``main_loss`` is the one used.
 
 Usage in a LightningModule (epoch-based warmup)
 ------------------------------------------------
@@ -70,24 +74,31 @@ class LossWarmupWrapper(nn.Module):
        defined in **epochs** (``warmup_epochs``) or **steps**
        (``warmup_steps``), but not both.
 
-    2. **Geometric temperature decay**: ``main_loss.temperature`` decays
-       from ``temp_start`` to ``temp_end`` over ``temp_decay_steps``
-       global training steps, starting from the moment of phase switch::
+    2. **Optional geometric temperature decay**: when both ``temp_start``
+       and ``temp_end`` are given, ``main_loss.temperature`` decays from
+       ``temp_start`` to ``temp_end`` over ``temp_decay_steps`` global
+       training steps, starting from the moment of phase switch::
 
            temp(t) = temp_start * (temp_end / temp_start) ** (t / temp_decay_steps)
 
        After ``temp_decay_steps`` steps the temperature is held at
-       ``temp_end``.
+       ``temp_end``.  When neither is given (the default) the wrapper never
+       writes ``main_loss.temperature``: not at construction, at the phase
+       switch, afterwards, or when a checkpoint is loaded.  Giving exactly
+       one of the two raises ``ValueError``.
 
     Call :meth:`on_train_epoch_start` and :meth:`on_train_batch_start`
     from the corresponding PyTorch Lightning hooks (or your training loop).
     In step mode, :meth:`on_train_epoch_start` is optional (only needed
     when ``reset_queue_each_epoch=True``).  :meth:`on_train_batch_start`
-    is **required** whenever ``main_loss`` exposes a ``temperature``
-    (in **epoch mode as well as step mode**), because it is the only thing
-    that drives the temperature schedule.  Omitting it leaves the
-    temperature undecayed (it never moves toward ``temp_end``); a one-time
-    ``UserWarning`` is emitted from :meth:`forward` if this is detected.
+    is **required** (in **epoch mode as well as step mode**) whenever a
+    temperature schedule is requested and ``main_loss`` exposes a
+    ``temperature``, because it is the only thing that drives the schedule,
+    and whenever a warmup phase is configured and ``main_loss`` has
+    ``reset_queue``, because it performs the queue reset at the phase
+    switch.  Omitting it disables those behaviors; a one-time
+    ``UserWarning`` naming what is disabled is emitted from :meth:`forward`
+    if this is detected.
 
     Parameters
     ----------
@@ -100,12 +111,17 @@ class LossWarmupWrapper(nn.Module):
     warmup_epochs : int, optional
         Number of epochs to use ``warmup_loss`` (0 = skip warmup entirely).
         Mutually exclusive with ``warmup_steps``.  Default: 0.
-    temp_start : float
-        Temperature at the start of the main phase.
-    temp_end : float
-        Temperature after ``temp_decay_steps`` steps.
-    temp_decay_steps : int
+    temp_start : float or None, optional
+        Temperature at the start of the main phase.  Must be given together
+        with ``temp_end`` (both positive) to schedule the temperature.
+        Default: None (no schedule).
+    temp_end : float or None, optional
+        Temperature after ``temp_decay_steps`` steps.  Must be given together
+        with ``temp_start``.  Default: None (no schedule).
+    temp_decay_steps : int, optional
         Number of global training steps over which to decay temperature.
+        Must be positive; unused when no schedule is requested.
+        Default: 10_000.
     blend_epochs : int, optional
         Number of epochs after warmup to linearly blend from ``warmup_loss``
         to ``main_loss``.  During blend epoch ``k`` (0-indexed),
@@ -146,8 +162,8 @@ class LossWarmupWrapper(nn.Module):
         warmup_loss: nn.Module,
         main_loss: nn.Module,
         warmup_epochs: int = 0,
-        temp_start: float = 0.05,
-        temp_end: float = 0.005,
+        temp_start: float | None = None,
+        temp_end: float | None = None,
         temp_decay_steps: int = 10_000,
         *,
         blend_epochs: int = 0,
@@ -187,7 +203,14 @@ class LossWarmupWrapper(nn.Module):
             raise ValueError(
                 f"final_main_weight must be in (0, 1], got {final_main_weight}"
             )
-        if temp_start <= 0 or temp_end <= 0:
+        if (temp_start is None) != (temp_end is None):
+            raise ValueError(
+                "temp_start and temp_end must be given together (both to schedule "
+                "the temperature, neither to leave main_loss.temperature alone); "
+                f"got temp_start={temp_start}, temp_end={temp_end}"
+            )
+        schedules_temperature = temp_start is not None and temp_end is not None
+        if schedules_temperature and (temp_start <= 0 or temp_end <= 0):
             raise ValueError("temp_start and temp_end must be positive")
         if temp_decay_steps <= 0:
             raise ValueError(
@@ -197,8 +220,12 @@ class LossWarmupWrapper(nn.Module):
         self.warmup_loss = warmup_loss
         self.main_loss = main_loss
         self.warmup_epochs = warmup_epochs
-        self.temp_start = float(temp_start)
-        self.temp_end = float(temp_end)
+        # Decided once: the wrapper writes main_loss.temperature, and warns
+        # about a missing batch hook on its behalf, only when both
+        # temperatures were given.
+        self._schedules_temperature: bool = schedules_temperature
+        self.temp_start = float(temp_start) if temp_start is not None else None
+        self.temp_end = float(temp_end) if temp_end is not None else None
         self.temp_decay_steps = temp_decay_steps
         self.blend_epochs = blend_epochs
         self.final_main_weight = float(final_main_weight)
@@ -226,7 +253,7 @@ class LossWarmupWrapper(nn.Module):
                 for p in params
             )
 
-        if not self._has_temperature:
+        if self._schedules_temperature and not self._has_temperature:
             warnings.warn(
                 f"{type(main_loss).__name__} has no 'temperature' attribute; "
                 "temperature scheduling will be skipped.",
@@ -251,6 +278,7 @@ class LossWarmupWrapper(nn.Module):
         no_warmup = (self._step_mode and self.warmup_steps == 0) or (
             not self._step_mode and warmup_epochs == 0
         )
+        self._has_warmup: bool = not no_warmup
         if no_warmup:
             self._switch_step = 0
             self._apply_temperature(self.temp_start)
@@ -310,8 +338,9 @@ class LossWarmupWrapper(nn.Module):
         float or None
             ``float(main_loss.temperature)`` if ``main_loss`` has a
             ``temperature`` attribute, ``None`` otherwise.  During
-            warmup the value reflects whatever was last written to
-            ``main_loss.temperature`` (typically ``temp_start``).
+            warmup the value reflects whatever is currently on
+            ``main_loss.temperature``: its constructor value, or the last
+            value the wrapper wrote when a schedule is requested.
         """
         if not self._has_temperature:
             return None
@@ -358,15 +387,20 @@ class LossWarmupWrapper(nn.Module):
 
     def on_train_batch_start(self, global_step: int) -> None:
         """
-        Update the temperature schedule for the current training step.
+        Advance the phase bookkeeping and, if requested, the temperature
+        schedule for the current training step.
 
         Call this from ``LightningModule.on_train_batch_start`` passing
         ``self.global_step``.  Responsibilities:
 
         - On the first main-phase batch, latches ``_switch_step`` to
-          ``global_step`` and sets temperature to ``temp_start``.
-        - On all subsequent main-phase batches, applies the geometric
-          decay formula and writes the result to ``main_loss.temperature``.
+          ``global_step``, resets the main loss's queue (if it has one) and,
+          when a temperature schedule is requested, sets temperature to
+          ``temp_start``.
+        - On all subsequent main-phase batches, when a temperature schedule
+          is requested, applies the geometric decay formula and writes the
+          result to ``main_loss.temperature``.  Without a schedule it never
+          writes the temperature.
         - Is a no-op during warmup or before the phase sentinel is set.
 
         Parameters
@@ -394,6 +428,9 @@ class LossWarmupWrapper(nn.Module):
                 self.main_loss.reset_queue()  # type: ignore[union-attr]
             return
 
+        if not self._schedules_temperature:
+            return
+
         elapsed = global_step - self._switch_step
         frac = min(1.0, elapsed / self.temp_decay_steps)
         temp = self.temp_start * math.exp(
@@ -414,10 +451,12 @@ class LossWarmupWrapper(nn.Module):
 
         Notes
         -----
-        No-op if ``main_loss`` has no ``temperature`` attribute
-        (``_has_temperature`` is False).
+        No-op unless a temperature schedule was requested at construction
+        and ``main_loss`` has a ``temperature`` attribute.  This is the only
+        place the wrapper writes ``main_loss.temperature``, which keeps the
+        no-schedule guarantee (including on checkpoint load) in one spot.
         """
-        if self._has_temperature:
+        if self._schedules_temperature and self._has_temperature:
             self.main_loss.temperature = temp  # type: ignore[union-attr]
 
     # ── checkpoint compatibility ────────────────────────────────────────────
@@ -436,7 +475,8 @@ class LossWarmupWrapper(nn.Module):
             Schedule state.  ``temperature`` is included so that a resumed
             run reports the correct value before the first
             :meth:`on_train_batch_start` recomputes it; it is ``None`` when
-            ``main_loss`` has no ``temperature`` attribute.
+            ``main_loss`` has no ``temperature`` attribute.  The keys are
+            the same whether or not a temperature schedule is requested.
 
         Notes
         -----
@@ -463,7 +503,9 @@ class LossWarmupWrapper(nn.Module):
             Mapping produced by :meth:`get_extra_state`.  Missing keys fall
             back to the current in-memory value so that partial or
             future-versioned payloads degrade rather than raise during a
-            training restart.
+            training restart.  The saved ``temperature`` is applied to
+            ``main_loss`` only when a temperature schedule is requested; a
+            wrapper without one leaves ``main_loss.temperature`` untouched.
         """
         self._epoch = state.get("epoch", self._epoch)
         self._global_step = state.get("global_step", self._global_step)
@@ -536,22 +578,20 @@ class LossWarmupWrapper(nn.Module):
         """
         if self.in_warmup:
             return self.warmup_loss(logits, targets, **self._warmup_kwargs(kwargs))
-        if (
-            not self._batch_hook_seen
-            and not self._no_batch_hook_warned
-            and self._has_temperature
-        ):
-            warnings.warn(
-                f"{type(self).__name__}: on_train_batch_start() was never called in "
-                f"the main phase, so temperature scheduling is disabled and "
-                f"{type(self.main_loss).__name__}.temperature will not decay toward "
-                f"temp_end. Call on_train_batch_start(global_step) every training step "
-                f"(required in epoch mode too, not only step mode). "
-                f"(This warning is shown once per instance.)",
-                UserWarning,
-                stacklevel=2,
-            )
-            self._no_batch_hook_warned = True
+        if not self._batch_hook_seen and not self._no_batch_hook_warned:
+            disabled = self._behaviors_disabled_without_batch_hook()
+            if disabled:
+                warnings.warn(
+                    f"{type(self).__name__}: on_train_batch_start() was never called in "
+                    f"the main phase, so {' and '.join(disabled)} "
+                    f"{'is' if len(disabled) == 1 else 'are'} disabled. "
+                    f"Call on_train_batch_start(global_step) every training step "
+                    f"(required in epoch mode too, not only step mode). "
+                    f"(This warning is shown once per instance.)",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._no_batch_hook_warned = True
         w = self.main_weight
         if w >= 1.0:
             return self.main_loss(logits, targets, **kwargs)
@@ -571,6 +611,33 @@ class LossWarmupWrapper(nn.Module):
             blended = (1 - w) * warmup_out + w * main_loss_value
             return (blended, *main_extra)
         return (1 - w) * warmup_out + w * main_out
+
+    def _behaviors_disabled_without_batch_hook(self) -> list[str]:
+        """
+        Describe what a missing :meth:`on_train_batch_start` call disables.
+
+        Returns
+        -------
+        list of str
+            One phrase per disabled behavior: the temperature schedule (when
+            requested and ``main_loss`` has a ``temperature``) and the
+            switch-time queue reset (when a warmup phase is configured and
+            ``main_loss`` has ``reset_queue``).  Empty when the hook's
+            absence changes nothing.
+        """
+        loss_name = type(self.main_loss).__name__
+        disabled = []
+        if self._schedules_temperature and self._has_temperature:
+            disabled.append(
+                f"the temperature schedule ({loss_name}.temperature will not "
+                f"decay toward temp_end)"
+            )
+        if self._has_warmup and self._has_reset_queue:
+            disabled.append(
+                f"the queue reset at the warmup-to-main switch "
+                f"({loss_name}.reset_queue() will not run)"
+            )
+        return disabled
 
     def _warmup_kwargs(self, kwargs: dict) -> dict:
         """

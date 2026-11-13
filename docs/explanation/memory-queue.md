@@ -12,7 +12,9 @@ The queue is a fixed-size circular buffer of `(logits, targets)` rows. On every 
 
 1. The live batch is appended to the queue contents to form the full pool
 2. AP or recall is computed on the full pool
-3. The live batch is written into the queue, overwriting the oldest entries
+3. The live batch's usable rows are written into the queue, overwriting the oldest entries
+
+Only rows whose target is not `ignore_index` are stored. A padding row can never contribute to the loss, so storing it would only spend a slot: on padded sequence batches, enqueuing every row left most of the queue filled with rows that were discarded again when the pool was built. Under DDP the rows stored are the non-ignored rows of the gathered global batch, so every rank's queue stays identical.
 
 Queue entries are stored *detached*: no gradient flows through queued logits. Gradients only flow through the live batch's portion of the pool. This is important: you cannot backpropagate through historical logits that were computed by a previous version of the model.
 
@@ -36,9 +38,10 @@ If these stale entries remain in the queue, the AP loss computes ranks relative 
 
 ## When to reset manually
 
-- Between training and validation: `loss_fn.reset_queue()` before the val loop prevents training logits from appearing in val-phase AP estimates
 - After changing model architecture or checkpoint
 - When `reset_queue_each_epoch=True` in `LossWarmupWrapper` is set, which is useful when the model changes significantly epoch-to-epoch and stale logits would bias ranking
+
+Do not reset the queue between training and validation. In eval mode the queue is frozen (it stops updating, unless `update_queue_in_eval=True`), but its training rows are still merged into the pool, so a loss computed with the training instance during validation ranks validation rows against training rows. Resetting before the validation loop would give a validation-only value, at the cost of emptying the queue the next training epoch needs. Use a separate loss instance with `queue_size=0` for validation instead; see [Queue behavior during validation](../how-to/use-ranking-losses.md#queue-behavior-during-validation).
 
 ## Stored `sample_weight`
 
@@ -54,6 +57,6 @@ The core AP computation is O(|P| × M) by construction (only the positive rows o
 
 ## DDP queue synchronization
 
-In distributed training, every worker calls `all_gather` before passing to the loss. This means every worker sees the same global batch and enqueues the same data. No explicit queue synchronization across workers is needed: they are identical by construction.
+In distributed training, every worker calls `all_gather` before passing to the loss. This means every worker sees the same global batch and enqueues the same rows (its non-ignored rows). No explicit queue synchronization across workers is needed: they are identical by construction.
 
-One caveat on loss values (not queues): if `max_pool_size` subsampling triggers, each rank draws its own random subset (unseeded `torch.randperm` per rank), so per-rank loss values can differ slightly on those steps. The queues remain identical, because the full post-gather batch is enqueued, not the subsampled pool.
+One caveat on loss values (not queues): if `max_pool_size` subsampling triggers, each rank draws its own random subset (unseeded `torch.randperm` per rank), so per-rank loss values can differ slightly on those steps. The thresholds of `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` do not differ, because they are estimated on the full gathered pool before subsampling. The queues remain identical, because the non-ignored rows of the post-gather batch are enqueued, not the subsampled pool.

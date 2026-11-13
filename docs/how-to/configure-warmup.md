@@ -1,6 +1,6 @@
 # Configure Warmup and Blending
 
-`LossWarmupWrapper` manages a three-phase training schedule: warmup, optional linear blend, and main (ranking) phase with geometric temperature decay.
+`LossWarmupWrapper` manages a three-phase training schedule: warmup, optional linear blend, and main (ranking) phase, with an optional geometric temperature decay in the main phase.
 
 Warmup and blend can be specified in **epochs** or **steps**. Use whichever maps more naturally to your training setup. The two styles are mutually exclusive per axis (`warmup_epochs` vs `warmup_steps`, `blend_epochs` vs `blend_steps`).
 
@@ -166,6 +166,8 @@ loss_fn = LossWarmupWrapper(
 `final_main_weight` must be in `(0, 1]`. The default is `1.0`.
 
 ## Tune temperature decay
+
+Temperature scheduling is opt-in: the wrapper decays `main_loss.temperature` only when you pass both `temp_start` and `temp_end`. Leave both out and the loss keeps the temperature it was constructed with (passing just one raises `ValueError`). This matters most for `PAUCAtBudgetLoss`, whose temperature is a dimensionless multiplier (default `0.1`) that usually should not be annealed with raw-logit values.
 
 Temperature controls how sharply the sigmoid approximates a hard rank. Start high (soft, stable gradients) and decay to a low value (sharp, closer to true AP):
 

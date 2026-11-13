@@ -18,9 +18,9 @@ from typing import Literal
 import torch
 import torch.nn as nn
 
-from imbalanced_losses._queue import _MemoryQueue
+from imbalanced_losses._queue import PooledBatch, _MemoryQueue
 from imbalanced_losses._sampling import subsample_pool
-from imbalanced_losses._weights import _SampleWeightMixin
+from imbalanced_losses._weights import _SampleWeightMixin, _caller_stacklevel
 from imbalanced_losses.distributed import all_gather_no_grad, all_gather_with_grad
 
 
@@ -105,7 +105,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     gather_distributed : bool or None
         DDP all-gather flag (``None`` = auto-detect).
     max_pool_size : int or None
-        Cap on ranking-pool rows after ignore-index filtering.
+        Cap on ranking-pool rows after ignore-index filtering.  Losses
+        with pool-level thresholds (see :meth:`_estimate_thresholds`)
+        estimate them from the full pool before the cap is applied.
     """
 
     def __init__(
@@ -191,8 +193,18 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         Clear the circular buffer.
 
         Resets all stored logits to zero, all stored targets to
-        ignore_index, and the write pointer to 0.  Typically called
-        between training and evaluation epochs.
+        ignore_index, and the write pointer to 0.
+
+        Call it when the queue's contents are stale: at the start of a new
+        training phase, or after changing the model or loading a different
+        checkpoint.  ``LossWarmupWrapper`` calls it at the warmup-to-main
+        switch.
+
+        It is not needed around validation.  The queue is frozen in eval
+        mode (unless ``update_queue_in_eval=True``), but its training rows
+        are still merged into the pool, and resetting it would discard the
+        rows the next training epoch needs.  For a validation-only loss
+        value, use a separate loss instance with ``queue_size=0``.
         """
         self._queue.reset()
 
@@ -208,6 +220,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
         sample_weight: torch.Tensor | None = None,
+        thresholds: object | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute loss and validity for each class.
@@ -237,6 +250,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             weighted arithmetic; only positives' weights participate in
             the ranking objective, negatives' weights are never used, and
             thresholds/ranks/bands never see it.
+        thresholds : object, optional
+            Whatever :meth:`_estimate_thresholds` returned for this call.
+            Passed as a keyword only when subsampling ran and the hook
+            returned a non-``None`` value, so an implementation that never
+            overrides the hook need not accept it.  When absent, compute
+            the thresholds from *logits* itself.
 
         Returns
         -------
@@ -247,6 +266,27 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             True for classes that had a meaningful computation (e.g. at
             least one positive and one negative).
         """
+
+    def _estimate_thresholds(self, pool: PooledBatch) -> object | None:
+        """
+        Estimate score thresholds from the full pool before subsampling.
+
+        Called at most once per forward, and only when ``max_pool_size``
+        subsampling is about to run, with the ``ignore_index``-filtered,
+        pre-subsampling pool.  A loss whose thresholds depend on the pool
+        overrides this so that capping the pool does not move its operating
+        point; the result is handed to :meth:`_compute_per_class` as the
+        ``thresholds`` keyword.  Implementations must not modify *pool*, and
+        the result must carry no gradient.
+
+        Returns
+        -------
+        object or None
+            ``None`` (the default) means the loss has no pool-level
+            thresholds, and ``_compute_per_class`` is called without the
+            ``thresholds`` keyword.
+        """
+        return None
 
     def _validate_filtered_targets(
         self, targets: torch.Tensor, *, is_live: torch.Tensor | None = None
@@ -261,7 +301,13 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         count as a negative for every class.  Queued rows are checked
         along with the live batch, so a queue restored from a checkpoint
         saved before this check existed raises until :meth:`reset_queue`
-        drops its rows.  Binary mode is not checked here.
+        drops its rows.
+
+        With ``num_classes == 1``, a target outside ``{0, 1}`` emits one
+        ``UserWarning`` per call (listing at most eight of the offending
+        values) and the row still counts as positive.  The warning is
+        attributed to the first frame outside this library and torch, so it
+        points at the caller's own line.  An empty pool does not warn.
 
         Overrides that add checks should call
         ``super()._validate_filtered_targets(targets, is_live=is_live)``
@@ -276,7 +322,17 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             Selects which remedy the error message names; when omitted,
             both remedies are named.
         """
-        if self.num_classes > 1:
+        if self.num_classes == 1:
+            bad = targets[(targets != 0) & (targets != 1)]
+            if bad.numel() > 0:
+                warnings.warn(
+                    f"Binary mode (num_classes=1) expects targets in {{0, 1}}, "
+                    f"but found values: {bad[:8].tolist()}. "
+                    "Non-zero values are treated as positive.",
+                    UserWarning,
+                    stacklevel=_caller_stacklevel(),
+                )
+        elif self.num_classes > 1:
             is_bad = (targets < 0) | (targets >= self.num_classes)
             bad = targets[is_bad]
             if bad.numel() > 0:
@@ -460,6 +516,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         self._validate_filtered_targets(pool.targets, is_live=all_is_live)
 
         # --- subsample if pool exceeds max_pool_size -------------------------
+        thresholds = None
         if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
             if not self._subsample_warned:
                 warnings.warn(
@@ -471,39 +528,81 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
                     stacklevel=2,
                 )
                 self._subsample_warned = True
+            # Thresholds come from the whole filtered pool, so the cap does
+            # not move the operating point; the per-class compute then runs
+            # over the subsample against them.
+            thresholds = self._estimate_thresholds(pool)
             pool, all_is_live = subsample_pool(
                 pool, self.max_pool_size, is_live=all_is_live
             )
 
         # --- empty pool check ------------------------------------------------
+        # _compute_per_class is never called on an empty pool; the result is
+        # the same one a pool of all-degenerate classes reduces to.
         if pool.logits.size(0) == 0:
-            nan_per_class = logits.new_full((self.num_classes,), float("nan"))
-            if self.reduction == "none":
-                # Same sentinel as a non-empty pool of all-degenerate classes.
-                out = nan_per_class
-            else:
-                out = logits.sum() * 0.0
-            if return_per_class:
-                return (
-                    out,
-                    nan_per_class.clone(),
-                    torch.zeros(
-                        self.num_classes, dtype=torch.bool, device=logits.device
-                    ),
-                )
-            return out
+            return self._reduce(
+                logits.new_zeros((self.num_classes,)),
+                torch.zeros(self.num_classes, dtype=torch.bool, device=logits.device),
+                logits,
+                return_per_class,
+            )
 
         # --- per-class compute -----------------------------------------------
+        # The keyword is passed only when the hook produced something, so a
+        # _compute_per_class without a ``thresholds`` parameter keeps working.
+        extra = {} if thresholds is None else {"thresholds": thresholds}
         loss_vec, valid_vec = self._compute_per_class(
             pool.logits, pool.targets, pool.is_iid, all_is_live,
-            sample_weight=pool.sample_weight,
+            sample_weight=pool.sample_weight, **extra,
         )
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------
+        # Only rows the loss can use are stored: ignore_index rows would
+        # occupy queue slots that merge() filters out again. The mask depends
+        # only on the gathered targets, so every DDP rank enqueues the same
+        # rows. A batch with nothing to store is a no-op in enqueue().
         if self._should_update_queue():
-            self._queue.enqueue(logits, targets, is_iid=live_iid, sample_weight=sample_weight)
+            keep = targets != self.ignore_index
+            self._queue.enqueue(
+                logits.detach()[keep],
+                targets[keep],
+                is_iid=live_iid[keep],
+                sample_weight=None if sample_weight is None else sample_weight[keep],
+            )
 
-        # --- reduction -------------------------------------------------------
+        return self._reduce(loss_vec, valid_vec, logits, return_per_class)
+
+    def _reduce(
+        self,
+        loss_vec: torch.Tensor,
+        valid_vec: torch.Tensor,
+        logits: torch.Tensor,
+        return_per_class: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Reduce per-class losses to the value ``forward`` returns.
+
+        Shared by the general path and the empty-pool early return.
+        ``reduction='none'`` masks invalid classes to ``nan`` (so a result
+        with no valid class is a ``nan`` vector with no gradient path unless
+        *loss_vec* has one).  ``'mean'`` and ``'sum'`` reduce over valid
+        classes only; with none valid they return ``logits.sum() * 0.0``,
+        a zero that keeps a gradient path to the caller's logits.  The
+        ``per_class`` element is always a fresh tensor, never the loss
+        itself.
+
+        Parameters
+        ----------
+        loss_vec : torch.Tensor, shape [C]
+            Per-class losses; entries of invalid classes are ignored.
+        valid_vec : torch.Tensor, shape [C], dtype=bool
+            True for classes with a meaningful loss.
+        logits : torch.Tensor
+            Compute-dtype logits of this call; anchors the zero returned
+            when no class is valid.
+        return_per_class : bool
+            Also return the masked per-class vector and *valid_vec*.
+        """
         if self.reduction == "none":
             out = loss_vec.masked_fill(~valid_vec, float("nan"))
         else:
