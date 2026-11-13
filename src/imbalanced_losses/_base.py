@@ -275,8 +275,18 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         Clear the circular buffer.
 
         Resets all stored logits to zero, all stored targets to
-        ignore_index, and the write pointer to 0.  Typically called
-        between training and evaluation epochs.
+        ignore_index, and the write pointer to 0.
+
+        Call it when the queue's contents are stale: at the start of a new
+        training phase, or after changing the model or loading a different
+        checkpoint.  ``LossWarmupWrapper`` calls it at the warmup-to-main
+        switch.
+
+        It is not needed around validation.  The queue is frozen in eval
+        mode (unless ``update_queue_in_eval=True``), but its training rows
+        are still merged into the pool, and resetting it would discard the
+        rows the next training epoch needs.  For a validation-only loss
+        value, use a separate loss instance with ``queue_size=0``.
         """
         self._queue.reset()
 
