@@ -80,12 +80,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     Abstract base for ranking losses that use a memory queue.
 
     Subclasses implement :meth:`_compute_per_class`; everything else --
-    validation,
-    DDP gather, queue merge, ignore-index filtering, subsampling,
-    reduction, and ``return_per_class`` -- is handled here.  The
-    target-range rule lives in :meth:`_validate_filtered_targets`, which
-    subclasses may override; an override that adds checks should call
-    ``super()._validate_filtered_targets(...)`` to keep the range rule.
+    validation, DDP gather, queue merge, ignore-index filtering,
+    subsampling, reduction, and ``return_per_class`` -- is handled here.
+    The target-range rule lives in :meth:`_validate_filtered_targets`,
+    which subclasses may override; an override that adds checks should
+    call ``super()._validate_filtered_targets(...)`` to keep the range
+    rule.
 
     Parameters
     ----------
