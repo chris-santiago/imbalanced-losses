@@ -1519,3 +1519,226 @@ class TestSampleWeightGatherDistributed:
         loss_gathered = fn_gathered(logits, targets, sample_weight=weight)
         loss_off = fn_off(logits, targets, sample_weight=weight)
         torch.testing.assert_close(loss_gathered, loss_off)
+
+
+# ===========================================================================
+# 15. Focal modulator guard and gamma validation
+# ===========================================================================
+
+import importlib
+import math
+
+import torch.nn.functional as F
+
+_focal_module = importlib.import_module("imbalanced_losses.focal_loss")
+
+_DTYPES = [torch.float32, torch.float64]
+_GAMMAS = [0, 0.3, 0.5, 1, 1.5, 2, 5]
+_SATURATION_SCALE = 50.0
+
+
+_NEAR_MARGINS = {
+    torch.float32: [8.0, 12.0, 15.0],
+    torch.float64: [10.0, 20.0, 30.0],
+}
+
+
+def _make_inputs(kind, dtype, saturated, n=12, c=4):
+    """Build (logits leaf, targets) for a focal loss.
+
+    ``saturated`` is ``True`` (1 - p_t == 0 on every row), ``False`` (moderate
+    margins) or ``"near"`` (margins that leave 0 < 1 - p_t << 1, down to a few
+    ulps of 1 in the working dtype).
+    """
+    gen = torch.Generator().manual_seed(SEED)
+    if saturated == "near":
+        margins = torch.tensor(_NEAR_MARGINS[dtype], dtype=dtype).repeat(n // 3 + 1)[:n]
+    elif saturated:
+        margins = torch.full((n,), _SATURATION_SCALE, dtype=dtype)
+    else:
+        margins = torch.randn(n, generator=gen, dtype=dtype).abs() + 1.0
+    if kind == "sigmoid":
+        targets = torch.randint(0, 2, (n,), generator=gen).to(dtype)
+        # Push every logit toward its target so p_t -> 1.
+        logits = (margins * (2 * targets - 1)).detach().requires_grad_(True)
+    else:
+        targets = torch.randint(0, c, (n,), generator=gen)
+        logits = torch.randn(n, c, generator=gen, dtype=dtype) * 0.5
+        logits[torch.arange(n), targets] += margins if saturated else 0.0
+        logits = logits.detach().requires_grad_(True)
+    return logits, targets
+
+
+def _make_loss(kind, gamma, **kwargs):
+    if kind == "sigmoid":
+        return SigmoidFocalLoss(alpha=-1, gamma=gamma, **kwargs)
+    return SoftmaxFocalLoss(gamma=gamma, **kwargs)
+
+
+def _inline_modulator(p_t, gamma):
+    return (1 - p_t) ** gamma
+
+
+# Softmax rows have exactly zero cross-entropy at saturation unless smoothed,
+# which would hide a wrong modulator value there.
+_SMOOTHING = {"sigmoid": {}, "softmax": {"label_smoothing": 0.1}}
+
+
+def _assert_matches_inline_reference(fn, logits, targets, monkeypatch, **kwargs):
+    """Loss and grad of ``fn`` equal an inline ``(1 - p_t) ** gamma`` run wherever finite."""
+    loss, grad = _loss_and_grad(fn, logits, targets, **kwargs)
+    monkeypatch.setattr(_focal_module, "_focal_modulator", _inline_modulator)
+    ref_loss, ref_grad = _loss_and_grad(fn, logits, targets, **kwargs)
+    finite = torch.isfinite(ref_loss)
+    assert torch.equal(loss[finite], ref_loss[finite])
+    finite_grad = torch.isfinite(ref_grad)
+    assert torch.equal(grad[finite_grad], ref_grad[finite_grad])
+    assert torch.isfinite(grad).all()
+
+
+def _loss_and_grad(loss_fn, logits, targets, **kwargs):
+    logits = logits.detach().clone().requires_grad_(True)
+    loss = loss_fn(logits, targets, **kwargs)
+    loss.sum().backward()
+    return loss.detach(), logits.grad
+
+
+@pytest.mark.parametrize("kind", ["sigmoid", "softmax"])
+class TestFocalModulatorGuard:
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("gamma", [0.3, 0.5])
+    def test_saturated_grad_finite_and_zero_at_saturation(self, kind, dtype, gamma):
+        logits, targets = _make_inputs(kind, dtype, saturated=True)
+        fn = _make_loss(kind, gamma, reduction="none")
+        loss = fn(logits, targets)
+        loss.sum().backward()
+        assert torch.isfinite(logits.grad).all()
+        if kind == "sigmoid":
+            p_t = torch.sigmoid(logits.detach()) * targets + (1 - torch.sigmoid(logits.detach())) * (1 - targets)
+            saturated = (1 - p_t) <= 0
+            assert saturated.any()
+            assert (logits.grad[saturated] == 0.0).all()
+        else:
+            p_t = torch.softmax(logits.detach(), dim=1).gather(1, targets[:, None]).squeeze(1)
+            saturated = (1 - p_t) <= 0
+            assert saturated.any()
+            assert (logits.grad[saturated] == 0.0).all()
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("saturated", [True, "near", False])
+    @pytest.mark.parametrize("gamma", _GAMMAS)
+    def test_bitwise_identical_to_inline_power(self, kind, dtype, saturated, gamma, monkeypatch):
+        logits, targets = _make_inputs(kind, dtype, saturated)
+        fn = _make_loss(kind, gamma, reduction="none")
+        _assert_matches_inline_reference(fn, logits, targets, monkeypatch)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("saturated", [True, "near"])
+    def test_gamma_zero_saturated_equals_cross_entropy(self, kind, dtype, saturated):
+        logits, targets = _make_inputs(kind, dtype, saturated)
+        fn = _make_loss(kind, 0.0, reduction="none", **_SMOOTHING[kind])
+        loss, grad = _loss_and_grad(fn, logits, targets)
+        ref_logits = logits.detach().clone().requires_grad_(True)
+        if kind == "sigmoid":
+            ref = F.binary_cross_entropy_with_logits(ref_logits, targets, reduction="none")
+        else:
+            ref = F.cross_entropy(
+                ref_logits, targets, reduction="none", label_smoothing=_SMOOTHING[kind]["label_smoothing"]
+            )
+        ref.sum().backward()
+        assert torch.equal(loss, ref.detach())
+        assert torch.equal(grad, ref_logits.grad)
+        if kind == "softmax":
+            # Label smoothing keeps the loss nonzero at saturation, so a wrong
+            # modulator value at gamma == 0 would change it.
+            assert (loss > 0).all()
+
+    def test_half_precision_grad_finite(self, kind):
+        gen = torch.Generator().manual_seed(SEED)
+        if kind == "sigmoid":
+            targets = torch.ones(8, dtype=torch.float16)
+            logits = torch.full((8,), 12.0, dtype=torch.float16)
+        else:
+            targets = torch.zeros(8, dtype=torch.long)
+            logits = torch.zeros(8, 3, dtype=torch.float16)
+            logits[:, 0] = 12.0
+        logits.requires_grad_(True)
+        fn = _make_loss(kind, 0.5, reduction="none")
+        fn(logits, targets).sum().backward()
+        assert torch.isfinite(logits.grad).all()
+
+    def test_sample_weight_saturated_grad_finite(self, kind):
+        weight = torch.rand(12, generator=torch.Generator().manual_seed(SEED)) + 0.1
+        for reduction in _make_loss(kind, 0.5).SUPPORTED_REDUCTIONS:
+            logits, targets = _make_inputs(kind, torch.float32, saturated=True)
+            fn = _make_loss(kind, 0.5, reduction=reduction)
+            fn(logits, targets, sample_weight=weight).sum().backward()
+            assert torch.isfinite(logits.grad).all(), reduction
+
+    def test_nan_logits_still_nan_loss(self, kind):
+        logits, targets = _make_inputs(kind, torch.float32, saturated=False)
+        with torch.no_grad():
+            logits[0] = float("nan")
+        fn = _make_loss(kind, 2.0, reduction="mean")
+        assert torch.isnan(fn(logits, targets))
+
+    def test_zero_element_input_matches_inline_reference(self, kind, monkeypatch):
+        if kind == "sigmoid":
+            logits, targets = torch.zeros(0, requires_grad=True), torch.zeros(0)
+        else:
+            logits, targets = torch.zeros(0, 3, requires_grad=True), torch.zeros(0, dtype=torch.long)
+        fn = _make_loss(kind, 0.5, reduction="sum")
+        out = fn(logits, targets)
+        monkeypatch.setattr(_focal_module, "_focal_modulator", _inline_modulator)
+        ref = fn(logits, targets)
+        assert out.shape == ref.shape
+        assert torch.equal(out, ref)
+
+
+class TestSoftmaxFocalLabelSmoothingIdentity:
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("saturated", [True, "near", False])
+    @pytest.mark.parametrize("gamma", _GAMMAS)
+    @pytest.mark.parametrize("label_smoothing", [0.0, 0.1])
+    def test_bitwise_identical_to_inline_power(
+        self, dtype, saturated, gamma, label_smoothing, monkeypatch
+    ):
+        logits, targets = _make_inputs("softmax", dtype, saturated)
+        fn = SoftmaxFocalLoss(gamma=gamma, reduction="none", label_smoothing=label_smoothing)
+        _assert_matches_inline_reference(fn, logits, targets, monkeypatch)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_gamma_one_smoothed_saturated_grad_is_nonzero(self, dtype):
+        # gamma == 1 keeps its finite, nonzero saturated gradient (not zeroed).
+        logits, targets = _make_inputs("softmax", dtype, saturated=True)
+        fn = SoftmaxFocalLoss(gamma=1, reduction="sum", label_smoothing=0.1)
+        _, grad = _loss_and_grad(fn, logits, targets)
+        assert torch.isfinite(grad).all()
+        assert (grad != 0).any()
+
+
+class TestSoftmaxFocalGuardIgnoreIndex:
+    def test_saturated_rows_with_ignore_index_grad_finite_and_ignored_zero(self):
+        logits, targets = _make_inputs("softmax", torch.float32, saturated=True)
+        targets = targets.clone()
+        targets[::3] = -100
+        fn = SoftmaxFocalLoss(gamma=0.5, reduction="mean")
+        fn(logits, targets).backward()
+        assert torch.isfinite(logits.grad).all()
+        assert (logits.grad[targets == -100] == 0.0).all()
+
+
+@pytest.mark.parametrize("loss_cls", [SigmoidFocalLoss, SoftmaxFocalLoss])
+class TestGammaValidation:
+    @pytest.mark.parametrize("gamma", [-1, -0.5, math.nan, math.inf, -math.inf])
+    def test_invalid_gamma_raises_value_error(self, loss_cls, gamma):
+        with pytest.raises(ValueError, match="gamma"):
+            loss_cls(gamma=gamma)
+
+    @pytest.mark.parametrize("gamma", [0, 0.0, 0.5, 2])
+    def test_valid_gamma_accepted(self, loss_cls, gamma):
+        assert loss_cls(gamma=gamma).gamma == gamma
+
+    def test_gamma_none_raises_type_error(self, loss_cls):
+        with pytest.raises(TypeError):
+            loss_cls(gamma=None)
