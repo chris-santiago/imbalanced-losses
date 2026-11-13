@@ -124,8 +124,8 @@ loss.backward()
 
 **Focal losses** (`SigmoidFocalLoss`, `SoftmaxFocalLoss`):
 - Arbitrary input shapes: `(N, C)`, `(N, C, L)`, `(N, C, H, W)`, …
-- `ignore_index` masking: padded positions contribute zero loss and zero gradient
-- `mean` reduction divides by valid (non-ignored) count, not total tensor size
+- `ignore_index` masking (softmax only): padded positions contribute zero loss and zero gradient
+- `mean` reduction (softmax only) divides by valid (non-ignored) count, not total tensor size; the sigmoid loss has no `ignore_index` and averages over every element
 - `mean_positive` reduction (softmax only): normalizes by positive count for detection tasks
 - `alpha`: scalar (sigmoid) or per-class tensor (softmax) class reweighting
 - `label_smoothing` (softmax only): forwarded directly to `F.cross_entropy`

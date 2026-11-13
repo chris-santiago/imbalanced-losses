@@ -56,6 +56,21 @@ def _resolve_gather(gather_distributed: bool | None) -> bool:
     )
 
 
+def _to_compute_dtype(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Return *logits* in the dtype the ranking losses compute in.
+
+    ``float16`` and ``bfloat16`` become ``float32`` (``torch.quantile`` has
+    no half-precision kernel and half-precision rank sums lose accuracy).
+    Every other dtype, float64 included, is returned as the same tensor
+    object.  The cast is differentiable, so gradient reaches the caller's
+    tensor in its original dtype.
+    """
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        return logits.to(torch.float32)
+    return logits
+
+
 # ---------------------------------------------------------------------------
 # Abstract base class
 # ---------------------------------------------------------------------------
@@ -64,10 +79,13 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     """
     Abstract base for ranking losses that use a memory queue.
 
-    Subclasses implement :meth:`_compute_per_class` (and optionally
-    :meth:`_validate_filtered_targets`); everything else -- validation,
-    DDP gather, queue merge, ignore-index filtering, subsampling,
-    reduction, and ``return_per_class`` -- is handled here.
+    Subclasses implement :meth:`_compute_per_class`; everything else --
+    validation, DDP gather, queue merge, ignore-index filtering,
+    subsampling, reduction, and ``return_per_class`` -- is handled here.
+    The target-range rule lives in :meth:`_validate_filtered_targets`,
+    which subclasses may override; an override that adds checks should
+    call ``super()._validate_filtered_targets(...)`` to keep the range
+    rule.
 
     Parameters
     ----------
@@ -230,20 +248,59 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             least one positive and one negative).
         """
 
-    def _validate_filtered_targets(self, targets: torch.Tensor) -> None:
+    def _validate_filtered_targets(
+        self, targets: torch.Tensor, *, is_live: torch.Tensor | None = None
+    ) -> None:
         """
-        Optional hook called after ignore-index filtering and subsampling,
-        before ``_compute_per_class``.
+        Validate target range on the pooled, ``ignore_index``-filtered rows.
 
-        Default is a no-op.  ``RecallAtQuantileLoss`` overrides this to
-        validate target ranges.
+        Called once per forward, after ignore-index filtering and before
+        ``max_pool_size`` subsampling, so the check sees every live and
+        queued row.  With ``num_classes > 1``, raises ``ValueError`` if
+        any target lies outside ``[0, num_classes)``; such a row would
+        count as a negative for every class.  Queued rows are checked
+        along with the live batch, so a queue restored from a checkpoint
+        saved before this check existed raises until :meth:`reset_queue`
+        drops its rows.  Binary mode is not checked here.
+
+        Overrides that add checks should call
+        ``super()._validate_filtered_targets(targets, is_live=is_live)``
+        to keep this rule, and must accept (and may ignore) ``is_live``.
 
         Parameters
         ----------
         targets : torch.Tensor, shape [M]
-            Filtered targets (no ignore-index values).
+            Filtered targets (no ignore-index values); may be empty.
+        is_live : torch.Tensor, shape [M], dtype=bool, optional
+            True for rows from the current batch, False for queued rows.
+            Selects which remedy the error message names; when omitted,
+            both remedies are named.
         """
-        pass
+        if self.num_classes > 1:
+            is_bad = (targets < 0) | (targets >= self.num_classes)
+            bad = targets[is_bad]
+            if bad.numel() > 0:
+                if is_live is None:
+                    in_live = in_queue = True
+                else:
+                    in_live = bool(is_live[is_bad].any())
+                    in_queue = bool((~is_live[is_bad]).any())
+                remedies = []
+                if in_live:
+                    remedies.append(
+                        "mark rows in the current batch with ignore_index "
+                        "or fix their labels"
+                    )
+                if in_queue:
+                    remedies.append(
+                        "call reset_queue() to drop queued rows restored "
+                        "from an older checkpoint"
+                    )
+                raise ValueError(
+                    f"targets contain class ids outside [0, {self.num_classes}); "
+                    f"examples: {bad[:8].tolist()}. "
+                    + "; ".join(remedies).capitalize() + "."
+                )
 
     # ------------------------------------------------------------------
     # Forward template
@@ -260,6 +317,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute the ranking loss.
+
+        ``float16`` and ``bfloat16`` logits are computed in ``float32`` and
+        the returned loss is ``float32``; gradient reaches the original
+        tensor in its own dtype.  Other dtypes (``float32``, ``float64``)
+        are computed as given.  A supplied ``sample_weight`` follows the
+        compute dtype.
 
         Parameters
         ----------
@@ -294,12 +357,18 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         -------
         loss : torch.Tensor
             Scalar (reduction='mean' or 'sum') or shape [C]
-            (reduction='none').
+            (reduction='none').  When the pool is empty (every row is
+            ``ignore_index``, or a zero-row batch with an empty queue),
+            'none' returns ``nan`` for every class, matching the
+            all-degenerate case; 'mean' and 'sum' return ``0.0`` with a
+            gradient path.
         per_class_loss : torch.Tensor, shape [C]
             Only returned when ``return_per_class=True``.
         valid_classes : torch.Tensor, shape [C], dtype=bool
             Only returned when ``return_per_class=True``.
         """
+        logits = _to_compute_dtype(logits)
+
         # --- shape validation ------------------------------------------------
         if targets.ndim == 2 and targets.size(1) == 1:
             targets = targets.squeeze(1)
@@ -387,6 +456,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         pool = pool.index(valid)
         all_is_live = all_is_live[valid]
 
+        # --- validate the whole pool, before subsampling can hide a row -------
+        self._validate_filtered_targets(pool.targets, is_live=all_is_live)
+
         # --- subsample if pool exceeds max_pool_size -------------------------
         if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
             if not self._subsample_warned:
@@ -405,21 +477,21 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
 
         # --- empty pool check ------------------------------------------------
         if pool.logits.size(0) == 0:
-            out = logits.sum() * 0.0
+            nan_per_class = logits.new_full((self.num_classes,), float("nan"))
             if self.reduction == "none":
-                out = out.expand(self.num_classes)
+                # Same sentinel as a non-empty pool of all-degenerate classes.
+                out = nan_per_class
+            else:
+                out = logits.sum() * 0.0
             if return_per_class:
                 return (
                     out,
-                    logits.new_full((self.num_classes,), float("nan")),
+                    nan_per_class.clone(),
                     torch.zeros(
                         self.num_classes, dtype=torch.bool, device=logits.device
                     ),
                 )
             return out
-
-        # --- subclass validation hook ----------------------------------------
-        self._validate_filtered_targets(pool.targets)
 
         # --- per-class compute -----------------------------------------------
         loss_vec, valid_vec = self._compute_per_class(

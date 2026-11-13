@@ -13,6 +13,8 @@ Lin et al., "Focal Loss for Dense Object Detection", ICCV 2017.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -48,7 +50,8 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
         Weighting factor in [0, 1] to balance positives vs negatives, or -1 to
         ignore. Default: 0.25.
     gamma : float
-        Exponent of the modulating factor (1 - p_t). Default: 2.
+        Exponent of the modulating factor (1 - p_t). Must be finite and
+        >= 0, else ``ValueError``. Default: 2.
     reduction : str
         'none' | 'mean' | 'sum'. Default: 'mean'.  ``'mean_positive'`` is
         softmax-only: there is no background class in the sigmoid
@@ -74,6 +77,7 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
             raise ValueError(
                 f"Invalid alpha value: {alpha}. alpha must be in [0, 1] or -1 for ignore."
             )
+        _check_gamma(gamma)
         self.alpha = alpha
         self.gamma = gamma
         self.reduction = reduction
@@ -133,7 +137,7 @@ class SigmoidFocalLoss(_SampleWeightMixin, nn.Module):
         p = torch.sigmoid(inputs)
         ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
         p_t = p * targets + (1 - p) * (1 - targets)
-        loss = ce_loss * ((1 - p_t) ** self.gamma)
+        loss = ce_loss * _focal_modulator(p_t, self.gamma)
 
         if self.alpha >= 0:
             alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
@@ -166,12 +170,15 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
     Parameters
     ----------
     alpha : Tensor or list[float] or None
-        Per-class weighting factors of shape (C,).  Typically set to the
+        Per-class weighting factors of shape (C,).  Its length must equal
+        the number of classes (``inputs.size(1)``); a mismatch raises
+        ``ValueError`` on the first forward call.  Typically set to the
         inverse class frequency or similar.  ``None`` disables class
         weighting.  When provided, each sample's loss is scaled by
         ``alpha[y]`` where ``y`` is the ground-truth class.
     gamma : float
-        Focusing exponent.  ``gamma=0`` recovers vanilla CE.  Default: 2.0.
+        Focusing exponent.  ``gamma=0`` recovers vanilla CE.  Must be finite
+        and >= 0, else ``ValueError``.  Default: 2.0.
     reduction : str
         'none' | 'mean' | 'mean_positive' | 'sum'.  Default: 'mean'.
 
@@ -216,6 +223,7 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         gather_distributed: bool | None = None,
     ):
         super().__init__()
+        _check_gamma(gamma)
         self.gamma = gamma
         self.reduction = reduction
         self.label_smoothing = label_smoothing
@@ -270,6 +278,12 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         Tensor
             Scalar or per-sample loss depending on ``reduction``.
         """
+        if self.alpha is not None and self.alpha.size(0) != inputs.size(1):
+            raise ValueError(
+                f"alpha has length {self.alpha.size(0)} but inputs has "
+                f"{inputs.size(1)} classes (dim 1); alpha must have one entry per class."
+            )
+
         sample_weight = self._check_sample_weight_like(
             sample_weight, targets, dtype=inputs.dtype
         )
@@ -304,7 +318,7 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         p_t = log_p_t.exp()  # probability assigned to the true class
 
         # ---- 3. Focal modulator: (1 - p_t)^gamma -----------------------------
-        focal_weight = (1.0 - p_t) ** self.gamma
+        focal_weight = _focal_modulator(p_t, self.gamma)
         loss = focal_weight * ce_loss
 
         # ---- 4. Per-class alpha weighting ------------------------------------
@@ -332,6 +346,37 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         if self.reduction == "sum":
             return _reduce_sum(loss, sample_weight)
         raise _invalid_reduction(self.reduction, self.SUPPORTED_REDUCTIONS)
+
+
+# ---------------------------------------------------------------------------
+# Focal modulator and gamma validation
+# ---------------------------------------------------------------------------
+
+def _check_gamma(gamma: float) -> None:
+    """Raise ValueError unless ``gamma`` is finite and >= 0."""
+    if not (math.isfinite(gamma) and gamma >= 0):
+        raise ValueError(
+            f"Invalid gamma value: {gamma}. gamma must be finite and >= 0."
+        )
+
+
+def _focal_modulator(p_t: torch.Tensor, gamma: float) -> torch.Tensor:
+    """``(1 - p_t) ** gamma`` with a finite gradient everywhere.
+
+    Only ``0 < gamma < 1`` has an infinite pow derivative
+    (``gamma * x ** (gamma - 1)``) at ``x == 0``, which autograd turns into NaN
+    when multiplied by a zero upstream factor.  For that range the base is
+    swapped for 1 where ``1 - p_t <= 0`` before the power (so no inf is formed)
+    and the output there is set to the analytic limit 0, with zero gradient.
+    ``gamma == 0`` and ``gamma >= 1`` already have a finite derivative, so
+    they take the plain expression and keep value and gradient unchanged.
+    """
+    base = 1 - p_t
+    if not 0 < gamma < 1:
+        return base ** gamma
+    positive = base > 0
+    safe_base = torch.where(positive, base, torch.ones_like(base))
+    return torch.where(positive, safe_base ** gamma, torch.zeros_like(base))
 
 
 # ---------------------------------------------------------------------------
