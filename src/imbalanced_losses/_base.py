@@ -56,6 +56,21 @@ def _resolve_gather(gather_distributed: bool | None) -> bool:
     )
 
 
+def _to_compute_dtype(logits: torch.Tensor) -> torch.Tensor:
+    """
+    Return *logits* in the dtype the ranking losses compute in.
+
+    ``float16`` and ``bfloat16`` become ``float32`` (``torch.quantile`` has
+    no half-precision kernel and half-precision rank sums lose accuracy).
+    Every other dtype, float64 included, is returned as the same tensor
+    object.  The cast is differentiable, so gradient reaches the caller's
+    tensor in its original dtype.
+    """
+    if logits.dtype in (torch.float16, torch.bfloat16):
+        return logits.to(torch.float32)
+    return logits
+
+
 # ---------------------------------------------------------------------------
 # Abstract base class
 # ---------------------------------------------------------------------------
@@ -261,6 +276,12 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         """
         Compute the ranking loss.
 
+        ``float16`` and ``bfloat16`` logits are computed in ``float32`` and
+        the returned loss is ``float32``; gradient reaches the original
+        tensor in its own dtype.  Other dtypes (``float32``, ``float64``)
+        are computed as given.  A supplied ``sample_weight`` follows the
+        compute dtype.
+
         Parameters
         ----------
         logits : torch.Tensor, shape [N, C]
@@ -300,6 +321,8 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         valid_classes : torch.Tensor, shape [C], dtype=bool
             Only returned when ``return_per_class=True``.
         """
+        logits = _to_compute_dtype(logits)
+
         # --- shape validation ------------------------------------------------
         if targets.ndim == 2 and targets.size(1) == 1:
             targets = targets.squeeze(1)

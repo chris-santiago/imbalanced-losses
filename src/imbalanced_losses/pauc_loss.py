@@ -66,7 +66,7 @@ from typing import Any, Literal
 
 import torch
 
-from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._base import _QueuedRankingLoss, _to_compute_dtype
 from imbalanced_losses._weights import _positive_mass
 
 
@@ -848,6 +848,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         base-class contract (which cannot accept extra return values from
         ``_compute_per_class``).
         """
+        # Half-precision logits are computed in float32; applied here so the
+        # diagnostics below are assembled in the compute dtype.
+        logits = _to_compute_dtype(logits)
+
         # --- squeeze [N,1] targets early so grad_pos_count sees the right shape --
         if targets.ndim == 2 and targets.size(1) == 1:
             targets = targets.squeeze(1)
