@@ -247,18 +247,27 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
 
     def _validate_filtered_targets(self, targets: torch.Tensor) -> None:
         """
-        Optional hook called after ignore-index filtering and subsampling,
-        before ``_compute_per_class``.
+        Validate target range on the pooled, ``ignore_index``-filtered rows.
 
-        Default is a no-op.  ``RecallAtQuantileLoss`` overrides this to
-        validate target ranges.
+        Called once per forward, after ignore-index filtering and before
+        ``max_pool_size`` subsampling, so the check sees every live and
+        queued row.  With ``num_classes > 1``, raises ``ValueError`` if any
+        target lies outside ``[0, num_classes)``; such a row would count as
+        a negative for every class.  Binary mode is not checked here.
+        Subclasses may override this to change the rule.
 
         Parameters
         ----------
         targets : torch.Tensor, shape [M]
-            Filtered targets (no ignore-index values).
+            Filtered targets (no ignore-index values); may be empty.
         """
-        pass
+        if self.num_classes > 1:
+            bad = targets[(targets < 0) | (targets >= self.num_classes)]
+            if bad.numel() > 0:
+                raise ValueError(
+                    f"targets contain class ids outside [0, {self.num_classes}); "
+                    f"examples: {bad[:8].tolist()}"
+                )
 
     # ------------------------------------------------------------------
     # Forward template
@@ -410,6 +419,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         pool = pool.index(valid)
         all_is_live = all_is_live[valid]
 
+        # --- validate the whole pool, before subsampling can hide a row -------
+        self._validate_filtered_targets(pool.targets)
+
         # --- subsample if pool exceeds max_pool_size -------------------------
         if self.max_pool_size is not None and pool.logits.size(0) > self.max_pool_size:
             if not self._subsample_warned:
@@ -440,9 +452,6 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
                     ),
                 )
             return out
-
-        # --- subclass validation hook ----------------------------------------
-        self._validate_filtered_targets(pool.targets)
 
         # --- per-class compute -----------------------------------------------
         loss_vec, valid_vec = self._compute_per_class(

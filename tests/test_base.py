@@ -270,3 +270,142 @@ class TestFullPrecisionUnchanged:
         y = _to_compute_dtype(x)
         assert y.dtype == torch.float32
         assert y is not x
+
+
+def _multiclass_batch(n: int = N):
+    """C=3 batch of ``n`` rows with every target in {0, 1, 2}."""
+    g = torch.Generator().manual_seed(0)
+    return torch.randn(n, 3, generator=g), torch.arange(n) % 3
+
+
+class TestMultiClassTargetRange:
+    @RANKING_LOSSES
+    @pytest.mark.parametrize("bad", [5, 3, -1, 2**62])
+    def test_out_of_range_target_raises(self, loss_name, bad):
+        logits, targets = _multiclass_batch()
+        targets[7] = bad
+        loss = make_loss(loss_name, 3, 0)
+        with pytest.raises(ValueError, match="outside"):
+            loss(logits, targets)
+
+    @RANKING_LOSSES
+    def test_message_keeps_wording_and_examples(self, loss_name):
+        logits, targets = _multiclass_batch()
+        targets[7] = 5
+        loss = make_loss(loss_name, 3, 0)
+        with pytest.raises(
+            ValueError,
+            match=r"targets contain class ids outside \[0, 3\); examples: \[5\]",
+        ):
+            loss(logits, targets)
+
+    @RANKING_LOSSES
+    def test_in_range_targets_do_not_raise(self, loss_name):
+        logits, targets = _multiclass_batch()
+        loss = make_loss(loss_name, 3, 0)
+        assert torch.isfinite(loss(logits, targets))
+
+    @RANKING_LOSSES
+    def test_default_ignore_index_rows_not_flagged(self, loss_name):
+        logits, targets = _multiclass_batch()
+        targets[7] = -100
+        loss = make_loss(loss_name, 3, 0)
+        assert targets[7] == loss.ignore_index
+        loss(logits, targets)
+
+    @RANKING_LOSSES
+    def test_custom_ignore_index_not_flagged_but_default_value_is(self, loss_name):
+        logits, targets = _multiclass_batch()
+        targets[7] = 999
+        loss = make_loss(loss_name, 3, 0, ignore_index=999)
+        loss(logits, targets)
+        # With a custom ignore_index, -100 is an ordinary bad class id.
+        targets[7] = -100
+        with pytest.raises(ValueError, match="outside"):
+            make_loss(loss_name, 3, 0, ignore_index=999)(logits, targets)
+
+    @RANKING_LOSSES
+    def test_binary_mode_warns_and_does_not_raise(self, loss_name):
+        logits, targets = make_batch(1, 0)
+        targets[7] = 2
+        loss = make_loss(loss_name, 1, 0)
+        with pytest.warns(UserWarning, match="expects targets in"):
+            loss(logits, targets)
+
+    @RANKING_LOSSES
+    @pytest.mark.parametrize("max_pool", [20, 2])
+    def test_bad_row_raises_every_time_under_subsampling(self, loss_name, max_pool):
+        n = 200
+        logits, targets = _multiclass_batch(n)
+        targets[137] = 5
+        assert n > max_pool  # the pool really exceeds max_pool_size
+        # The sampler reserves a quota for every observed class, so a lone
+        # bad row survives whenever the reserved set fits in max_pool_size
+        # (max_pool=20). At max_pool=2 the four reserved rows are randomly
+        # truncated to two, so a check that ran after subsampling would miss
+        # the bad row in about half the draws.
+        for _ in range(20):
+            loss = make_loss(loss_name, 3, 0, max_pool_size=max_pool)
+            with pytest.raises(ValueError, match="outside"):
+                loss(logits, targets)
+
+    @RANKING_LOSSES
+    def test_raise_leaves_queue_untouched(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        loss = make_loss(loss_name, 3, 64)
+        loss(logits, targets)
+        queue = loss._queue
+        assert int(queue._q_ptr) == 30  # the clean call really enqueued
+        ptr = queue._q_ptr.clone()
+        q_targets = queue._q_targets.clone()
+        q_logits = queue._q_logits.clone()
+        bad_targets = targets.clone()
+        bad_targets[3] = 5
+        with pytest.raises(ValueError, match="outside"):
+            loss(logits + 1.0, bad_targets)
+        assert torch.equal(queue._q_ptr, ptr)
+        assert torch.equal(queue._q_targets, q_targets)
+        assert torch.equal(queue._q_logits, q_logits)
+
+    @RANKING_LOSSES
+    def test_bad_target_already_in_queue_raises(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        loss = make_loss(loss_name, 3, 64)
+        loss(logits, targets)
+        loss._queue._q_targets[0] = 5
+        with pytest.raises(ValueError, match="outside"):
+            loss(logits, targets)
+
+    @RANKING_LOSSES
+    def test_all_ignored_does_not_raise(self, loss_name):
+        logits, _ = _multiclass_batch()
+        targets = torch.full((N,), -100, dtype=torch.long)
+        make_loss(loss_name, 3, 64)(logits, targets)
+
+    @RANKING_LOSSES
+    def test_float_targets_in_range_do_not_raise(self, loss_name):
+        logits, targets = _multiclass_batch()
+        loss = make_loss(loss_name, 3, 0)
+        loss(logits, targets.float())
+        bad = targets.float()
+        bad[7] = 5.0
+        with pytest.raises(ValueError, match="outside"):
+            make_loss(loss_name, 3, 0)(logits, bad)
+
+    def test_noop_override_skips_check_and_sees_full_pool(self):
+        seen: list[int] = []
+
+        class NoCheck(SmoothAPLoss):
+            def _validate_filtered_targets(self, targets):
+                seen.append(targets.numel())
+
+        n, max_pool = 200, 20
+        logits, targets = _multiclass_batch(n)
+        targets[137] = 5
+        loss = NoCheck(num_classes=3, queue_size=0, max_pool_size=max_pool)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            loss(logits, targets)  # subsampling ran, so the hook ran before it
+        assert seen == [n]
+
+    def test_recall_loss_no_longer_overrides_the_hook(self):
+        assert "_validate_filtered_targets" not in RecallAtQuantileLoss.__dict__

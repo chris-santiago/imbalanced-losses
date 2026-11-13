@@ -297,26 +297,6 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         return (soft_above * w_pos).sum() / w_pos.sum(), True
 
     # ------------------------------------------------------------------
-    # Subclass validation hook
-    # ------------------------------------------------------------------
-
-    def _validate_filtered_targets(self, targets: torch.Tensor) -> None:
-        """
-        Validate target range after ignore-index filtering.
-
-        In multi-class mode (num_classes > 1), checks that all targets
-        are in [0, num_classes) and raises ValueError if any are out of
-        range.
-        """
-        if self.num_classes > 1:
-            bad = targets[(targets < 0) | (targets >= self.num_classes)]
-            if bad.numel() > 0:
-                raise ValueError(
-                    f"targets contain class ids outside [0, {self.num_classes}); "
-                    f"examples: {bad[:8].tolist()}"
-                )
-
-    # ------------------------------------------------------------------
     # Per-class dispatch (required by _QueuedRankingLoss)
     # ------------------------------------------------------------------
 
