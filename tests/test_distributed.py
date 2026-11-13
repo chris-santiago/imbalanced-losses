@@ -8,11 +8,21 @@ a torchrun launcher and is validated by integration testing.
 
 from __future__ import annotations
 
+import os
+import queue as queue_module
+import tempfile
+import time
+import traceback
+from datetime import timedelta
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from imbalanced_losses import (
     PAUCAtBudgetLoss,
@@ -1247,3 +1257,312 @@ class TestPAUCIsLiveDistributed:
             "pool and live must differ when queue holds high-score positives: "
             f"pool={loss_pool.item():.6f}, live={loss_live.item():.6f}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Gradient scaling in all_gather_with_grad (mocked ranks)
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT = object()
+
+
+def _gather_mocked(local, others, scale_grad=_DEFAULT, rank=0, grad_enabled=True):
+    """Run ``all_gather_with_grad`` as *rank* of ``1 + len(others)`` mocked ranks.
+
+    *others* are the other ranks' tensors, placed in rank order around *local*.
+    Returns ``(output, mock)``; the mock lets callers assert the collectives ran.
+    """
+    rank_tensors = list(others)
+    rank_tensors.insert(rank, local)
+    mock = patch.object(dist, "all_gather", side_effect=_make_gather_mock(rank_tensors))
+    with patch.object(dist, "get_world_size", return_value=len(rank_tensors)), \
+         patch.object(dist, "get_rank", return_value=rank), \
+         mock as gather_mock, \
+         torch.set_grad_enabled(grad_enabled):
+        if scale_grad is _DEFAULT:
+            out = all_gather_with_grad(local)
+        else:
+            out = all_gather_with_grad(local, scale_grad)
+    assert gather_mock.call_count == 2, "sizes gather and data gather must both run"
+    return out
+
+
+class TestGatherGradScale:
+    @pytest.fixture(autouse=True)
+    def setup_dist(self):
+        _init_single_process_group()
+        yield
+        _destroy_process_group()
+
+    @pytest.mark.parametrize("scale_grad", [True, False])
+    def test_world_size_one_returns_same_object(self, scale_grad):
+        assert dist.get_world_size() == 1
+        x = torch.randn(6, 3, requires_grad=True)
+        assert all_gather_with_grad(x, scale_grad) is x
+        assert all_gather_with_grad(x, scale_grad=scale_grad) is x
+        out = all_gather_with_grad(x, scale_grad)
+        out.sum().backward()
+        assert torch.equal(x.grad, torch.ones_like(x))
+
+    def test_default_scales_local_grad_by_world_size(self):
+        local = torch.randn(4, 2, requires_grad=True)
+        others = [torch.randn(4, 2), torch.randn(4, 2)]
+        out = _gather_mocked(local, others)
+        out.sum().backward()
+        assert torch.equal(local.grad, torch.full_like(local, 3.0))
+
+    def test_scale_grad_false_keeps_unit_grad(self):
+        local = torch.randn(4, 2, requires_grad=True)
+        out = _gather_mocked(local, [torch.randn(4, 2), torch.randn(4, 2)], scale_grad=False)
+        out.sum().backward()
+        assert torch.equal(local.grad, torch.ones_like(local))
+
+    def test_scale_applies_per_element_with_nonuniform_upstream(self):
+        local = torch.randn(3, 2, requires_grad=True)
+        others = [torch.randn(5, 2), torch.randn(1, 2)]
+        out = _gather_mocked(local, others, rank=1)
+        weights = torch.arange(out.numel(), dtype=out.dtype).reshape(out.shape)
+        (out * weights).sum().backward()
+        # rank 1 owns rows 5..7 of the output
+        assert torch.equal(local.grad, 3.0 * weights[5:8])
+
+    @pytest.mark.parametrize("scale_grad", [True, False])
+    @pytest.mark.parametrize("sizes", [(4, 4, 4), (4, 7, 2)])
+    def test_output_values_equal_concatenation(self, sizes, scale_grad):
+        tensors = [torch.randn(n, 2) for n in sizes]
+        local = tensors[0].clone().requires_grad_(True)
+        out = _gather_mocked(local, tensors[1:], scale_grad=scale_grad)
+        assert torch.equal(out.detach(), torch.cat(tensors, dim=0))
+
+    def test_zero_row_local_rank(self):
+        local = torch.zeros(0, 3, requires_grad=True)
+        out = _gather_mocked(local, [torch.randn(5, 3)])
+        assert out.shape == (5, 3)
+        out.sum().backward()
+        assert local.grad is not None
+        assert local.grad.shape == (0, 3)
+
+    def test_local_without_grad_gathers_and_does_not_require_grad(self):
+        local = torch.randn(4, 2)
+        assert not local.requires_grad
+        out = _gather_mocked(local, [torch.randn(3, 2)])
+        assert not out.requires_grad
+        assert out.shape == (7, 2)
+
+    def test_inside_no_grad(self):
+        local = torch.randn(4, 2, requires_grad=True)
+        out = _gather_mocked(local, [torch.randn(4, 2)], grad_enabled=False)
+        assert out.shape == (8, 2)
+        assert not out.requires_grad
+
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.float16])
+    def test_dtype_preserved(self, dtype):
+        local = torch.randn(4, 2).to(dtype).requires_grad_(True)
+        others = [torch.randn(4, 2).to(dtype)]
+        out = _gather_mocked(local, others)
+        assert out.dtype == dtype
+        out.sum().backward()
+        assert local.grad.dtype == dtype
+        assert torch.equal(local.grad, torch.full_like(local, 2.0))
+
+    @pytest.mark.parametrize("falsy", [0, None])
+    def test_falsy_scale_grad_does_not_scale(self, falsy):
+        local = torch.randn(4, 2, requires_grad=True)
+        out = _gather_mocked(local, [torch.randn(4, 2)], scale_grad=falsy)
+        out.sum().backward()
+        assert torch.equal(local.grad, torch.ones_like(local))
+
+
+# ---------------------------------------------------------------------------
+# Gradient scale in a real two-process gloo group
+# ---------------------------------------------------------------------------
+
+_WORLD = 2
+_RANK_SIZES = (48, 80)
+_FEATURES = 8
+_CLASSES = 3
+_TWO_PROC_TIMEOUT_S = 120
+_FORCE_FAILURE_ENV = "IMBALANCED_LOSSES_TEST_FORCE_FAILURE"  # "raise" or "hang"
+
+
+def _two_proc_data():
+    g = torch.Generator().manual_seed(0)
+    n = sum(_RANK_SIZES)
+    feats = torch.randn(n, _FEATURES, generator=g)
+    y_bin = (torch.rand(n, generator=g) < 0.15).long()
+    y_mc = torch.randint(0, _CLASSES, (n,), generator=g)
+    y_mc[::7] = 0
+    return feats, y_bin, y_mc
+
+
+def _two_proc_model(width):
+    torch.manual_seed(1)
+    return nn.Linear(_FEATURES, width)
+
+
+# name -> (model width, loss factory, (logits, y_bin, y_mc) -> (logits, targets))
+_TWO_PROC_CASES = {
+    "smooth_ap": (
+        1,
+        lambda: SmoothAPLoss(num_classes=1, queue_size=0, temperature=0.5),
+        lambda lo, yb, ym: (lo, yb),
+    ),
+    "sigmoid_focal": (
+        1,
+        lambda: SigmoidFocalLoss(reduction="mean"),
+        lambda lo, yb, ym: (lo, yb.float().unsqueeze(1)),
+    ),
+    "softmax_focal": (
+        _CLASSES,
+        lambda: SoftmaxFocalLoss(reduction="mean_positive"),
+        lambda lo, yb, ym: (lo, ym),
+    ),
+}
+
+
+def _two_proc_worker(rank, init_file, result_queue):
+    """Spawned entry point. Always reports back, with a traceback on failure."""
+    try:
+        forced = os.environ.get(_FORCE_FAILURE_ENV)
+        if forced == "raise":
+            raise RuntimeError("forced worker failure")
+        if forced == "hang":
+            time.sleep(3600)
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{init_file}",
+            rank=rank,
+            world_size=_WORLD,
+            timeout=timedelta(seconds=60),
+        )
+        feats, y_bin, y_mc = _two_proc_data()
+        start = sum(_RANK_SIZES[:rank])
+        sl = slice(start, start + _RANK_SIZES[rank])
+        result = {}
+        for name, (width, make, prep) in _TWO_PROC_CASES.items():
+            # default gathering inside the loss, gradient reduced by DDP
+            model = DistributedDataParallel(_two_proc_model(width))
+            loss = make()(*prep(model(feats[sl]), y_bin[sl], y_mc[sl]))
+            loss.backward()
+            default_grad = model.module.weight.grad.clone()
+
+            # manual gathering without scaling (the former 1/world_size behavior)
+            model = DistributedDataParallel(_two_proc_model(width))
+            fn = make()
+            fn.gather_distributed = False
+            logits, targets = prep(model(feats[sl]), y_bin[sl], y_mc[sl])
+            unscaled_loss = fn(
+                all_gather_with_grad(logits, scale_grad=False),
+                all_gather_no_grad(targets),
+            )
+            unscaled_loss.backward()
+            unscaled_grad = model.module.weight.grad.clone()
+
+            result[name] = {
+                "default_grad": default_grad,
+                "unscaled_grad": unscaled_grad,
+                "default_loss": loss.detach(),
+                "unscaled_loss": unscaled_loss.detach(),
+            }
+        result_queue.put((rank, "ok", result))
+    except BaseException:
+        result_queue.put((rank, "error", traceback.format_exc()))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _run_two_process_group(timeout_s=_TWO_PROC_TIMEOUT_S):
+    """Spawn the group and return ``{rank: result}``; fail on error or timeout.
+
+    Children are always joined, and terminated first when the run failed.
+    """
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    with tempfile.TemporaryDirectory() as tmp:
+        procs = [
+            ctx.Process(
+                target=_two_proc_worker,
+                args=(r, os.path.join(tmp, "rendezvous"), result_queue),
+            )
+            for r in range(_WORLD)
+        ]
+        for p in procs:
+            p.start()
+        results = {}
+        completed = False
+        try:
+            for _ in range(_WORLD):
+                try:
+                    rank, status, payload = result_queue.get(timeout=timeout_s)
+                except queue_module.Empty:
+                    pytest.fail(f"two-process group gave no result within {timeout_s}s")
+                if status != "ok":
+                    pytest.fail(f"worker {rank} raised:\n{payload}")
+                results[rank] = payload
+            completed = True
+        finally:
+            for p in procs:
+                if completed:
+                    p.join(timeout=3)
+                if p.is_alive():
+                    p.terminate()
+                    p.join()
+    return results
+
+
+@pytest.fixture(scope="module")
+def two_process_results():
+    if not (dist.is_available() and dist.is_gloo_available()):
+        pytest.skip("torch.distributed with gloo is unavailable")
+    return _run_two_process_group()
+
+
+def _single_process_reference(name):
+    feats, y_bin, y_mc = _two_proc_data()
+    width, make, prep = _TWO_PROC_CASES[name]
+    model = _two_proc_model(width)
+    fn = make()
+    fn.gather_distributed = False
+    loss = fn(*prep(model(feats), y_bin, y_mc))
+    loss.backward()
+    return loss.detach(), model.weight.grad.clone()
+
+
+class TestTwoProcessGradientScale:
+    @pytest.mark.parametrize("name", list(_TWO_PROC_CASES))
+    def test_default_gather_matches_single_process_gradient(self, two_process_results, name):
+        _, ref_grad = _single_process_reference(name)
+        for rank, result in two_process_results.items():
+            grad = result[name]["default_grad"]
+            rel = ((grad - ref_grad).norm() / ref_grad.norm()).item()
+            assert rel < 1e-6, f"rank {rank}: relative gradient error {rel:.3e}"
+
+    @pytest.mark.parametrize("name", list(_TWO_PROC_CASES))
+    def test_unscaled_gather_gives_half_gradient(self, two_process_results, name):
+        _, ref_grad = _single_process_reference(name)
+        for rank, result in two_process_results.items():
+            grad = result[name]["unscaled_grad"]
+            ratio = (grad.norm() / ref_grad.norm()).item()
+            assert abs(ratio - 0.5) < 1e-6, f"rank {rank}: ratio {ratio:.8f}"
+
+    @pytest.mark.parametrize("name", list(_TWO_PROC_CASES))
+    def test_loss_value_unchanged_by_scaling(self, two_process_results, name):
+        for result in two_process_results.values():
+            assert torch.equal(result[name]["default_loss"], result[name]["unscaled_loss"])
+
+
+class TestTwoProcessFailureModes:
+    def test_worker_error_fails_fast(self, monkeypatch):
+        """A worker that raises is reported as a failure, not a hang."""
+        monkeypatch.setenv(_FORCE_FAILURE_ENV, "raise")
+        with pytest.raises(pytest.fail.Exception, match="raised"):
+            _run_two_process_group()
+
+    def test_worker_hang_times_out(self, monkeypatch):
+        """A hung worker fails the launcher at its timeout and is terminated."""
+        monkeypatch.setenv(_FORCE_FAILURE_ENV, "hang")
+        with pytest.raises(pytest.fail.Exception, match="no result within 1s"):
+            _run_two_process_group(timeout_s=1)
+        assert mp.active_children() == []
