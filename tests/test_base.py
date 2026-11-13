@@ -1135,3 +1135,319 @@ class TestFullPoolThresholds:
         hits = [w for w in rec if "near-zero" in str(w.message)]
         assert len(hits) == 1
         assert not os.path.abspath(hits[0].filename).startswith(package_dir)
+
+
+# ---------------------------------------------------------------------------
+# Only non-ignored rows are enqueued
+# ---------------------------------------------------------------------------
+
+IGNORE = -100
+
+
+def _padded_batch(n, n_valid, seed, num_classes=3, first_id=0):
+    """Batch of ``n`` rows, ``n_valid`` of them valid, at random positions.
+
+    Every row's first logit is a unique id (``first_id`` + row index) so a
+    stored row can be traced back to the batch row it came from.
+    Returns ``(logits, targets)``.
+    """
+    g = torch.Generator().manual_seed(seed)
+    logits = torch.randn(n, num_classes, generator=g)
+    logits[:, 0] = torch.arange(first_id, first_id + n, dtype=torch.float32)
+    targets = torch.full((n,), IGNORE, dtype=torch.long)
+    keep = torch.randperm(n, generator=g)[:n_valid].sort().values
+    targets[keep] = torch.arange(n_valid) % num_classes
+    return logits, targets
+
+
+def _queued(loss_name, queue_size, **kwargs):
+    loss = make_loss(loss_name, 3, queue_size, **kwargs)
+    loss.train()
+    return loss
+
+
+def _forward(loss, logits, targets, **kwargs):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return loss(logits, targets, **kwargs)
+
+
+def _ptr(loss):
+    return int(loss._queue._q_ptr)
+
+
+class TestEnqueueSkipsIgnoredRows:
+    @RANKING_LOSSES
+    def test_padded_batches_leave_only_valid_rows_and_pointer_counts_them(self, loss_name):
+        loss = _queued(loss_name, 1024)
+        for step in range(8):
+            _forward(loss, *_padded_batch(256, 26, seed=step, first_id=256 * step))
+        stored = loss._queue._q_targets
+        assert int((stored != IGNORE).sum()) == 208
+        assert _ptr(loss) == 208
+        assert bool((stored[:208] != IGNORE).all())
+        assert bool((stored[208:] == IGNORE).all())
+
+    @RANKING_LOSSES
+    def test_padded_batches_eventually_fill_the_whole_queue_with_valid_rows(self, loss_name):
+        loss = _queued(loss_name, 1024)
+        for step in range(40):
+            _forward(loss, *_padded_batch(256, 26, seed=step, first_id=256 * step))
+        assert bool((loss._queue._q_targets != IGNORE).all())
+
+    @RANKING_LOSSES
+    def test_batch_without_ignored_rows_is_enqueued_whole_and_in_order(self, loss_name):
+        logits, targets = make_batch(3, 0)
+        loss = _queued(loss_name, 200)
+        _forward(loss, logits, targets)
+        assert _ptr(loss) == N
+        assert torch.equal(loss._queue._q_logits[:N], logits)
+        assert torch.equal(loss._queue._q_targets[:N], targets)
+        _forward(loss, logits, targets)
+        assert _ptr(loss) == 2 * N
+
+    @RANKING_LOSSES
+    def test_overflow_keeps_the_last_queue_size_valid_rows_in_order(self, loss_name):
+        logits, targets = _padded_batch(120, 100, seed=1)
+        loss = _queued(loss_name, 64)
+        _forward(loss, logits, targets)
+        valid = targets != IGNORE
+        assert _ptr(loss) == 0
+        assert torch.equal(loss._queue._q_logits, logits[valid][-64:])
+        assert torch.equal(loss._queue._q_targets, targets[valid][-64:])
+
+    @RANKING_LOSSES
+    def test_valid_rows_equal_to_queue_size_replace_the_queue_wholesale(self, loss_name):
+        loss = _queued(loss_name, 64)
+        _forward(loss, *_padded_batch(40, 30, seed=2, first_id=1000))
+        assert _ptr(loss) == 30
+        logits, targets = _padded_batch(90, 64, seed=3)
+        _forward(loss, logits, targets)
+        valid = targets != IGNORE
+        assert _ptr(loss) == 0
+        assert torch.equal(loss._queue._q_logits, logits[valid])
+        assert torch.equal(loss._queue._q_targets, targets[valid])
+
+    @RANKING_LOSSES
+    def test_wrap_around_pointer_and_order_use_valid_rows_only(self, loss_name):
+        loss = _queued(loss_name, 10)
+        stream = []
+        for step in range(3):
+            logits, targets = _padded_batch(9, 4, seed=step, first_id=100 * step)
+            _forward(loss, logits, targets)
+            stream.append(logits[targets != IGNORE])
+        stream = torch.cat(stream)
+        assert stream.size(0) == 12
+        assert _ptr(loss) == 2
+        expected = torch.cat([stream[10:], stream[2:10]])
+        assert torch.equal(loss._queue._q_logits, expected)
+
+    @RANKING_LOSSES
+    def test_all_ignored_batch_leaves_a_filled_queue_untouched(self, loss_name):
+        loss = _queued(loss_name, 64)
+        _forward(loss, *_padded_batch(40, 30, seed=4))
+        before = {k: v.clone() for k, v in loss._queue.state_dict().items()}
+        logits, _ = _padded_batch(20, 0, seed=5, first_id=500)
+        _forward(loss, logits, torch.full((20,), IGNORE))
+        after = loss._queue.state_dict()
+        assert before.keys() == after.keys()
+        assert all(torch.equal(before[k], after[k]) for k in before)
+        assert _ptr(loss) == 30
+
+    @RANKING_LOSSES
+    def test_zero_row_batch_leaves_a_filled_queue_untouched(self, loss_name):
+        loss = _queued(loss_name, 64)
+        _forward(loss, *_padded_batch(40, 30, seed=6))
+        before = {k: v.clone() for k, v in loss._queue.state_dict().items()}
+        _forward(loss, torch.zeros(0, 3), torch.zeros(0, dtype=torch.long))
+        after = loss._queue.state_dict()
+        assert all(torch.equal(before[k], after[k]) for k in before)
+        assert _ptr(loss) == 30
+
+    @RANKING_LOSSES
+    def test_stored_weights_align_with_stored_targets(self, loss_name):
+        logits, targets = _padded_batch(60, 30, seed=7)
+        g = torch.Generator().manual_seed(70)
+        weight = torch.rand(60, generator=g) + 0.5
+        loss = _queued(loss_name, 64)
+        _forward(loss, logits, targets, sample_weight=weight)
+        valid = targets != IGNORE
+        assert _ptr(loss) == 30
+        assert torch.equal(loss._queue._q_weight[:30], weight[valid])
+        assert torch.equal(loss._queue._q_logits[:30], logits[valid])
+        assert loss._queue.has_weights
+
+    @RANKING_LOSSES
+    def test_a_non_unit_weight_on_an_ignored_row_is_never_stored(self, loss_name):
+        logits, targets = _padded_batch(60, 30, seed=8)
+        weight = torch.ones(60)
+        weight[int((targets == IGNORE).nonzero()[0])] = 5.0
+        loss = _queued(loss_name, 64)
+        _forward(loss, logits, targets, sample_weight=weight)
+        assert not loss._queue.has_weights
+        assert bool((loss._queue._q_weight == 1).all())
+
+    @RANKING_LOSSES
+    def test_stored_iid_flags_align_with_stored_targets(self, loss_name):
+        logits, targets = _padded_batch(60, 30, seed=9)
+        g = torch.Generator().manual_seed(90)
+        iid = torch.rand(60, generator=g) < 0.5
+        loss = _queued(loss_name, 64)
+        _forward(loss, logits, targets, iid_mask=iid)
+        valid = targets != IGNORE
+        assert torch.equal(loss._queue._q_iid[:30], iid[valid])
+        assert torch.equal(loss._queue._q_logits[:30], logits[valid])
+
+    @RANKING_LOSSES
+    def test_eval_mode_enqueues_only_when_update_queue_in_eval(self, loss_name):
+        logits, targets = _padded_batch(60, 30, seed=10)
+        idle = _queued(loss_name, 64).eval()
+        _forward(idle, logits, targets)
+        assert _ptr(idle) == 0
+        assert bool((idle._queue._q_targets == IGNORE).all())
+
+        updating = _queued(loss_name, 64, update_queue_in_eval=True).eval()
+        _forward(updating, logits, targets)
+        assert _ptr(updating) == 30
+        assert torch.equal(updating._queue._q_targets[:30], targets[targets != IGNORE])
+
+    @RANKING_LOSSES
+    def test_custom_ignore_index_rows_are_not_enqueued(self, loss_name):
+        logits, targets = _padded_batch(60, 30, seed=11)
+        targets[targets == IGNORE] = 999
+        loss = _queued(loss_name, 64, ignore_index=999)
+        _forward(loss, logits, targets)
+        assert _ptr(loss) == 30
+        assert bool((loss._queue._q_targets[:30] != 999).all())
+        assert bool((loss._queue._q_targets[:30] != IGNORE).all())
+
+    @RANKING_LOSSES
+    def test_forced_gather_in_a_single_process_stores_the_same_rows(
+        self, loss_name, single_process_group
+    ):
+        logits, targets = _padded_batch(60, 30, seed=12)
+        plain = _queued(loss_name, 64)
+        gathered = _queued(loss_name, 64)
+        gathered._gather_resolved = True
+        _forward(plain, logits, targets)
+        _forward(gathered, logits, targets)
+        for key, value in plain._queue.state_dict().items():
+            assert torch.equal(value, gathered._queue.state_dict()[key]), key
+        assert _ptr(gathered) == 30
+
+    @RANKING_LOSSES
+    def test_baseline_checkpoint_with_ignored_slots_loads_and_scores_as_empty_slots(
+        self, loss_name
+    ):
+        # A baseline checkpoint stores ignored rows (with their logits) in the
+        # queue buffers. They are filtered at merge, so the next loss must
+        # equal the loss with those slots empty.
+        g = torch.Generator().manual_seed(13)
+        q_logits = torch.randn(32, 3, generator=g)
+        q_targets = torch.arange(32) % 3
+        q_targets[::4] = IGNORE
+        state = {
+            "_q_logits": q_logits,
+            "_q_targets": q_targets,
+            "_q_ptr": torch.tensor([20]),
+            "_q_iid": torch.ones(32, dtype=torch.bool),
+            "_q_weight": torch.ones(32),
+        }
+        emptied = {k: v.clone() for k, v in state.items()}
+        emptied["_q_logits"][q_targets == IGNORE] = 0.0
+
+        live = make_batch(3, 14)
+        results = []
+        for buffers in (state, emptied):
+            loss = _queued(loss_name, 32)
+            loss._queue.load_state_dict(buffers)
+            results.append(_forward(loss, *live))
+        assert torch.isfinite(results[0])
+        assert torch.equal(results[0], results[1])
+
+
+class TestGoldenFixtureCompare:
+    @pytest.fixture
+    def golden(self):
+        import _golden_sample_weight as golden
+
+        return golden
+
+    @pytest.fixture
+    def new_fixture(self, golden):
+        return torch.load(golden.FIXTURE_PATH, weights_only=True)
+
+    def _run_compare(self, golden, old_fixture, tmp_path):
+        import subprocess
+        import sys
+
+        old_path = tmp_path / "old.pt"
+        torch.save(old_fixture, old_path)
+        return subprocess.run(
+            [sys.executable, golden.__file__, "--compare", str(old_path)],
+            capture_output=True,
+            text=True,
+        )
+
+    def test_allowed_set_is_the_step_2_entries_of_the_queue_size_64_configs(self, golden):
+        allowed = golden.allowed_to_differ()
+        configs = [c for c in golden.build_grid() if c.loss_kwargs.get("queue_size") == 64]
+        assert len(configs) == 10
+        assert len(allowed) == 10 * 2 * 3
+        assert all("|step=2|" in k and "queue_size=64" in k for k in allowed)
+
+    def test_perturbing_an_allowed_key_passes_and_is_reported(
+        self, golden, new_fixture, tmp_path
+    ):
+        key = sorted(golden.allowed_to_differ())[0]
+        old = dict(new_fixture)
+        old[key] = new_fixture[key] + 1.0
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert f"differs: {key}" in result.stdout
+
+    def test_identical_fixtures_pass(self, golden, new_fixture, tmp_path):
+        result = self._run_compare(golden, dict(new_fixture), tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert "0 tensor(s) differ" in result.stdout
+
+    @pytest.mark.parametrize("step", ["0", "1"])
+    def test_perturbing_a_disallowed_key_fails_and_names_it(
+        self, golden, new_fixture, tmp_path, step
+    ):
+        allowed = golden.allowed_to_differ()
+        key = next(
+            k for k in sorted(new_fixture)
+            if "queue_size=64" in k and f"|step={step}|" in k and k.endswith("|loss")
+        )
+        assert key not in allowed
+        old = dict(new_fixture)
+        old[key] = new_fixture[key] + 1.0
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert key in result.stderr
+
+    def test_a_queue_size_0_step_2_key_is_not_allowed(self, golden, new_fixture, tmp_path):
+        key = next(
+            k for k in sorted(new_fixture)
+            if "queue_size=0" in k and "|step=2|" in k and k.endswith("|grad")
+        )
+        old = dict(new_fixture)
+        old[key] = new_fixture[key] + 1.0
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert key in result.stderr
+
+    def test_a_missing_key_fails(self, golden, new_fixture, tmp_path):
+        key = sorted(golden.allowed_to_differ())[0]
+        old = {k: v for k, v in new_fixture.items() if k != key}
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert key in result.stderr
+
+    def test_an_extra_key_fails(self, golden, new_fixture, tmp_path):
+        old = dict(new_fixture)
+        old["extra|dtype=float32|step=0|loss"] = torch.zeros(())
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert "extra|dtype=float32|step=0|loss" in result.stderr

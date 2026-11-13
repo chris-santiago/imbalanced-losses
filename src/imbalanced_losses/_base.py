@@ -538,8 +538,18 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         )
 
         # --- enqueue live-batch (post-gather; runs before next merge) ---------
+        # Only rows the loss can use are stored: ignore_index rows would
+        # occupy queue slots that merge() filters out again. The mask depends
+        # only on the gathered targets, so every DDP rank enqueues the same
+        # rows. A batch with nothing to store is a no-op in enqueue().
         if self._should_update_queue():
-            self._queue.enqueue(logits, targets, is_iid=live_iid, sample_weight=sample_weight)
+            keep = targets != self.ignore_index
+            self._queue.enqueue(
+                logits[keep],
+                targets[keep],
+                is_iid=live_iid[keep],
+                sample_weight=None if sample_weight is None else sample_weight[keep],
+            )
 
         # --- reduction -------------------------------------------------------
         if self.reduction == "none":
