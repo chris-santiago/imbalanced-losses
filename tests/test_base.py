@@ -103,12 +103,14 @@ class TestHalfPrecisionLogits:
     ):
         loss_h = make_loss(loss_name, num_classes, queue_size, reduction="none")
         loss_f = make_loss(loss_name, num_classes, queue_size, reduction="none")
-        logits_h, targets = make_batch(num_classes, 0, half)
-        out = loss_h(logits_h, targets)
-        ref = loss_f(logits_h.float(), targets)
-        assert out.dtype == torch.float32
-        assert out.shape == (num_classes,)
-        torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
+        # A second step reaches the queue-merge path when queue_size > 0.
+        for seed in (0, 1):
+            logits_h, targets = make_batch(num_classes, seed, half)
+            out = loss_h(logits_h, targets)
+            ref = loss_f(logits_h.float(), targets)
+            assert out.dtype == torch.float32
+            assert out.shape == (num_classes,)
+            torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
 
     @RANKING_LOSSES
     @pytest.mark.parametrize(
@@ -122,12 +124,18 @@ class TestHalfPrecisionLogits:
         loss_u = make_loss(loss_name, 1, 64)
         logits_h, targets = make_batch(1, 0, torch.float16)
         weight = torch.linspace(0.25, 4.0, N).to(weight_dtype)
-        out = loss_h(logits_h, targets, sample_weight=weight)
+        leaf = _leaf(logits_h)
+        out = loss_h(leaf, targets, sample_weight=weight)
         ref = loss_f(logits_h.float(), targets, sample_weight=weight)
         unweighted = loss_u(logits_h.float(), targets)
         assert out.dtype == torch.float32
         assert torch.equal(out, ref)
         assert not torch.equal(out, unweighted)
+        out.backward()
+        assert leaf.grad is not None
+        assert leaf.grad.dtype == torch.float16
+        assert torch.isfinite(leaf.grad).all()
+        assert leaf.grad.abs().sum() > 0
 
     @HALF_DTYPES
     def test_pauc_iid_mask(self, half):
@@ -149,8 +157,9 @@ class TestHalfPrecisionLogits:
         loss_h = make_loss("pauc_at_budget", num_classes, 64)
         loss_f = make_loss("pauc_at_budget", num_classes, 64)
         logits_h, targets = make_batch(num_classes, 0, half)
+        leaf = _leaf(logits_h)
         loss, per_class, valid, stats = loss_h(
-            logits_h, targets, return_per_class=True, return_diagnostics=True
+            leaf, targets, return_per_class=True, return_diagnostics=True
         )
         ref_loss, ref_pc, ref_valid, ref_stats = loss_f(
             logits_h.float(), targets, return_per_class=True, return_diagnostics=True
@@ -163,6 +172,11 @@ class TestHalfPrecisionLogits:
             assert stats[key].dtype == torch.int64, key
         assert torch.equal(loss, ref_loss)
         assert torch.equal(valid, ref_valid)
+        loss.backward()
+        assert leaf.grad is not None
+        assert leaf.grad.dtype == half
+        assert torch.isfinite(leaf.grad).all()
+        assert leaf.grad.abs().sum() > 0
         torch.testing.assert_close(per_class, ref_pc, rtol=0, atol=0, equal_nan=True)
         for key, value in stats.items():
             torch.testing.assert_close(
@@ -171,15 +185,29 @@ class TestHalfPrecisionLogits:
 
     @RANKING_LOSSES
     @HALF_DTYPES
-    def test_inf_and_nan_logits_match_float32_cast(self, loss_name, half):
+    def test_inf_logits_match_float32_cast(self, loss_name, half):
         logits_h, targets = make_batch(1, 0, half)
         logits_h[3, 0] = float("inf")
         logits_h[7, 0] = float("-inf")
+        out = make_loss(loss_name, 1, 64)(logits_h, targets)
+        ref = make_loss(loss_name, 1, 64)(logits_h.float(), targets)
+        assert out.dtype == torch.float32
+        # Finite, so the equality below is a real value comparison, not NaN vs NaN.
+        assert torch.isfinite(ref)
+        assert torch.equal(out, ref)
+        # The inf rows matter: zeroing them would change the loss.
+        zeroed = logits_h.clone()
+        zeroed[3, 0] = 0.0
+        zeroed[7, 0] = 0.0
+        assert not torch.equal(make_loss(loss_name, 1, 64)(zeroed, targets), ref)
+
+    @RANKING_LOSSES
+    @HALF_DTYPES
+    def test_nan_logits_match_float32_cast(self, loss_name, half):
+        logits_h, targets = make_batch(1, 0, half)
         logits_h[11, 0] = float("nan")
-        loss_h = make_loss(loss_name, 1, 64)
-        loss_f = make_loss(loss_name, 1, 64)
-        out = loss_h(logits_h, targets)
-        ref = loss_f(logits_h.float(), targets)
+        out = make_loss(loss_name, 1, 64)(logits_h, targets)
+        ref = make_loss(loss_name, 1, 64)(logits_h.float(), targets)
         assert out.dtype == torch.float32
         torch.testing.assert_close(out, ref, rtol=0, atol=0, equal_nan=True)
 
@@ -443,6 +471,7 @@ class TestEmptyPoolSentinel:
         # Reference: a non-empty pool with no positives, so every class is degenerate.
         loss = make_loss(loss_name, num_classes, 0, reduction="none")
         logits, _ = self._empty_batch(num_classes)
+        logits = _leaf(logits)  # leaf, so requires_grad can differ between the two
         targets = torch.zeros(8, dtype=torch.long)
         ref = loss(logits, targets)
         empty = make_loss(loss_name, num_classes, 0, reduction="none")(
@@ -452,7 +481,10 @@ class TestEmptyPoolSentinel:
         assert torch.isnan(empty).all()
         assert empty.shape == ref.shape
         assert empty.dtype == ref.dtype
-        assert empty.requires_grad == ref.requires_grad
+        # Logits are a leaf requiring grad, so a result that kept a path to them
+        # would report True. (ref may carry a path through masked_fill; the
+        # sentinel itself is a constant.)
+        assert empty.requires_grad is False
 
     @RANKING_LOSSES
     @NUM_CLASSES
@@ -526,12 +558,13 @@ class TestEmptyPoolSentinel:
         weight = torch.linspace(0.5, 2.0, 8)
         none = make_loss(loss_name, num_classes, 0, reduction="none")
         self._assert_nan_vec(none(logits, targets, sample_weight=weight), num_classes)
-        mean = make_loss(loss_name, num_classes, 0, reduction="mean")
-        leaf = _leaf(logits)
-        out = mean(leaf, targets, sample_weight=weight)
-        assert out.item() == 0.0
-        out.backward()
-        assert (leaf.grad == 0).all()
+        for reduction in ("mean", "sum"):
+            loss = make_loss(loss_name, num_classes, 0, reduction=reduction)
+            leaf = _leaf(logits)
+            out = loss(leaf, targets, sample_weight=weight)
+            assert out.item() == 0.0
+            out.backward()
+            assert (leaf.grad == 0).all()
 
     @NUM_CLASSES
     def test_pauc_diagnostics_on_empty_pool(self, num_classes):
@@ -588,3 +621,19 @@ class TestEmptyPoolSentinel:
         expected = ref(q_logits, q_targets)
         torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
         assert not torch.isnan(out).all()
+
+
+class TestQueuedBadTargetIsActionable:
+    @RANKING_LOSSES
+    def test_error_names_reset_queue_and_reset_clears_it(self, loss_name):
+        logits, targets = _multiclass_batch(30)
+        loss = make_loss(loss_name, 3, 64)
+        loss(logits, targets)
+        loss._queue._q_targets[0] = 5  # as if restored from an older checkpoint
+        with pytest.raises(ValueError, match="outside") as excinfo:
+            loss(logits, targets)
+        message = str(excinfo.value)
+        assert "reset_queue" in message
+        assert "examples: [5]" in message
+        loss.reset_queue()
+        assert torch.isfinite(loss(logits, targets))

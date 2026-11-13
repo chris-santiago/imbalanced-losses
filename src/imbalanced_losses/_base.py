@@ -253,7 +253,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         ``max_pool_size`` subsampling, so the check sees every live and
         queued row.  With ``num_classes > 1``, raises ``ValueError`` if any
         target lies outside ``[0, num_classes)``; such a row would count as
-        a negative for every class.  Binary mode is not checked here.
+        a negative for every class.  Queued rows are checked along with the
+        live batch, so a queue restored from a checkpoint saved before this
+        check existed raises until :meth:`reset_queue` drops its rows.  Binary mode is not checked here.
         Subclasses may override this to change the rule.
 
         Parameters
@@ -266,7 +268,9 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
             if bad.numel() > 0:
                 raise ValueError(
                     f"targets contain class ids outside [0, {self.num_classes}); "
-                    f"examples: {bad[:8].tolist()}"
+                    f"examples: {bad[:8].tolist()}. Queued rows are checked too; "
+                    f"call reset_queue() to drop rows restored from an older "
+                    f"checkpoint."
                 )
 
     # ------------------------------------------------------------------

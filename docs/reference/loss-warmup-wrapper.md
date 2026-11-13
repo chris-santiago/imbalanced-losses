@@ -117,7 +117,7 @@ Temperature decays geometrically from `temp_start` to `temp_end` over `temp_deca
 temp(t) = temp_start * (temp_end / temp_start) ^ min(1, elapsed / temp_decay_steps)
 ```
 
-The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end` once `temp_decay_steps` steps have elapsed. The clock starts at the first main-phase batch, not at training epoch 0. With no warmup (`warmup_epochs=0` or `warmup_steps=0`) there is no phase switch to latch, so the clock starts at global step 0: elapsed steps are measured from 0, not from the first `global_step` the wrapper is passed.
+The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end` once `temp_decay_steps` steps have elapsed. The clock starts at the first main-phase batch, not at training epoch 0. With no warmup configured (`warmup_epochs=0` in epoch mode, or `warmup_steps=0` in step mode) there is no phase switch to latch, so the clock starts at global step 0: elapsed steps are measured from 0, not from the first `global_step` the wrapper is passed.
 
 ## Checkpointing and resume
 
