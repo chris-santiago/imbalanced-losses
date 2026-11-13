@@ -170,7 +170,9 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
     Parameters
     ----------
     alpha : Tensor or list[float] or None
-        Per-class weighting factors of shape (C,).  Typically set to the
+        Per-class weighting factors of shape (C,).  Its length must equal
+        the number of classes (``inputs.size(1)``); a mismatch raises
+        ``ValueError`` on the first forward call.  Typically set to the
         inverse class frequency or similar.  ``None`` disables class
         weighting.  When provided, each sample's loss is scaled by
         ``alpha[y]`` where ``y`` is the ground-truth class.
@@ -276,6 +278,12 @@ class SoftmaxFocalLoss(_SampleWeightMixin, nn.Module):
         Tensor
             Scalar or per-sample loss depending on ``reduction``.
         """
+        if self.alpha is not None and self.alpha.size(0) != inputs.size(1):
+            raise ValueError(
+                f"alpha has length {self.alpha.size(0)} but inputs has "
+                f"{inputs.size(1)} classes (dim 1); alpha must have one entry per class."
+            )
+
         sample_weight = self._check_sample_weight_like(
             sample_weight, targets, dtype=inputs.dtype
         )

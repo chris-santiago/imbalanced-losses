@@ -1742,3 +1742,81 @@ class TestGammaValidation:
     def test_gamma_none_raises_type_error(self, loss_cls):
         with pytest.raises(TypeError):
             loss_cls(gamma=None)
+
+
+class TestSoftmaxFocalAlphaLength:
+    C = 4
+
+    def _data(self, shape=(8,), seed=0):
+        g = torch.Generator().manual_seed(seed)
+        logits = torch.randn(shape[0], self.C, *shape[1:], generator=g)
+        targets = torch.randint(0, self.C, shape, generator=g)
+        return logits, targets
+
+    def test_correct_length_matches_per_class_scaling(self):
+        logits, targets = self._data()
+        alpha = torch.tensor([0.1, 0.4, 0.7, 0.9])
+        got = SoftmaxFocalLoss(alpha=alpha, reduction="none")(logits, targets)
+        base = SoftmaxFocalLoss(reduction="none")(logits, targets)
+        assert torch.equal(got, alpha[targets] * base)
+
+    @pytest.mark.parametrize("length", [0, 3, 5])
+    def test_wrong_length_raises_naming_both_lengths(self, length):
+        logits, targets = self._data()
+        fn = SoftmaxFocalLoss(alpha=[0.5] * length)
+        with pytest.raises(ValueError, match=rf"{length}.*{self.C}"):
+            fn(logits, targets)
+
+    def test_alpha_none_does_not_raise(self):
+        logits, targets = self._data()
+        assert torch.isfinite(SoftmaxFocalLoss(alpha=None)(logits, targets))
+
+    def test_correct_length_with_ignore_index_zero_for_ignored(self):
+        logits, targets = self._data()
+        targets = targets.clone()
+        targets[::2] = -100
+        out = SoftmaxFocalLoss(alpha=[0.1, 0.4, 0.7, 0.9], reduction="none")(
+            logits, targets
+        )
+        assert (out[targets == -100] == 0.0).all()
+        assert (out[targets != -100] > 0.0).all()
+
+    def test_spatial_inputs_alpha_c_ok(self):
+        logits, targets = self._data(shape=(2, 3, 5))
+        out = SoftmaxFocalLoss(alpha=[0.5] * self.C, reduction="none")(logits, targets)
+        assert out.shape == targets.shape
+
+    @pytest.mark.parametrize("length", [3, 5])
+    def test_spatial_inputs_alpha_hw_length_raises(self, length):
+        logits, targets = self._data(shape=(2, 3, 5))
+        with pytest.raises(ValueError, match="alpha"):
+            SoftmaxFocalLoss(alpha=[0.5] * length)(logits, targets)
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda a: list(a.tolist()),
+            lambda a: a.float(),
+            lambda a: a.double(),
+        ],
+        ids=["list", "float32", "float64"],
+    )
+    def test_alpha_container_types_accepted(self, make):
+        logits, targets = self._data()
+        alpha = make(torch.tensor([0.1, 0.4, 0.7, 0.9]))
+        assert torch.isfinite(SoftmaxFocalLoss(alpha=alpha)(logits, targets))
+
+    def test_2d_alpha_still_raises_in_constructor(self):
+        with pytest.raises(ValueError, match="1-D"):
+            SoftmaxFocalLoss(alpha=torch.ones(2, 4))
+
+    def test_1d_inputs_raise_index_error(self):
+        fn = SoftmaxFocalLoss(alpha=[0.5] * self.C)
+        with pytest.raises(IndexError):
+            fn(torch.randn(self.C), torch.tensor(1))
+
+    def test_mismatch_with_sample_weight_raises_value_error(self):
+        logits, targets = self._data()
+        fn = SoftmaxFocalLoss(alpha=[0.5] * 3)
+        with pytest.raises(ValueError, match="alpha"):
+            fn(logits, targets, sample_weight=torch.ones(8))
