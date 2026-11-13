@@ -43,9 +43,11 @@ for c in valid.nonzero(as_tuple=True)[0].tolist():
 ### Queue management
 
 ```python
-# Reset queue between training and eval
+# Reset the queue when its contents are stale (e.g. a new training phase)
 loss_fn.reset_queue()
 ```
+
+The queue does not need resetting around validation: it is frozen in eval mode. Its training rows are still merged into the pool there, so for a validation-only loss value use a separate instance with `queue_size=0`. Only rows whose target is not `ignore_index` are stored.
 
 ## Parameter guidance
 
@@ -56,7 +58,7 @@ loss_fn.reset_queue()
 | `temperature` | `0.01` | Range `0.005–0.05`; lower = sharper, closer to true rank |
 | `reduction` | `"mean"` | `"none"` returns `[C]` tensor with `nan` for degenerate classes |
 | `ignore_index` | `-100` | Excludes padding from ranking and the positive set |
-| `update_queue_in_eval` | `False` | Freezes queue during `model.eval()` by default |
+| `update_queue_in_eval` | `False` | Freezes queue during `model.eval()` by default. The frozen queue is still merged into the pool; use a `queue_size=0` instance for a validation-only value |
 | `gather_distributed` | `None` | Auto-detects DDP; set `False` to opt out |
 
 ## Complexity note

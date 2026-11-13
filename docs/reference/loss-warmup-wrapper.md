@@ -1,6 +1,6 @@
 # LossWarmupWrapper
 
-A training utility that wraps a warmup loss and a main ranking loss. Manages three phases: warmup (standard loss only), optional linear blend, and main phase with geometric temperature decay. Exposes PyTorch Lightning hooks.
+A training utility that wraps a warmup loss and a main ranking loss. Manages three phases: warmup (standard loss only), optional linear blend, and main phase, with an optional geometric temperature decay in the main phase. Exposes PyTorch Lightning hooks.
 
 ::: imbalanced_losses.warmup_wrapper.LossWarmupWrapper
 
@@ -17,7 +17,7 @@ loss_fn = LossWarmupWrapper(
     main_loss=SmoothAPLoss(num_classes=10, queue_size=1024),
     warmup_epochs=5,
     blend_epochs=2,
-    temp_start=0.5,   # deliberately above the 0.05 default: softer start
+    temp_start=0.5,   # soft at the switch; both temperatures must be given to schedule
     temp_end=0.01,
     temp_decay_steps=50_000,
 )
@@ -111,7 +111,9 @@ The blend ramp always targets `final_main_weight`, not `1.0`.
 
 ## Temperature schedule
 
-Temperature decays geometrically from `temp_start` to `temp_end` over `temp_decay_steps` steps, measured from the moment of phase switch:
+Temperature scheduling is opt-in. With `temp_start` and `temp_end` both left at `None` (the default), the wrapper never writes `main_loss.temperature`: not at construction, not at the phase switch, not afterwards, and not when a checkpoint is loaded, so the loss trains at the temperature you constructed it with. Passing exactly one of the two raises `ValueError`.
+
+With both given, temperature decays geometrically from `temp_start` to `temp_end` over `temp_decay_steps` steps, measured from the moment of phase switch:
 
 ```
 temp(t) = temp_start * (temp_end / temp_start) ^ min(1, elapsed / temp_decay_steps)
@@ -124,6 +126,8 @@ The exponent fraction is clamped at `1.0`, so the temperature holds at `temp_end
 `LossWarmupWrapper` persists its schedule state (the current epoch, global step, phase-switch step, and temperature) in `state_dict()` under the standard `_extra_state` key, via PyTorch's `get_extra_state`/`set_extra_state`. Resuming from a checkpoint restores the phase, continues the temperature decay from the correct elapsed step, resumes a blend ramp mid-way, and leaves the restored memory queue intact.
 
 Checkpoints written before this state was persisted still load under `strict=True`. They restart the temperature schedule on resume, which is the behavior they were saved with.
+
+The saved temperature is applied on load only by a wrapper that schedules temperature. A wrapper constructed without `temp_start`/`temp_end` leaves `main_loss.temperature` at its constructor value, even when the checkpoint was written by a scheduling wrapper.
 
 !!! warning "Temperature set outside the wrapper is not checkpointed"
 
@@ -147,9 +151,9 @@ Checkpoints written before this state was persisted still load under `strict=Tru
 | `warmup_loss` | required | Loss used during warmup (e.g. `CrossEntropyLoss`) |
 | `main_loss` | required | Loss used after warmup (e.g. `SmoothAPLoss`) |
 | `warmup_epochs` | `0` | Epochs before switching; `0` skips warmup. Mutually exclusive with `warmup_steps`. |
-| `temp_start` | `0.05` | Temperature at phase switch |
-| `temp_end` | `0.005` | Temperature after `temp_decay_steps` steps |
-| `temp_decay_steps` | `10_000` | Steps over which to decay temperature |
+| `temp_start` | `None` | Temperature at phase switch. Give together with `temp_end` to schedule the temperature; `None` (default) leaves `main_loss.temperature` alone. |
+| `temp_end` | `None` | Temperature after `temp_decay_steps` steps. Give together with `temp_start`. |
+| `temp_decay_steps` | `10_000` | Steps over which to decay temperature. Unused when no schedule is requested. |
 | `blend_epochs` | `0` | Linear blend epochs; `0` = hard switch. Mutually exclusive with `blend_steps`. |
 | `warmup_steps` | `None` | Steps before switching. Mutually exclusive with `warmup_epochs > 0`. |
 | `blend_steps` | `None` | Linear blend steps. Mutually exclusive with `blend_epochs > 0`. |

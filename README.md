@@ -9,7 +9,7 @@
 - **`SmoothAPLoss`**: Differentiable approximation of AP (Brown et al., ECCV 2020). Uses sigmoid-based soft rank estimation; O(|P|×M) where |P| is the positive count and M = batch + queue size. Supports multi-class, binary, and seq2seq settings.
 - **`RecallAtQuantileLoss`**: Optimizes recall above a score threshold set at the *q*-th quantile of the pooled distribution. Useful for alert/detection workloads (e.g. top 0.5% of scores).
 - **`PAUCAtBudgetLoss`**: Optimizes the normalized partial AUC over a false-positive-rate band `[alpha, beta]` that brackets a target operating point (e.g. FPR ≈ 0.005). Useful when the business constraint is a fixed false-alarm budget (fraud, screening, alerting).
-- **`LossWarmupWrapper`**: Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, then applies geometric temperature decay. Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
+- **`LossWarmupWrapper`**: Training utility that runs a standard loss (BCE/CE) during warmup, linearly blends into the ranking loss over a configurable transition window, and can apply a geometric temperature decay in the main phase when you ask for one (`temp_start` and `temp_end`). Automatically resets the memory queue at the phase switch to prevent queue poisoning from warmup-era logits.
 
 **Design points:**
 - Circular memory queue stabilizes gradient estimates across small batches, which is critical at low positive rates (e.g. 0.5%)
@@ -132,13 +132,13 @@ loss.backward()
 - `sample_weight`: optional per-observation weight passed to `forward()`; replaces the count-based denominator with weight mass. `None` (default) leaves the loss and its gradient bitwise unchanged.
 
 **Ranking losses** (`SmoothAPLoss`, `RecallAtQuantileLoss`, `PAUCAtBudgetLoss`):
-- **Memory queue**: circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable
+- **Memory queue**: circular buffer accumulates past batches to stabilize estimates over small batch sizes; set `queue_size=0` to disable. Only rows whose target is not `ignore_index` are stored
 - **Multi-class**: one-vs-rest per class using `logits[:, c]`
 - **Binary**: set `num_classes=1` with targets in `{0, 1}`
 - **Seq2seq**: flatten `[B, T, C]` → `[B*T, C]` upstream before passing
-- **Pool size cap**: `max_pool_size` applies minimum-quota subsampling after the gather+queue merge, bounding pairwise matrix memory for large M (e.g. seq2seq with long sequences)
+- **Pool size cap**: `max_pool_size` applies minimum-quota subsampling after the gather+queue merge, bounding pairwise matrix memory for large M (e.g. seq2seq with long sequences). `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` estimate their thresholds on the full pool before subsampling, so the cap does not move the operating point
 - **Padding**: `ignore_index` rows are excluded from ranking and the positive set
-- **Eval queue freeze**: `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue
+- **Eval queue freeze**: `update_queue_in_eval=False` (default) prevents validation-phase logits from contaminating the training queue. The frozen queue is still merged into the pool in eval mode; use a separate instance with `queue_size=0` for a validation-only loss value
 - **Reductions**: `'mean'` (default), `'sum'`, or `'none'` (per-class tensor; degenerate classes are `nan`)
 - **Per-class logging**: `return_per_class=True` returns `(loss, per_class, valid_mask)` without a second forward pass
 - **`sample_weight`**: optional per-observation weight passed to `forward()`; only positives' weights enter the objective (thresholds, ranks, and the pAUC band never see it). Persists through the memory queue, DDP gather, `ignore_index` filtering, and `max_pool_size` subsampling. `None` (default) leaves the loss and its gradient bitwise unchanged. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/).
@@ -210,8 +210,12 @@ logits  = logits.view(-1, C)
 targets = targets.view(-1)
 loss = loss_fn(logits, targets)
 
-# Reset queue between training and validation
+# Reset the queue when its contents are stale (e.g. a new training phase).
+# Not needed around validation: the queue is frozen in eval mode.
 loss_fn.reset_queue()
+
+# Validation-only loss value: a separate instance with no queue
+val_loss_fn = SmoothAPLoss(num_classes=4, queue_size=0)
 ```
 
 ## Parameters
@@ -241,13 +245,13 @@ loss_fn.reset_queue()
 | `ignore_index` | `-100` | Target value for padding positions |
 | `update_queue_in_eval` | `False` | Allow queue updates during `model.eval()` |
 | `gather_distributed` | `None` | `None` = auto-detect DDP; `False` = always local; `True` = always gather |
-| `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
+| `max_pool_size` | `None` | Cap on pool rows after gather+queue merge; minimum-quota subsampling applied when exceeded. `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` take their thresholds from the full pool before the cap. Size as `target_|P_c| × 2 × n_classes`. `None` disables. |
 | `quantile` | `0.005` | *(RecallAtQuantileLoss only)* Top fraction to target |
 | `quantile_interpolation` | `'higher'` | *(RecallAtQuantileLoss, PAUCAtBudgetLoss)* `torch.quantile` interpolation method |
 | `alpha` | `0.0` | *(PAUCAtBudgetLoss only)* Lower FPR band edge; `0 <= alpha < beta <= 1`. `alpha=0` sets `t_alpha=max(neg_iid)`, covering all top false-positives. |
 | `beta` | `0.005` | *(PAUCAtBudgetLoss only)* Upper FPR band edge; set to your target operating-point FPR. |
 | `surrogate` | `"trapezoid"` | *(PAUCAtBudgetLoss only)* `"trapezoid"` integrates soft-TPR over the band (gradient through positives only); `"pairwise"` compares positives vs band negatives (for wide/volatile bands) |
-| `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; `>= 3` for wide bands |
+| `n_knots` | `2` | *(PAUCAtBudgetLoss only)* Trapezoid FPR knots; use `5` or more if the loss value should track the true pAUC on an `alpha=0` band with a large pool (see the reference page) |
 | `tau_scale` | `"iqr"` | *(PAUCAtBudgetLoss only)* Scale used for scale-aware temperature: `"iqr"` (stable bulk statistic) or `"band"` (sized to the operating region) |
 | `pos_numerator` | `"pool"` | *(PAUCAtBudgetLoss only)* Positives in the soft-TPR numerator: `"pool"` (all pooled) or `"live"` (live-batch only). `"live"` removes the memory queue's gradient dilution at extreme imbalance and is most useful for the `"trapezoid"` surrogate; `"pairwise"` usually prefers `"pool"` to keep enough positives in the contrast |
 | `budget_basis` | `"fpr"` | *(PAUCAtBudgetLoss only)* Reference population for the band-edge quantiles: `"fpr"` (iid negatives only, so `beta` is true FPR) or `"population"` (all pooled scores, so `beta` is a top-k alert budget over the whole population) |
@@ -258,15 +262,15 @@ loss_fn.reset_queue()
 
 **`sample_weight` (forward-time, not a constructor parameter):** every ranking loss accepts an optional trailing keyword argument, `sample_weight`, shape `[N]` float, non-negative, on the logits device. It rides the same rail as `iid_mask`: DDP gather, memory-queue persistence across steps and checkpoints, `ignore_index` filtering, and `max_pool_size` subsampling all carry it correctly. Only positives' weights enter the objective (a queue row's weight is the weight it was enqueued with, default `1`); thresholds, ranks, and the pAUC band are never weighted, so a zero-weight positive contributes nothing to the loss but still occupies its place in ranks and band membership. `None` (default) leaves the loss and its gradient bitwise identical to a release without `sample_weight`. See [Weight Samples by Value](https://chris-santiago.github.io/imbalanced-losses/how-to/weight-samples/) for a worked dollar-weighted example.
 
-## `LossWarmupWrapper`: BCE/CE warmup + loss blending + geometric temperature decay
+## `LossWarmupWrapper`: BCE/CE warmup + loss blending + optional geometric temperature decay
 
-A wrapper that trains with a standard loss (e.g. `CrossEntropyLoss`) for a warmup period, optionally blends both losses over a transition period, then switches to the ranking loss with a geometrically decaying temperature schedule.
+A wrapper that trains with a standard loss (e.g. `CrossEntropyLoss`) for a warmup period, optionally blends both losses over a transition period, then switches to the ranking loss. When you pass both `temp_start` and `temp_end`, it also decays the ranking loss's temperature geometrically:
 
 ```
 temp(t) = temp_start × (temp_end / temp_start) ^ (elapsed_steps / temp_decay_steps)
 ```
 
-The schedule clock starts at the moment of phase switch, not at training start.
+The schedule clock starts at the moment of phase switch, not at training start. Temperature scheduling is opt-in: with neither `temp_start` nor `temp_end` given (the default), the wrapper never touches `main_loss.temperature`, so the value you configured on the loss is the one used. Passing only one of the two raises `ValueError`.
 
 **Queue poisoning fix:** At the switch point the wrapper automatically calls `main_loss.reset_queue()` (if available), ensuring the ranking loss never sees stale warmup-era logits.
 
@@ -332,9 +336,9 @@ During the blend phase, `return_per_class=True` returns a tuple whose elements c
 | `warmup_loss` | required | Loss used during warmup; must accept `(logits, targets)` and return a scalar. Receives `sample_weight` if it declares it (or `**kwargs`); no other keyword argument is forwarded |
 | `main_loss` | required | Loss used after warmup; must accept `(logits, targets, **kwargs)` |
 | `warmup_epochs` | `0` | Epochs to use `warmup_loss`; `0` skips warmup entirely |
-| `temp_start` | `0.05` | Temperature at phase switch |
-| `temp_end` | `0.005` | Temperature after `temp_decay_steps` steps |
-| `temp_decay_steps` | `10_000` | Steps over which to decay temperature |
+| `temp_start` | `None` | Temperature at phase switch. Give together with `temp_end` to schedule the temperature; `None` (default) leaves `main_loss.temperature` alone |
+| `temp_end` | `None` | Temperature after `temp_decay_steps` steps. Give together with `temp_start` |
+| `temp_decay_steps` | `10_000` | Steps over which to decay temperature; unused when no schedule is requested |
 | `blend_epochs` | `0` | Epochs to linearly ramp from warmup to main loss; `0` = hard switch |
 | `warmup_steps` | `None` | Step-based warmup (mutually exclusive with `warmup_epochs > 0`) |
 | `blend_steps` | `None` | Step-based blend (requires `warmup_steps`; mutually exclusive with `blend_epochs > 0`) |
@@ -365,14 +369,14 @@ In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `
 
 | Function | Description |
 |---|---|
-| `all_gather_with_grad(tensor)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** so autograd works correctly. Variable dim-0 sizes across ranks are supported. |
+| `all_gather_with_grad(tensor, scale_grad=True)` | Gathers tensors across all workers; **preserves gradients for the local rank's slice** and scales them by `world_size`, so that DDP's gradient averaging yields the full-batch gradient. Variable dim-0 sizes across ranks are supported. |
 | `all_gather_no_grad(tensor)` | Gathers tensors without gradient tracking; use for integer targets/labels. Variable dim-0 sizes across ranks are supported. |
 
-`all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached, matching standard DDP semantics where each worker optimizes its own parameters via all-reduced gradients.
+`all_gather_with_grad` replaces the local rank's slice in the output with the original tensor (restoring the gradient connection), while other workers' slices remain detached. Each worker therefore differentiates the shared global loss through its own slice only, and `DistributedDataParallel` averages those gradients across workers, which on its own would give `1/world_size` of the full-batch gradient. The helper scales the local slice's gradient by `world_size` to compensate (the forward value is unchanged), and the losses' built-in gathering does the same. Pass `scale_grad=False` if your setup sums gradients across workers or already compensates.
 
 **Variable batch sizes:** Both helpers handle unequal dim-0 sizes across ranks (e.g. the last batch without `drop_last=True`). Tensors are zero-padded to the maximum size for the collective, then trimmed before concatenation. An equal-size fast path skips the overhead when all ranks contribute the same number of rows.
 
-**Queue synchronization:** Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same global-batch data. No extra synchronization of the memory queue is needed.
+**Queue synchronization:** Because every worker calls `all_gather` before passing to the loss, every worker enqueues the same rows (the non-ignored rows of the global batch). No extra synchronization of the memory queue is needed.
 
 ### Usage
 
@@ -380,7 +384,9 @@ In DDP each GPU sees only `N/world_size` samples. The soft-rank computation in `
 from imbalanced_losses import SmoothAPLoss
 from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_grad
 
-loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+# Losses gather for you by default. To gather manually, turn that off,
+# or every row is gathered twice.
+loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, gather_distributed=False)
 
 # Inside training_step on each GPU:
 logits_global  = all_gather_with_grad(logits)   # [sum(N_i), C] — grad flows for local rank
@@ -400,7 +406,9 @@ from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_gr
 class MyModel(pl.LightningModule):
     def __init__(self):
         super().__init__()
-        self.loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024)
+        # Simplest: leave gather_distributed at its default and pass local tensors.
+        # This example gathers manually, so the loss must not gather again.
+        self.loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, gather_distributed=False)
 
     def training_step(self, batch, batch_idx):
         logits, targets = batch

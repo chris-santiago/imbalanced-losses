@@ -117,7 +117,9 @@ Use `max_pool_size` to cap the pool with minimum-quota subsampling:
 loss_fn = SmoothAPLoss(num_classes=C, queue_size=1024, max_pool_size=4096)
 ```
 
-The queue accumulates the original full batch (unaffected by the cap). A one-time `UserWarning` fires when subsampling first triggers. Because the subsampled pool is a random subset, the loss value varies across steps for identical inputs. This is expected and analogous to dropout noise.
+The queue is unaffected by the cap: it accumulates every non-ignored row of the batch. A one-time `UserWarning` fires when subsampling first triggers. Because the subsampled pool is a random subset, the loss value varies across steps for identical inputs. This is expected and analogous to dropout noise.
+
+The thresholds do not vary with the subsample. `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` estimate their thresholds on the full pool before subsampling (the quantile threshold, or the band edges, knots and dispersion scale), so capping the pool does not move the operating point; only the set of positives (and, for the pairwise pAUC surrogate, band negatives) is subsampled. Two consequences: the full-pool estimate costs one sort of the full pool per class per step, and with `surrogate="pairwise"` a tight cap can leave a class with no negatives inside the full-pool band, in which case the class is skipped for that step. Prefer the trapezoid surrogate or a larger cap when that happens often.
 
 **Sizing `max_pool_size` with a dominant background class:** the subsampler gives every observed class an equal quota (`max_pool_size // (2 × n_classes)`), not a proportional one. A dominant class (e.g. 99% background) and a rare class get the same reserved count, so rare classes are over-represented in the subsampled pool. The effective positive count per class is `|P_c| ≈ max_pool_size // (2 × n_classes)`, which is much higher than `max_pool_size × positive_rate` would suggest. Size from the target `|P_c|`, not from memory alone: `max_pool_size ≈ target_|P_c| × 2 × n_classes`.
 
@@ -259,11 +261,11 @@ If the model is initialized from a pretrained checkpoint that already produces m
 
 **Temperature decay too fast**
 
-If `temp_end / temp_start` is too small or `temp_decay_steps` is too short, the temperature reaches the minimum before the model has refined the ranking. Low temperature with poorly separated scores produces large, noisy gradients. Schedule the decay to reach `temp_end` no earlier than ~50–75% of the main training phase.
+This applies when you request a schedule by passing both `temp_start` and `temp_end`; without them the wrapper leaves the loss's temperature fixed. If `temp_end / temp_start` is too small or `temp_decay_steps` is too short, the temperature reaches the minimum before the model has refined the ranking. Low temperature with poorly separated scores produces large, noisy gradients. Schedule the decay to reach `temp_end` no earlier than ~50–75% of the main training phase.
 
 **Queue poisoning at the phase switch**
 
-`LossWarmupWrapper` resets the queue when it latches the phase switch in `on_train_batch_start`. This happens regardless of how the queue was filled, so even warmup-era logits enqueued by calling `main_loss.forward()` directly are wiped at the switch. The real failure mode is never wiring `on_train_batch_start` into the training loop: the switch is never latched, so the queue reset never fires and the temperature schedule never runs. The wrapper emits a one-time `UserWarning` on the first main-phase forward if the hook was never called (when the wrapped loss exposes a `temperature` attribute, which all the queued losses in this library do). Call `on_train_batch_start(global_step)` every training step, in epoch mode as well as step mode.
+`LossWarmupWrapper` resets the queue when it latches the phase switch in `on_train_batch_start`. This happens regardless of how the queue was filled, so even warmup-era logits enqueued by calling `main_loss.forward()` directly are wiped at the switch. The real failure mode is never wiring `on_train_batch_start` into the training loop: the switch is never latched, so the queue reset never fires and a requested temperature schedule never runs. The wrapper emits a one-time `UserWarning` on the first main-phase forward if the hook was never called and its absence disables something: a requested temperature schedule, or the switch-time queue reset (a warmup phase is configured and the wrapped loss has a queue). The message names what is disabled. Call `on_train_batch_start(global_step)` every training step, in epoch mode as well as step mode.
 
 **Hand-rolled temperature schedules do not survive a resume**
 

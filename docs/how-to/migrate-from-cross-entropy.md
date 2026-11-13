@@ -94,6 +94,8 @@ loss_fn = LossWarmupWrapper(
     main_loss=SmoothAPLoss(num_classes=1, queue_size=512),
     warmup_epochs=5,
     blend_epochs=2,
+    temp_start=0.05,   # optional: decay the temperature after the switch
+    temp_end=0.005,    # (omit both to keep SmoothAPLoss's own temperature)
 )
 
 # In your training loop:
@@ -117,6 +119,8 @@ loss_fn = LossWarmupWrapper(
     main_loss=SmoothAPLoss(num_classes=n_classes, queue_size=1024),
     warmup_epochs=5,
     blend_epochs=2,
+    temp_start=0.05,
+    temp_end=0.005,
 )
 
 # CrossEntropyLoss and SmoothAPLoss share the same input format:
@@ -137,11 +141,7 @@ for epoch in range(total_epochs):
 
 ### Forgetting the epoch / step hooks
 
-`LossWarmupWrapper` tracks phase transitions in `on_train_epoch_start` and temperature decay
-in `on_train_batch_start`. Each hook has its own failure mode. In epoch mode, missing
-`on_train_epoch_start` means the loss never transitions from warmup. Missing
-`on_train_batch_start` still transitions, but silently disables temperature decay and the
-queue reset at the phase switch (the wrapper emits a one-time `UserWarning` when this happens).
+`LossWarmupWrapper` tracks phase transitions in `on_train_epoch_start`, and performs the queue reset at the phase switch and any requested temperature decay in `on_train_batch_start`. Each hook has its own failure mode. In epoch mode, missing `on_train_epoch_start` means the loss never transitions from warmup. Missing `on_train_batch_start` still transitions, but disables the queue reset at the phase switch and the temperature decay if you asked for one (the wrapper emits a one-time `UserWarning` naming what is disabled).
 
 ```python
 # Wrong — loss stays in warmup forever, no temperature decay
@@ -202,6 +202,8 @@ loss_fn = LossWarmupWrapper(
     warmup_loss=nn.CrossEntropyLoss(),
     main_loss=SmoothAPLoss(num_classes=5, queue_size=1024),
     warmup_epochs=5,
+    temp_start=0.05,
+    temp_end=0.005,
 )
 ```
 

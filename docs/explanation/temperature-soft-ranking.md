@@ -82,7 +82,7 @@ Use `"iqr"` for most cases. Switch to `"band"` when the band is very wide and yo
 | Stable mid-training | `0.02–0.05` |
 | Late training refinement | `0.005–0.01` |
 
-The `LossWarmupWrapper` defaults (`temp_start=0.05`, `temp_end=0.005`) decay from the stable mid-training range into the late-training refinement range over the main phase. Raise `temp_start` toward 0.1–0.5 if the main phase begins with weakly separated scores.
+`LossWarmupWrapper` schedules temperature only when you pass both `temp_start` and `temp_end`; by default it leaves the loss's own temperature untouched. A schedule of `temp_start=0.05, temp_end=0.005` decays from the stable mid-training range into the late-training refinement range over the main phase. Raise `temp_start` toward 0.1–0.5 if the main phase begins with weakly separated scores. These ranges are for the raw-logit temperatures of `SmoothAPLoss` and `RecallAtQuantileLoss`; `PAUCAtBudgetLoss` uses a dimensionless multiplier (default `0.1`) and should not be scheduled with them.
 
 If you schedule temperature yourself rather than through the wrapper, note that `temperature` is a plain attribute and is **not** saved in `state_dict()`: it reverts to its constructor value on every resume. See [Assumptions and failure modes](assumptions-and-failure-modes.md#losswarmupwrapper) and [issue #16](https://github.com/chris-santiago/imbalanced-losses/issues/16).
 

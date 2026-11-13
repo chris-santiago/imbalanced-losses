@@ -50,7 +50,8 @@ for c in valid.nonzero(as_tuple=True)[0].tolist():
 | `temperature` | `0.01` | Larger = smoother gradient; smaller = sharper recall estimate |
 | `reduction` | `"mean"` | `"none"` returns `[C]` tensor; classes with no positives are `nan` |
 | `ignore_index` | `-100` | Excluded from threshold estimation and recall |
-| `update_queue_in_eval` | `False` | Freezes queue during `model.eval()` by default |
+| `update_queue_in_eval` | `False` | Freezes queue during `model.eval()` by default. The frozen queue is still merged into the pool; use a `queue_size=0` instance for a validation-only value |
+| `max_pool_size` | `None` | Minimum-quota subsampling cap for very large pools (seq2seq). The threshold is the quantile of the full pool, taken before subsampling; soft recall is averaged over the subsample's positives |
 | `quantile_interpolation` | `"higher"` | Conservative default; use `"linear"` for a softer threshold |
 
 ## Quantile selection guidance

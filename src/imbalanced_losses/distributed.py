@@ -100,7 +100,8 @@ def all_gather_with_grad(tensor: torch.Tensor, scale_grad: bool = True) -> torch
 
     All workers' queues stay synchronized automatically: since every worker
     calls ``all_gather`` before passing to the loss, every worker enqueues
-    the same global-batch data. No extra synchronization is needed.
+    the same rows (the non-ignored rows of the global batch). No extra
+    synchronization is needed.
 
     Raises
     ------
@@ -109,9 +110,17 @@ def all_gather_with_grad(tensor: torch.Tensor, scale_grad: bool = True) -> torch
 
     Examples
     --------
-    Typical usage in a DDP training step::
+    Manual gathering in a DDP training step.  The loss must be constructed
+    with ``gather_distributed=False``, otherwise it gathers again: every row
+    is duplicated and the gradient is scaled by ``world_size`` twice::
 
-        from imbalanced_losses.distributed import all_gather_with_grad
+        from imbalanced_losses import SmoothAPLoss
+        from imbalanced_losses.distributed import (
+            all_gather_no_grad,
+            all_gather_with_grad,
+        )
+
+        loss_fn = SmoothAPLoss(num_classes=4, gather_distributed=False)
 
         logits_global  = all_gather_with_grad(logits)          # [sum(N_i), C]
         targets_global = all_gather_no_grad(targets)           # [sum(N_i)]

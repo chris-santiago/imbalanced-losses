@@ -163,11 +163,16 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         trapezoid surrogate (knot 0 = alpha, knot n_knots-1 = beta). Must be
         >= 2. Ignored when ``surrogate='pairwise'``. Default: 2.
 
-        The default of 2 (trapezoid rule) is accurate for narrow bands where
-        TPR(FPR) is approximately linear over ``[alpha, beta]``; the
-        integration error scales as ``(beta - alpha)^3 * TPR''``.  For wide
-        bands where TPR curvature is non-negligible, ``n_knots >= 3`` is
-        recommended.
+        The default of 2 puts one knot at each band edge.  On a band that
+        starts above zero (e.g. ``[0.0025, 0.0075]``) two knots are within
+        about 3% of the exact empirical pAUC.  On the default ``alpha=0``
+        band the first knot is the maximum negative, where TPR is near zero
+        and the ROC is steepest, so two knots under-estimate the pAUC: by
+        about 2% at a 1,280-row pool and by 25 to 30% at 20,000 to 200,000
+        rows (measured at 2% positives), growing with pool size.
+        ``n_knots=5`` is within about 4% and ``n_knots=9`` within about 1%
+        at those sizes.  This describes the value of the estimator, not
+        training outcomes; the default is unchanged.
     tau_scale : {'iqr', 'band'}, optional
         Robust dispersion used to make the temperature scale-aware.
         ``'iqr'`` (default) uses ``IQR(neg_iid)`` -- a stable bulk statistic

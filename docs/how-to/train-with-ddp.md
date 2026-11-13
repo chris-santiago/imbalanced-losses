@@ -32,6 +32,22 @@ loss.backward()
 
 **Important:** Use `all_gather_with_grad` for logits (gradients must flow back to model parameters) and `all_gather_no_grad` for integer targets (no gradient required).
 
+**Always pass `gather_distributed=False` when you gather yourself.** With the default auto-detection the loss gathers again, which duplicates every row and multiplies the gradient by `world_size` a second time.
+
+## Gradient scale
+
+`DistributedDataParallel` averages gradients across ranks, and each rank only differentiates through its own slice of the gathered batch, so without correction every update would be `1/world_size` of the full-batch gradient. `all_gather_with_grad` corrects this by scaling the local slice's gradient by `world_size`; the loss value is not changed. The losses' built-in gathering does the same, so with the default settings the gradient under DDP matches single-process training on the combined batch.
+
+If your setup sums gradients across ranks instead of averaging, or you already compensate (a learning rate scaled by the number of GPUs for this reason, or a loss multiplied by `world_size`), turn the scaling off:
+
+```python
+loss_fn = SmoothAPLoss(num_classes=4, queue_size=1024, gather_distributed=False)
+
+logits_global  = all_gather_with_grad(logits, scale_grad=False)
+targets_global = all_gather_no_grad(targets)
+loss = loss_fn(logits_global, targets_global)
+```
+
 ## PyTorch Lightning with DDP
 
 ```python
