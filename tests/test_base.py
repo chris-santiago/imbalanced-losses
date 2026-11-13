@@ -8,6 +8,7 @@ concrete losses; later tests in this file reuse it.
 from __future__ import annotations
 
 import inspect
+import math
 import warnings
 
 import pytest
@@ -15,6 +16,7 @@ import torch
 import torch.distributed as dist
 
 from imbalanced_losses import PAUCAtBudgetLoss, RecallAtQuantileLoss, SmoothAPLoss
+from imbalanced_losses import _base as base_module
 from imbalanced_losses._base import _QueuedRankingLoss, _to_compute_dtype
 
 # (class, constructor kwargs). PAUC uses a wide band so a small batch has
@@ -831,6 +833,45 @@ class TestFullPoolThresholds:
         ])
         assert torch.equal(seen[0]["thresholds"], expected)
 
+    def test_recall_multiclass_loss_is_computed_against_the_supplied_thresholds(self):
+        logits, targets = _skewed_batch(3, 1200, 0, seed=22)
+        temperature = 0.7
+        loss = RecallAtQuantileLoss(
+            3, quantile=0.05, queue_size=0, max_pool_size=256,
+            temperature=temperature, reduction="none",
+        )
+        captured = {}
+        original = loss._compute_per_class
+
+        def spy(pool_logits, pool_targets, *args, **kwargs):
+            captured["logits"] = pool_logits.detach().clone()
+            captured["targets"] = pool_targets.clone()
+            captured["thresholds"] = kwargs["thresholds"].clone()
+            return original(pool_logits, pool_targets, *args, **kwargs)
+
+        loss._compute_per_class = spy
+        torch.manual_seed(0)
+        with pytest.warns(UserWarning, match="max_pool_size"):
+            out = loss(logits, targets)
+
+        sub_logits, sub_targets = captured["logits"], captured["targets"]
+        theta = captured["thresholds"]
+        assert sub_logits.size(0) == 256
+        # The subsample's own quantiles differ from the supplied ones, so a
+        # loss that recomputed them from the subsample would not match below.
+        own = torch.stack([
+            torch.quantile(sub_logits[:, c], 0.95, interpolation="higher")
+            for c in range(3)
+        ])
+        assert not torch.equal(own, theta)
+        expected = torch.stack([
+            1.0 - torch.sigmoid(
+                (sub_logits[sub_targets == c, c] - theta[c]) / temperature
+            ).mean()
+            for c in range(3)
+        ])
+        torch.testing.assert_close(out, expected, rtol=1e-6, atol=1e-6)
+
     @PAUC_GRID
     @NUM_CLASSES
     def test_pauc_diagnostics_equal_uncapped(
@@ -842,12 +883,23 @@ class TestFullPoolThresholds:
         )
         capped = PAUCAtBudgetLoss(num_classes, queue_size=0, max_pool_size=256, **kwargs)
         uncapped = PAUCAtBudgetLoss(num_classes, queue_size=0, **kwargs)
+        # The subsample is random; under the pairwise surrogate it can hold no
+        # band negative for a class, which makes that class invalid with NaN
+        # diagnostics.  The seed fixes the draw to one that keeps every class
+        # valid, so the comparison below covers all of them.
+        torch.manual_seed(0)
         with pytest.warns(UserWarning, match="max_pool_size"):
-            _, stats_c = capped(logits, targets, return_diagnostics=True)
-        _, stats_u = uncapped(logits, targets, return_diagnostics=True)
+            _, _, valid_c, stats_c = capped(
+                logits, targets, return_per_class=True, return_diagnostics=True
+            )
+        _, _, valid_u, stats_u = uncapped(
+            logits, targets, return_per_class=True, return_diagnostics=True
+        )
+        assert valid_u.all()
+        assert valid_c.all()
         for key in ("t_alpha", "t_beta", "tau_eff"):
             assert torch.isfinite(stats_u[key]).all()
-            assert torch.equal(stats_c[key], stats_u[key]), key
+            assert torch.equal(stats_c[key][valid_c], stats_u[key][valid_c]), key
 
     def test_pauc_trapezoid_binary_loss_matches_uncapped(self):
         logits, targets = _skewed_batch(1, 2000, 20, seed=3)
@@ -959,15 +1011,16 @@ class TestFullPoolThresholds:
 
     @RANKING_LOSSES
     @DTYPES
+    @NUM_CLASSES
     @pytest.mark.parametrize("cap_kind", ["none", "above", "equal"])
     def test_untriggered_cap_skips_hook_and_is_bitwise_identical(
-        self, loss_name, dtype, cap_kind
+        self, loss_name, dtype, num_classes, cap_kind
     ):
-        logits, targets = make_batch(3, 0)
+        logits, targets = make_batch(num_classes, 0)
         logits = logits.to(dtype)
         cap = {"none": None, "above": N + 50, "equal": N}[cap_kind]
-        reference = make_loss(loss_name, 3, 0)
-        candidate = make_loss(loss_name, 3, 0, max_pool_size=cap)
+        reference = make_loss(loss_name, num_classes, 0)
+        candidate = make_loss(loss_name, num_classes, 0, max_pool_size=cap)
         calls = _spy_estimator(candidate)
         leaf_r, leaf_c = _leaf(logits), _leaf(logits)
         out_r = reference(leaf_r, targets)
@@ -1379,16 +1432,39 @@ class TestGoldenFixtureCompare:
         return torch.load(golden.FIXTURE_PATH, weights_only=True)
 
     def _run_compare(self, golden, old_fixture, tmp_path):
-        import subprocess
-        import sys
+        """Run ``--compare`` in-process; return its exit code and captured output."""
+        import contextlib
+        import io
+        import types
 
         old_path = tmp_path / "old.pt"
         torch.save(old_fixture, old_path)
-        return subprocess.run(
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            returncode = golden.main(["--compare", str(old_path)])
+        return types.SimpleNamespace(
+            returncode=returncode, stdout=stdout.getvalue(), stderr=stderr.getvalue()
+        )
+
+    @pytest.mark.parametrize("perturb,expected", [(False, 0), (True, 1)])
+    def test_script_exit_code_reflects_the_comparison(
+        self, golden, new_fixture, tmp_path, perturb, expected
+    ):
+        import subprocess
+        import sys
+
+        old = dict(new_fixture)
+        if perturb:
+            key = next(k for k in sorted(old) if "queue_size=0" in k and k.endswith("|loss"))
+            old[key] = old[key] + 1.0
+        old_path = tmp_path / "old.pt"
+        torch.save(old, old_path)
+        result = subprocess.run(
             [sys.executable, golden.__file__, "--compare", str(old_path)],
             capture_output=True,
             text=True,
         )
+        assert result.returncode == expected, result.stderr
 
     def test_allowed_set_is_the_step_2_entries_of_the_queue_size_64_configs(self, golden):
         allowed = golden.allowed_to_differ()
@@ -1438,6 +1514,68 @@ class TestGoldenFixtureCompare:
         result = self._run_compare(golden, old, tmp_path)
         assert result.returncode != 0
         assert key in result.stderr
+
+    @staticmethod
+    def _disallowed_key(golden, new_fixture, suffix, dtype_name, predicate=None):
+        """A tensor key outside the allowed set, with the given field and dtype."""
+        allowed = golden.allowed_to_differ()
+        return next(
+            k for k in sorted(new_fixture)
+            if k.endswith(suffix) and f"dtype={dtype_name}" in k and k not in allowed
+            and isinstance(new_fixture[k], torch.Tensor)
+            and (predicate is None or predicate(new_fixture[k]))
+        )
+
+    def test_negative_zero_for_zero_in_a_disallowed_key_fails_and_names_it(
+        self, golden, new_fixture, tmp_path
+    ):
+        def has_positive_zero(t):
+            return bool(((t == 0) & ~torch.signbit(t)).any())
+
+        key = self._disallowed_key(golden, new_fixture, "|grad", "float32", has_positive_zero)
+        old = dict(new_fixture)
+        edited = new_fixture[key].clone()
+        position = ((edited == 0) & ~torch.signbit(edited)).nonzero()[0]
+        edited[tuple(position.tolist())] = -0.0
+        # Equal as values, different as bits.
+        assert torch.equal(edited, new_fixture[key])
+        old[key] = edited
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert key in result.stderr
+
+    def test_a_dtype_change_in_a_disallowed_key_fails_and_names_it(
+        self, golden, new_fixture, tmp_path
+    ):
+        key = self._disallowed_key(golden, new_fixture, "|loss", "float32")
+        assert new_fixture[key].dtype == torch.float32
+        old = dict(new_fixture)
+        old[key] = new_fixture[key].double()
+        # Equal as values, different dtype.
+        assert torch.equal(old[key], new_fixture[key])
+        result = self._run_compare(golden, old, tmp_path)
+        assert result.returncode != 0
+        assert key in result.stderr
+
+    def test_a_shape_change_is_a_difference(self, golden):
+        old = {"k": torch.zeros(4)}
+        differing, _ = golden.compare_fixtures(old, {"k": torch.zeros(1, 4)})
+        assert differing == ["k"]
+
+    def test_identical_nans_are_equal_and_empty_tensors_compare(self, golden):
+        old = {"a": torch.tensor([1.0, float("nan")]), "b": torch.zeros(0, 3)}
+        differing, violations = golden.compare_fixtures(
+            old, {"a": old["a"].clone(), "b": torch.zeros(0, 3)}
+        )
+        assert differing == []
+        assert violations == []
+
+    def test_a_non_contiguous_tensor_compares_by_value_bits(self, golden):
+        base = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        differing, _ = golden.compare_fixtures(
+            {"k": base.t()}, {"k": base.t().contiguous()}
+        )
+        assert differing == []
 
     def test_a_missing_key_fails(self, golden, new_fixture, tmp_path):
         key = sorted(golden.allowed_to_differ())[0]
@@ -1629,3 +1767,277 @@ class TestBinaryTargetCheck:
 
         source = pathlib.Path(importlib.import_module(f"imbalanced_losses.{module}").__file__)
         assert "Binary mode (num_classes=1)" not in source.read_text()
+
+
+# ---------------------------------------------------------------------------
+# _quantile: torch.quantile, with an exact sort-based path above its size limit
+# ---------------------------------------------------------------------------
+
+QUANTILE_MODES = ("linear", "lower", "higher", "nearest", "midpoint")
+QUANTILE_MODE_PARAM = pytest.mark.parametrize("mode", QUANTILE_MODES)
+QUANTILE_SIZES = pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 8, 9, 40, 1001])
+# Dyadic levels: q * (n - 1) is exact in float32, so torch.quantile's own
+# float32 rank arithmetic and the fallback's float64 rank arithmetic agree.
+DYADIC_LEVELS = [0.0, 0.125, 0.25, 0.5, 0.75, 1.0]
+# Levels whose float32 product with (n - 1) is rounded by torch.quantile.
+INEXACT_LEVELS = [0.05, 0.2, 0.9, 0.995]
+
+
+def _assert_same_values(actual, expected):
+    """Same dtype, shape and device; equal values with NaNs at the same places."""
+    assert actual.dtype == expected.dtype
+    assert actual.shape == expected.shape
+    assert actual.device == expected.device
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan)
+    assert torch.equal(actual[~nan], expected[~nan])
+
+
+def _tied_sample(n, dtype, seed=0):
+    """``n`` scores rounded to one decimal, so ties are common."""
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randn(n, generator=g) * 3).round(decimals=1).to(dtype)
+
+
+@pytest.fixture
+def always_fallback(monkeypatch):
+    """Route every call, whatever its size, through the sort-based path."""
+    monkeypatch.setattr(base_module, "_QUANTILE_MAX_NUMEL", 0)
+
+
+class TestQuantileHelper:
+    def test_limit_is_the_largest_input_torch_quantile_accepts(self):
+        assert base_module._QUANTILE_MAX_NUMEL == 2**24
+
+    @DTYPES
+    @QUANTILE_MODE_PARAM
+    @QUANTILE_SIZES
+    def test_at_or_below_the_limit_is_torch_quantile(self, dtype, mode, n):
+        x = _tied_sample(n, dtype)
+        for q in DYADIC_LEVELS + INEXACT_LEVELS:
+            _assert_same_values(
+                base_module._quantile(x, q, interpolation=mode),
+                torch.quantile(x, q, interpolation=mode),
+            )
+
+    @DTYPES
+    @QUANTILE_MODE_PARAM
+    @QUANTILE_SIZES
+    def test_fallback_equals_torch_quantile_scalar_q(
+        self, always_fallback, dtype, mode, n
+    ):
+        x = _tied_sample(n, dtype)
+        for q in DYADIC_LEVELS:
+            expected = torch.quantile(x, q, interpolation=mode)
+            actual = base_module._quantile(x, q, interpolation=mode)
+            assert actual.ndim == 0
+            _assert_same_values(actual, expected)
+
+    @DTYPES
+    @QUANTILE_MODE_PARAM
+    @QUANTILE_SIZES
+    def test_fallback_equals_torch_quantile_vector_q(
+        self, always_fallback, dtype, mode, n
+    ):
+        x = _tied_sample(n, dtype)
+        q = torch.tensor(DYADIC_LEVELS, dtype=dtype)
+        actual = base_module._quantile(x, q, interpolation=mode)
+        assert actual.shape == q.shape
+        _assert_same_values(actual, torch.quantile(x, q, interpolation=mode))
+
+    @QUANTILE_MODE_PARAM
+    @QUANTILE_SIZES
+    def test_fallback_equals_torch_quantile_float64_any_level(
+        self, always_fallback, mode, n
+    ):
+        # In float64 torch.quantile's rank arithmetic is the fallback's, so
+        # every level agrees bit for bit.
+        x = _tied_sample(n, torch.float64)
+        q = torch.tensor(DYADIC_LEVELS + INEXACT_LEVELS, dtype=torch.float64)
+        _assert_same_values(
+            base_module._quantile(x, q, interpolation=mode),
+            torch.quantile(x, q, interpolation=mode),
+        )
+        for level in q.tolist():
+            _assert_same_values(
+                base_module._quantile(x, level, interpolation=mode),
+                torch.quantile(x, level, interpolation=mode),
+            )
+
+    @pytest.mark.parametrize("mode", ["lower", "higher", "nearest"])
+    @QUANTILE_SIZES
+    def test_fallback_float32_any_level_picks_the_float64_rank(
+        self, always_fallback, mode, n
+    ):
+        # torch.quantile rounds the float32 product q * (n - 1) to float32
+        # (0.995f * 1000 -> 995.0 where the exact product is 995.0000047),
+        # which can pick the neighbouring order statistic.  The fallback keeps
+        # the rank in float64, so it equals torch.quantile on the float64
+        # input with the same float32-valued level.
+        x = _tied_sample(n, torch.float32)
+        q = torch.tensor(DYADIC_LEVELS + INEXACT_LEVELS, dtype=torch.float32)
+        expected = torch.quantile(x.double(), q.double(), interpolation=mode).float()
+        _assert_same_values(base_module._quantile(x, q, interpolation=mode), expected)
+
+    @pytest.mark.parametrize("mode", ["linear", "midpoint"])
+    @QUANTILE_SIZES
+    def test_fallback_float32_any_level_interpolates_the_float64_rank(
+        self, always_fallback, mode, n
+    ):
+        # Interpolation cannot be bitwise equal to torch.quantile in float32
+        # for these levels.  "linear": torch's weight is the float32-rounded
+        # rank minus its floor, the fallback's is the float64 one; measured
+        # over this grid they differ by up to 3.8e-6 in value.  "midpoint":
+        # when the rounded rank crosses an integer, torch averages a
+        # different pair of order statistics (measured difference up to 0.45
+        # here, half the gap between two of them).  Against the float64
+        # computation with the same float32-valued level, the fallback is
+        # within two float32 ulps (measured 4.8e-7 at magnitude 12).
+        x = _tied_sample(n, torch.float32)
+        q = torch.tensor(DYADIC_LEVELS + INEXACT_LEVELS, dtype=torch.float32)
+        actual = base_module._quantile(x, q, interpolation=mode)
+        assert actual.dtype == torch.float32
+        reference = torch.quantile(x.double(), q.double(), interpolation=mode).float()
+        torch.testing.assert_close(actual, reference, rtol=0, atol=1e-6)
+        if mode == "linear":
+            torch.testing.assert_close(
+                actual, torch.quantile(x, q, interpolation=mode), rtol=0, atol=1e-5
+            )
+
+    @DTYPES
+    @QUANTILE_MODE_PARAM
+    @pytest.mark.parametrize("n", [1, 2, 5, 9])
+    @pytest.mark.parametrize("nan_at", [0, -1])
+    def test_a_nan_makes_every_level_nan(self, always_fallback, dtype, mode, n, nan_at):
+        x = _tied_sample(n, dtype)
+        x[nan_at] = float("nan")
+        q = torch.tensor(DYADIC_LEVELS, dtype=dtype)
+        for level in (0.0, 0.5, 1.0):
+            actual = base_module._quantile(x, level, interpolation=mode)
+            assert torch.isnan(actual)
+            _assert_same_values(actual, torch.quantile(x, level, interpolation=mode))
+        actual = base_module._quantile(x, q, interpolation=mode)
+        assert torch.isnan(actual).all()
+        _assert_same_values(actual, torch.quantile(x, q, interpolation=mode))
+
+    @DTYPES
+    @QUANTILE_MODE_PARAM
+    def test_infinite_scores_match_torch_quantile(self, always_fallback, dtype, mode):
+        x = torch.tensor([float("-inf"), -1.0, 0.0, 2.0, float("inf")], dtype=dtype)
+        q = torch.tensor(DYADIC_LEVELS, dtype=dtype)
+        _assert_same_values(
+            base_module._quantile(x, q, interpolation=mode),
+            torch.quantile(x, q, interpolation=mode),
+        )
+
+    def test_nearest_rounds_half_ranks_to_even_like_torch(self, always_fallback):
+        # Ranks 0.5, 1.5, 2.5 and 3.5 of n = 8 (q = k / 14 is exact in float64).
+        x = torch.arange(8, dtype=torch.float64)
+        q = torch.tensor([0.5, 1.5, 2.5, 3.5], dtype=torch.float64) / 7
+        result = base_module._quantile(x, q, interpolation="nearest")
+        assert result.tolist() == [0.0, 2.0, 2.0, 4.0]
+        _assert_same_values(result, torch.quantile(x, q, interpolation="nearest"))
+
+    @DTYPES
+    def test_unsorted_input_is_not_mutated_and_nd_input_is_flattened(
+        self, always_fallback, dtype
+    ):
+        x = _tied_sample(12, dtype).reshape(3, 4)
+        before = x.clone()
+        _assert_same_values(
+            base_module._quantile(x, 0.5, interpolation="higher"),
+            torch.quantile(x, 0.5, interpolation="higher"),
+        )
+        assert torch.equal(x, before)
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.1])
+    def test_level_outside_unit_interval_raises_like_torch(self, always_fallback, bad):
+        x = _tied_sample(5, torch.float32)
+        with pytest.raises(RuntimeError):
+            torch.quantile(x, bad)
+        with pytest.raises(RuntimeError):
+            base_module._quantile(x, bad)
+        with pytest.raises(RuntimeError):
+            base_module._quantile(x, torch.tensor([0.5, bad]))
+
+    def test_real_size_input_above_the_torch_limit(self):
+        n = 2**24 + 1
+        # Reversed, distinct integers 0 .. 2**24 (all exact in float32), so the
+        # order statistic of rank r is r - 2**24 after the negation.
+        x = torch.arange(n, dtype=torch.float32).neg_()
+        with pytest.raises(RuntimeError, match="too large"):
+            torch.quantile(x, 0.5)
+        levels = [0.0, 0.25, 0.5, 0.995, 1.0]
+        # The rank is the float32-valued level times n - 1 in float64.
+        ranks = [torch.tensor(q, dtype=torch.float32).item() * (n - 1) for q in levels]
+        q = torch.tensor(levels, dtype=torch.float32)
+        for mode, pick in (
+            ("lower", math.floor), ("higher", math.ceil), ("nearest", round),
+        ):
+            result = base_module._quantile(x, q, interpolation=mode)
+            assert result.dtype == torch.float32
+            assert result.tolist() == [float(pick(r) - 2**24) for r in ranks], mode
+        # The fractional rank of 0.995 lies between two integers, so the
+        # interpolated value lies strictly between the two picks.
+        linear = base_module._quantile(x, 0.995, interpolation="linear").item()
+        assert math.floor(ranks[3]) - 2**24 <= linear <= math.ceil(ranks[3]) - 2**24
+        assert base_module._quantile(x, 0.5, interpolation="midpoint").item() == (
+            2**23 - 2**24
+        )
+
+
+class TestQuantileLimitInThresholdEstimators:
+    """Both threshold estimators survive a pool above the quantile limit."""
+
+    @staticmethod
+    def _thresholds(loss, logits, targets, monkeypatch, limit):
+        """Run ``loss`` once and return (its thresholds, the sizes torch.quantile saw)."""
+        seen = []
+        real = torch.quantile
+
+        def recording(x, q, **kwargs):
+            seen.append(x.numel())
+            return real(x, q, **kwargs)
+
+        monkeypatch.setattr(torch, "quantile", recording)
+        monkeypatch.setattr(base_module, "_QUANTILE_MAX_NUMEL", limit)
+        calls = _spy_estimator(loss)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            loss(logits, targets)
+        monkeypatch.undo()
+        assert len(calls) == 1
+        return _flat_tensors(calls[0]["result"]), seen
+
+    @pytest.mark.parametrize(
+        "loss_name,kwargs",
+        [
+            ("recall_at_quantile", {"quantile": 0.25}),
+            ("pauc_at_budget", {"beta": 0.25, "surrogate": "trapezoid"}),
+            ("pauc_at_budget", {"beta": 0.25, "surrogate": "pairwise"}),
+            ("pauc_at_budget", {"beta": 0.25, "budget_basis": "population"}),
+        ],
+        ids=["recall", "pauc_trapezoid", "pauc_pairwise", "pauc_population"],
+    )
+    @NUM_CLASSES
+    def test_lowered_limit_gives_the_thresholds_of_the_unlowered_limit(
+        self, monkeypatch, loss_name, kwargs, num_classes
+    ):
+        limit, rows, cap = 100, 1200, 256
+        logits, targets = _skewed_batch(num_classes, rows, 40, seed=21)
+
+        def run(lowered):
+            loss = make_loss(loss_name, num_classes, 0, max_pool_size=cap, **kwargs)
+            return self._thresholds(
+                loss, logits, targets, monkeypatch, limit if lowered else 2**24
+            )
+
+        expected, seen_normal = run(lowered=False)
+        actual, seen_lowered = run(lowered=True)
+        # The unlowered run sorted the whole pool inside torch.quantile; the
+        # lowered one never handed torch.quantile an input above the limit.
+        assert max(seen_normal) > limit
+        assert all(size <= limit for size in seen_lowered)
+        assert expected
+        assert len(actual) == len(expected)
+        assert all(torch.equal(a, e) for a, e in zip(actual, expected))

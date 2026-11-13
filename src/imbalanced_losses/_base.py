@@ -71,6 +71,77 @@ def _to_compute_dtype(logits: torch.Tensor) -> torch.Tensor:
     return logits
 
 
+# Largest input ``torch.quantile`` accepts; one more element raises
+# ``RuntimeError: quantile() input tensor is too large``.
+_QUANTILE_MAX_NUMEL = 2**24
+
+
+def _quantile(
+    input: torch.Tensor,
+    q: float | torch.Tensor,
+    interpolation: str = "linear",
+) -> torch.Tensor:
+    """
+    ``torch.quantile`` over the flattened *input*, without its size limit.
+
+    Up to ``_QUANTILE_MAX_NUMEL`` elements this is ``torch.quantile`` itself.
+    Above it, the same order statistics are read from one sort.  The two
+    routes follow the same conventions: *q* is first cast to the input's
+    dtype, the rank is ``q * (n - 1)``, ``"lower"``/``"higher"`` take its
+    floor/ceil, ``"nearest"`` rounds half to even, ``"linear"`` and
+    ``"midpoint"`` interpolate between the neighbouring order statistics
+    (weight ``rank - floor(rank)`` and ``0.5``), and any NaN in *input*
+    makes every result NaN.
+
+    One difference: the sort route forms the rank in float64, because a
+    float32 rank cannot represent integers above 2**24, whereas
+    ``torch.quantile`` forms it in the input dtype.  For a float32 input
+    and a *q* whose float32 product with ``n - 1`` is not exact, the two can
+    therefore select the neighbouring order statistic.
+
+    Parameters
+    ----------
+    input : torch.Tensor
+        Scores of any shape; flattened.
+    q : float or torch.Tensor
+        Level in ``[0, 1]``: a Python float (scalar result) or a 0-d / 1-D
+        tensor of levels (result of the same shape).
+    interpolation : ``'linear'`` | ``'lower'`` | ``'higher'`` | ``'nearest'`` | ``'midpoint'``
+        How to resolve a rank between two order statistics.
+
+    Returns
+    -------
+    torch.Tensor
+        In the input's dtype and on its device.
+    """
+    if input.numel() <= _QUANTILE_MAX_NUMEL:
+        return torch.quantile(input, q, interpolation=interpolation)
+
+    q_t = torch.as_tensor(q, dtype=input.dtype, device=input.device)
+    if bool(((q_t < 0) | (q_t > 1)).any()):
+        raise RuntimeError("quantile() q values must be in the range [0, 1]")
+    ordered = input.reshape(-1).sort().values
+    last = ordered.numel() - 1
+    ranks = q_t.to(torch.float64) * last
+    if bool(torch.isnan(ordered[-1])):  # NaN sorts last
+        ranks = torch.full_like(ranks, last)
+    if interpolation == "lower":
+        ranks = ranks.floor()
+    elif interpolation == "higher":
+        ranks = ranks.ceil()
+    elif interpolation == "nearest":
+        ranks = ranks.round()
+    below = ranks.to(torch.long)
+    values = ordered[below]
+    if interpolation in ("linear", "midpoint"):
+        weights = (
+            torch.full_like(ranks, 0.5) if interpolation == "midpoint" else ranks - below
+        )
+        above = ranks.ceil().to(torch.long)
+        values = torch.lerp(values, ordered[above], weights.to(input.dtype))
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Abstract base class
 # ---------------------------------------------------------------------------
@@ -554,7 +625,7 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         if self._should_update_queue():
             keep = targets != self.ignore_index
             self._queue.enqueue(
-                logits[keep],
+                logits.detach()[keep],
                 targets[keep],
                 is_iid=live_iid[keep],
                 sample_weight=None if sample_weight is None else sample_weight[keep],

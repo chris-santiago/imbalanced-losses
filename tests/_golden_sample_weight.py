@@ -47,8 +47,8 @@ fixture before committing the new one::
     uv run python tests/_golden_sample_weight.py
 
 Check a regenerated fixture against the previous one (exit 0 only when the key
-sets match and every tensor is bitwise equal except the allowed step-2
-entries of the ``queue_size=64`` configurations)::
+sets match and every tensor has the same dtype and shape and identical bytes,
+except the allowed step-2 entries of the ``queue_size=64`` configurations)::
 
     uv run python tests/_golden_sample_weight.py --compare OLD_FIXTURE
 
@@ -409,12 +409,27 @@ def allowed_to_differ() -> set[str]:
     return allowed
 
 
+def _bitwise_identical(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Same dtype, same shape and identical bytes.
+
+    Stricter than ``torch.equal``, which treats ``-0.0`` and ``0.0`` as equal,
+    treats a NaN as different from itself and ignores dtype.
+    """
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    return torch.equal(
+        a.contiguous().reshape(-1).view(torch.uint8),
+        b.contiguous().reshape(-1).view(torch.uint8),
+    )
+
+
 def compare_fixtures(
     old: dict[str, Any], new: dict[str, Any]
 ) -> tuple[list[str], list[str]]:
     """Compare two fixtures; return ``(differing, violations)``.
 
-    ``differing`` lists every tensor key whose values are not ``torch.equal``.
+    ``differing`` lists every tensor key whose tensors are not bitwise
+    identical (see :func:`_bitwise_identical`: dtype, shape and bytes).
     ``violations`` names every problem: a key present in only one fixture, or
     a differing key outside :func:`allowed_to_differ`. The comparison passes
     when ``violations`` is empty. Non-tensor entries (the ``_meta_`` fields)
@@ -430,7 +445,10 @@ def compare_fixtures(
         key
         for key in old.keys() & new.keys()
         if isinstance(old[key], torch.Tensor)
-        and not torch.equal(old[key], new[key])
+        and not (
+            isinstance(new[key], torch.Tensor)
+            and _bitwise_identical(old[key], new[key])
+        )
     )
     allowed = allowed_to_differ()
     violations.extend(f"differs but not allowed: {k}" for k in differing if k not in allowed)

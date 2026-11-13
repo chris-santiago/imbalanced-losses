@@ -66,7 +66,7 @@ from typing import Any, Literal, NamedTuple
 
 import torch
 
-from imbalanced_losses._base import _QueuedRankingLoss, _to_compute_dtype
+from imbalanced_losses._base import _QueuedRankingLoss, _quantile, _to_compute_dtype
 from imbalanced_losses._queue import PooledBatch
 from imbalanced_losses._weights import _positive_mass
 
@@ -440,7 +440,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         surrogate), then the two band edges ``1 - alpha`` and ``1 - beta``,
         then the IQR pair ``0.75, 0.25`` when ``tau_scale='iqr'``.  Packing
         them together lets :meth:`_band_quantiles_and_scale` resolve all of
-        them with a single ``torch.quantile`` call, which sorts ``ref`` once
+        them with a single quantile call (``torch.quantile``, or its sort-based
+        equivalent for a reference above ``torch.quantile``'s size limit; see
+        :func:`~imbalanced_losses._base._quantile`), which sorts ``ref`` once
         instead of once per level.
 
         The knot levels are all built by tensor subtraction from a
@@ -525,7 +527,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         ``torch.quantile`` sorts its input once per call, so the knots, the
         band edges and the IQR quantiles are issued as one call rather than
-        the four or five this used to take.  The endpoint knot levels carry
+        the four or five this used to take.  The call goes through
+        :func:`~imbalanced_losses._base._quantile`, which is
+        ``torch.quantile`` itself up to that function's 2**24-element input
+        limit and an exact one-sort equivalent above it (a full pre-subsampling
+        pool can exceed the limit).  The endpoint knot levels carry
         the band edges' exact bits (see :meth:`_band_levels`), so
         ``t_k[0] == t_alpha`` and ``t_k[-1] == t_beta`` always hold.
 
@@ -550,7 +556,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             against ``_SCALE_EPS`` before computing ``tau_eff``.
         """
         q, n_knots = self._band_levels(ref)
-        v = torch.quantile(ref, q, interpolation=self.quantile_interpolation)
+        v = _quantile(ref, q, interpolation=self.quantile_interpolation)
 
         t_k = v[:n_knots] if n_knots else None
         t_alpha = v[n_knots]
@@ -635,7 +641,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         is_iid: torch.Tensor,
         is_live: torch.Tensor,
         sample_weight: torch.Tensor | None = None,
-        band: _BandThresholds | None = None,
+        band_thresholds: _BandThresholds | None = None,
     ) -> tuple[torch.Tensor, bool, dict[str, Any]]:
         """
         Compute normalized partial AUC over ``[alpha, beta]`` for one class.
@@ -664,7 +670,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             quantiles, ``tau_eff``, and the band mask are never touched.
             Diagnostics (``v``, ``pauc_var``, ``band_neg_count``,
             ``grad_pos_count``) stay unweighted.
-        band : _BandThresholds, optional
+        band_thresholds : _BandThresholds, optional
             Precomputed thresholds for this class, estimated on the full
             pool before subsampling.  When supplied, the reference rows
             are not re-derived from *scores* and the iid-negative guard
@@ -685,7 +691,13 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             negatives, or -- when weighted -- the numerator positives' weight
             mass is zero. When ``pos_numerator="live"``, also False if there
             are no live positives for this class (no gradient signal this
-            step). Invalid classes are excluded from reduction.
+            step). Invalid classes are excluded from reduction.  With
+            *band_thresholds* supplied, the reference rows and the dispersion
+            are those of the full pre-subsampling pool: a class whose pool
+            has no reference rows never reaches here, a subsample without
+            iid negatives does not invalidate the class, and the degenerate
+            test reads the supplied scale (the band-negative and
+            positive-count tests still read *scores*).
         diag : dict
             Diagnostic scalars for this class (all detached) when
             ``self._want_diag`` is True. Keys: ``t_alpha``, ``t_beta``,
@@ -700,7 +712,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         Band edges ``t_alpha``/``t_beta`` and ``tau_eff`` come from a
         DETACHED reference population -- selected by ``self.budget_basis``
         (iid negatives under ``"fpr"``, the whole iid population under
-        ``"population"``), computed from *scores* or supplied as *band*
+        ``"population"``), computed from *scores* or supplied as *band_thresholds*
         (the full pre-subsampling pool) -- regardless of ``pos_numerator``: the queue still
         stabilizes thresholds even when the numerator is restricted to live
         positives. The ``band_neg_count`` diagnostic always counts iid
@@ -716,7 +728,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         # point (see _class_thresholds).  With supplied thresholds that
         # guard was already applied to the full pool, so the subsample having
         # none of them is not a reason to drop the class.
-        if n_pos == 0 or (band is None and int(iid_neg.sum()) == 0):
+        if n_pos == 0 or (band_thresholds is None and int(iid_neg.sum()) == 0):
             return scores.new_zeros(()), False, {}
 
         # Determine the numerator positive set.
@@ -736,9 +748,9 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
                 # Zero weighted positive mass: same invalid path as n_pos == 0.
                 return scores.new_zeros(()), False, {}
 
-        if band is None:
-            band = self._class_thresholds(scores, is_neg, is_iid)
-        t_k, t_alpha, t_beta, scale = band
+        if band_thresholds is None:
+            band_thresholds = self._class_thresholds(scores, is_neg, is_iid)
+        t_k, t_alpha, t_beta, scale = band_thresholds
 
         # Degeneracy guard: if the robust dispersion is ~zero, the sigmoid
         # temperature cannot be calibrated.  Mark as invalid rather than
@@ -783,7 +795,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         tau_eff = self.temperature * scale.clamp_min(self._SCALE_EPS)
 
         if self.surrogate == "trapezoid":
-            # t_k came back from the single quantile call above, alongside the
+            # t_k came back from the single quantile call (one sort), alongside the
             # band edges and the IQR pair.
             p = scores[pos_num]  # gradient flows here (numerator positive set)
             # [n_pos_num, n_knots]; each row is the contribution vector for one positive.
@@ -1056,16 +1068,16 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         thresholds: list[_BandThresholds | None] | None,
     ) -> tuple[torch.Tensor, bool, dict[str, Any]]:
         """Run :meth:`_compute_pauc` for class ``c`` with its full-pool thresholds, if any."""
-        band = None
+        band_thresholds = None
         if thresholds is not None:
-            band = thresholds[c]
-            if band is None:
+            band_thresholds = thresholds[c]
+            if band_thresholds is None:
                 # No iid negatives in the full pool: invalid, as in the
                 # unsubsampled guard.
                 return logits.new_zeros(()), False, {}
         return self._compute_pauc(
             logits[:, c], is_pos, ~is_pos, is_iid, is_live,
-            sample_weight=sample_weight, band=band,
+            sample_weight=sample_weight, band_thresholds=band_thresholds,
         )
 
     def _compute_per_class(
