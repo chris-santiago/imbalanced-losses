@@ -31,7 +31,8 @@ from typing import Literal
 
 import torch
 
-from imbalanced_losses._base import _QueuedRankingLoss, _quantile
+from imbalanced_losses._base import _QueuedRankingLoss
+from imbalanced_losses._quantile import _quantile
 from imbalanced_losses._queue import PooledBatch
 from imbalanced_losses._weights import _positive_mass
 
@@ -245,7 +246,7 @@ class RecallAtQuantileLoss(_QueuedRankingLoss):
         the per-class compute both call it.  The quantile is
         ``torch.quantile`` up to its 2**24-element input limit and an exact
         sort-based equivalent above it (the full pre-subsampling pool can
-        exceed the limit); see :func:`~imbalanced_losses._base._quantile`.
+        exceed the limit); see :func:`~imbalanced_losses._quantile._quantile`.
 
         Parameters
         ----------

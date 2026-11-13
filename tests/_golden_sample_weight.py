@@ -42,15 +42,25 @@ Usage
 -----
 Regenerate the fixture. Do this only when a deliberate behavior change moves
 stored values, and prove the change with ``--compare`` against the previous
-fixture before committing the new one::
+fixture before committing the new one (after updating the allow-list, see
+below)::
 
     uv run python tests/_golden_sample_weight.py
 
 Check a regenerated fixture against the previous one (exit 0 only when the key
 sets match and every tensor has the same dtype and shape and identical bytes,
-except the allowed step-2 entries of the ``queue_size=64`` configurations)::
+except the keys :func:`allowed_to_differ` names)::
 
     uv run python tests/_golden_sample_weight.py --compare OLD_FIXTURE
+
+The allow-list belongs to the one regeneration described above (the enqueue
+filter) and to no other: :func:`allowed_to_differ`, ``COMPARE_ALLOWED_STEP``
+and its ``queue_size`` filter name exactly the step-2 entries of the
+``queue_size=64`` configurations. It is not a general policy. A later
+deliberate regeneration must first rewrite :func:`allowed_to_differ` to name
+the keys its own change is expected to move. Run unedited, ``--compare``
+reports that change's legitimate differences as violations and proves nothing
+about it.
 
 ``tests/test_sample_weight_identity.py`` imports ``build_grid`` and
 ``run_entry`` from this module so the replay uses the exact same inputs the
@@ -395,6 +405,10 @@ def allowed_to_differ() -> set[str]:
     Derived from the grid: every config whose ``queue_size`` is
     ``QUEUE_SIZE_SMALL``, at step ``COMPARE_ALLOWED_STEP``, for every dtype,
     for each field ``run_entry`` stores for it.
+
+    This set records the enqueue-filter regeneration only; it is not a
+    general policy. A future regeneration replaces this rule with the keys
+    its own change moves before running ``--compare``.
     """
     allowed: set[str] = set()
     for config in build_grid():

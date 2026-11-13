@@ -66,7 +66,8 @@ from typing import Any, Literal, NamedTuple
 
 import torch
 
-from imbalanced_losses._base import _QueuedRankingLoss, _quantile, _to_compute_dtype
+from imbalanced_losses._base import _QueuedRankingLoss, _to_compute_dtype
+from imbalanced_losses._quantile import _quantile
 from imbalanced_losses._queue import PooledBatch
 from imbalanced_losses._weights import _positive_mass
 
@@ -447,7 +448,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         them together lets :meth:`_band_quantiles_and_scale` resolve all of
         them with a single quantile call (``torch.quantile``, or its sort-based
         equivalent for a reference above ``torch.quantile``'s size limit; see
-        :func:`~imbalanced_losses._base._quantile`), which sorts ``ref`` once
+        :func:`~imbalanced_losses._quantile._quantile`), which sorts ``ref`` once
         instead of once per level.
 
         The knot levels are all built by tensor subtraction from a
@@ -533,7 +534,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         ``torch.quantile`` sorts its input once per call, so the knots, the
         band edges and the IQR quantiles are issued as one call rather than
         the four or five this used to take.  The call goes through
-        :func:`~imbalanced_losses._base._quantile`, which is
+        :func:`~imbalanced_losses._quantile._quantile`, which is
         ``torch.quantile`` itself up to that function's 2**24-element input
         limit and an exact one-sort equivalent above it (a full pre-subsampling
         pool can exceed the limit).  The endpoint knot levels carry
@@ -575,7 +576,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
     def _class_thresholds(
         self, scores: torch.Tensor, is_neg: torch.Tensor, is_iid: torch.Tensor
-    ) -> _BandThresholds:
+    ) -> _BandThresholds | None:
         """
         Band edges, knots, and dispersion scale for one class.
 
@@ -585,13 +586,13 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         FPR semantics) or the whole pooled iid population (``"population"``,
         a top-k budget over all scores).
 
-        Precondition: at least one iid negative among the rows (either
-        basis needs iid negatives to anchor the operating point).  Callers
-        apply that guard themselves: :meth:`_compute_pauc` on its own pool
-        and :meth:`_estimate_thresholds` on the full pool.  In ``"fpr"``
-        mode the guard is exactly the iid-negative guard; in
-        ``"population"`` mode it additionally rejects a positives-only
-        reference.
+        Returns ``None`` when the rows hold no iid negative: either basis
+        needs iid negatives to anchor the operating point, and this method
+        is the one place that rule lives.  :meth:`_estimate_thresholds`
+        stores the ``None`` for the class, and :meth:`_compute_pauc` and
+        :meth:`_pauc_for_class` treat it as an invalid class.  In ``"fpr"``
+        mode the rule is exactly a non-empty reference; in ``"population"``
+        mode it additionally rejects a positives-only reference.
 
         Parameters
         ----------
@@ -604,10 +605,14 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         Returns
         -------
-        _BandThresholds
-            Detached thresholds.
+        _BandThresholds or None
+            Detached thresholds, or ``None`` when the rows hold no iid
+            negative.
         """
-        ref_mask = is_iid if self.budget_basis == "population" else is_neg & is_iid
+        iid_neg = is_neg & is_iid
+        if not bool(iid_neg.any()):
+            return None
+        ref_mask = is_iid if self.budget_basis == "population" else iid_neg
         ref = scores[ref_mask].detach()
         # One sort resolves the band edges, the trapezoid knots (when that
         # surrogate is active) and the IQR bulk quantiles together.
@@ -622,10 +627,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         Returns
         -------
         list of _BandThresholds or None, length C
-            Entry ``c`` is class ``c``'s detached thresholds, or ``None``
-            when the class has no iid negatives in the full pool (the
-            class is then invalid).  The degenerate-dispersion check is
-            left to the per-class compute, which owns its warning.
+            Entry ``c`` is :meth:`_class_thresholds` for class ``c`` over
+            the full pool: its detached thresholds, or ``None`` when the
+            class has no iid negatives there (the class is then invalid).
+            The degenerate-dispersion check is left to the per-class
+            compute, which owns its warning.
         """
         if self.num_classes == 1:
             is_pos_by_class = [pool.targets.bool()]
@@ -633,8 +639,6 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
             is_pos_by_class = [pool.targets == c for c in range(self.num_classes)]
         return [
             self._class_thresholds(pool.logits[:, c], ~is_pos, pool.is_iid)
-            if bool((~is_pos & pool.is_iid).any())
-            else None
             for c, is_pos in enumerate(is_pos_by_class)
         ]
 
@@ -678,10 +682,11 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         band_thresholds : _BandThresholds, optional
             Precomputed thresholds for this class, estimated on the full
             pool before subsampling.  When supplied, the reference rows
-            are not re-derived from *scores* and the iid-negative guard
-            was already applied by the estimator (a class without
-            reference rows never reaches here).  ``None`` (default)
-            computes them from *scores* with :meth:`_class_thresholds`.
+            are not re-derived from *scores*: the thresholds came from
+            :meth:`_class_thresholds` on the full pool, and a class for
+            which it returned ``None`` never reaches here.  ``None``
+            (default) computes them from *scores* with
+            :meth:`_class_thresholds`.
 
         Returns
         -------
@@ -729,11 +734,7 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         """
         iid_neg = is_neg & is_iid
         n_pos = int(is_pos.sum())
-        # Either reference basis needs iid negatives to anchor the operating
-        # point (see _class_thresholds).  With supplied thresholds that
-        # guard was already applied to the full pool, so the subsample having
-        # none of them is not a reason to drop the class.
-        if n_pos == 0 or (band_thresholds is None and int(iid_neg.sum()) == 0):
+        if n_pos == 0:
             return scores.new_zeros(()), False, {}
 
         # Determine the numerator positive set.
@@ -755,6 +756,10 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
 
         if band_thresholds is None:
             band_thresholds = self._class_thresholds(scores, is_neg, is_iid)
+            if band_thresholds is None:
+                # No iid negatives to anchor the band (rule owned by
+                # _class_thresholds).
+                return scores.new_zeros(()), False, {}
         t_k, t_alpha, t_beta, scale = band_thresholds
 
         # Degeneracy guard: if the robust dispersion is ~zero, the sigmoid
@@ -1077,8 +1082,8 @@ class PAUCAtBudgetLoss(_QueuedRankingLoss):
         if thresholds is not None:
             band_thresholds = thresholds[c]
             if band_thresholds is None:
-                # No iid negatives in the full pool: invalid, as in the
-                # unsubsampled guard.
+                # _class_thresholds found no iid negatives in the full pool:
+                # invalid, as on the unsubsampled path.
                 return logits.new_zeros(()), False, {}
         return self._compute_pauc(
             logits[:, c], is_pos, ~is_pos, is_iid, is_live,
