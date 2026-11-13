@@ -409,3 +409,182 @@ class TestMultiClassTargetRange:
 
     def test_recall_loss_no_longer_overrides_the_hook(self):
         assert "_validate_filtered_targets" not in RecallAtQuantileLoss.__dict__
+
+
+class TestEmptyPoolSentinel:
+    """An empty pool returns NaN per class under reduction='none'."""
+
+    IGNORE = -100
+
+    @staticmethod
+    def _empty_batch(num_classes, dtype=torch.float32, n=8):
+        logits = torch.randn(n, num_classes, dtype=dtype)
+        targets = torch.full((n,), TestEmptyPoolSentinel.IGNORE, dtype=torch.long)
+        return logits, targets
+
+    @staticmethod
+    def _assert_nan_vec(out, num_classes, dtype=torch.float32):
+        assert out.shape == (num_classes,)
+        assert out.dtype == dtype
+        assert torch.isnan(out).all()
+        assert out.requires_grad is False
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_all_ignored_none_is_nan(self, loss_name, num_classes):
+        loss = make_loss(loss_name, num_classes, 0, reduction="none")
+        logits, targets = self._empty_batch(num_classes)
+        out = loss(_leaf(logits), targets)
+        self._assert_nan_vec(out, num_classes)
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_matches_non_empty_all_degenerate_sentinel(self, loss_name, num_classes):
+        # Reference: a non-empty pool with no positives, so every class is degenerate.
+        loss = make_loss(loss_name, num_classes, 0, reduction="none")
+        logits, _ = self._empty_batch(num_classes)
+        targets = torch.zeros(8, dtype=torch.long)
+        ref = loss(logits, targets)
+        empty = make_loss(loss_name, num_classes, 0, reduction="none")(
+            logits, torch.full((8,), self.IGNORE, dtype=torch.long)
+        )
+        assert torch.isnan(ref).any()  # degenerate classes use the NaN sentinel
+        assert torch.isnan(empty).all()
+        assert empty.shape == ref.shape
+        assert empty.dtype == ref.dtype
+        assert empty.requires_grad == ref.requires_grad
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    @pytest.mark.parametrize("reduction", ["mean", "sum"])
+    def test_all_ignored_mean_sum_zero_with_grad_path(
+        self, loss_name, num_classes, reduction
+    ):
+        loss = make_loss(loss_name, num_classes, 0, reduction=reduction)
+        logits, targets = self._empty_batch(num_classes)
+        leaf = _leaf(logits)
+        out = loss(leaf, targets)
+        assert out.shape == ()
+        assert out.item() == 0.0
+        assert out.requires_grad
+        out.backward()
+        assert leaf.grad is not None
+        assert (leaf.grad == 0).all()
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    @pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+    def test_return_per_class(self, loss_name, num_classes, reduction):
+        loss = make_loss(loss_name, num_classes, 0, reduction=reduction)
+        logits, targets = self._empty_batch(num_classes)
+        out, per_class, valid = loss(logits, targets, return_per_class=True)
+        if reduction == "none":
+            self._assert_nan_vec(out, num_classes)
+        else:
+            assert out.item() == 0.0
+        self._assert_nan_vec(per_class, num_classes)
+        assert valid.shape == (num_classes,)
+        assert valid.dtype == torch.bool
+        assert not valid.any()
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_per_class_is_not_aliased_to_loss(self, loss_name, num_classes):
+        loss = make_loss(loss_name, num_classes, 0, reduction="none")
+        logits, targets = self._empty_batch(num_classes)
+        out, per_class, _ = loss(logits, targets, return_per_class=True)
+        per_class.fill_(1.0)
+        assert torch.isnan(out).all()
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_zero_row_batch_empty_queue(self, loss_name, num_classes):
+        loss = make_loss(loss_name, num_classes, 64, reduction="none")
+        out = loss(torch.zeros(0, num_classes), torch.zeros(0, dtype=torch.long))
+        self._assert_nan_vec(out, num_classes)
+        assert int(loss._queue._q_ptr) == 0
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_float64(self, loss_name, num_classes):
+        loss = make_loss(loss_name, num_classes, 0, reduction="none")
+        logits, targets = self._empty_batch(num_classes, torch.float64)
+        self._assert_nan_vec(loss(logits, targets), num_classes, torch.float64)
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    @HALF_DTYPES
+    def test_half_logits_give_float32_nan(self, loss_name, num_classes, half):
+        loss = make_loss(loss_name, num_classes, 0, reduction="none")
+        logits, targets = self._empty_batch(num_classes, half)
+        self._assert_nan_vec(loss(logits, targets), num_classes, torch.float32)
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_sample_weight_on_all_ignored(self, loss_name, num_classes):
+        logits, targets = self._empty_batch(num_classes)
+        weight = torch.linspace(0.5, 2.0, 8)
+        none = make_loss(loss_name, num_classes, 0, reduction="none")
+        self._assert_nan_vec(none(logits, targets, sample_weight=weight), num_classes)
+        mean = make_loss(loss_name, num_classes, 0, reduction="mean")
+        leaf = _leaf(logits)
+        out = mean(leaf, targets, sample_weight=weight)
+        assert out.item() == 0.0
+        out.backward()
+        assert (leaf.grad == 0).all()
+
+    @NUM_CLASSES
+    def test_pauc_diagnostics_on_empty_pool(self, num_classes):
+        loss = make_loss("pauc_at_budget", num_classes, 0, reduction="none")
+        logits, targets = self._empty_batch(num_classes)
+        out, stats = loss(logits, targets, return_diagnostics=True)
+        self._assert_nan_vec(out, num_classes)
+        for key in ("t_alpha", "t_beta", "tau_eff", "pauc_var"):
+            assert stats[key].shape == (num_classes,)
+            assert stats[key].dtype.is_floating_point
+            assert torch.isnan(stats[key]).all(), key
+        for key in ("band_neg_count", "grad_pos_count"):
+            assert stats[key].shape == (num_classes,)
+            assert (stats[key] == 0).all(), key
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_queue_untouched_after_empty_pool(self, loss_name, num_classes):
+        loss = make_loss(loss_name, num_classes, 64, reduction="none")
+        logits, targets = self._empty_batch(num_classes)
+        loss(logits, targets)
+        assert int(loss._queue._q_ptr) == 0
+        assert (loss._queue._q_targets == self.IGNORE).all()
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    @pytest.mark.parametrize("reduction", ["none", "mean"])
+    def test_no_warning_on_empty_pool(self, loss_name, num_classes, reduction):
+        import warnings
+
+        loss = make_loss(loss_name, num_classes, 64, reduction=reduction)
+        logits, targets = self._empty_batch(num_classes)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            loss(logits, targets, return_per_class=True)
+
+    @RANKING_LOSSES
+    @NUM_CLASSES
+    def test_all_ignored_live_batch_with_filled_queue_is_not_empty(
+        self, loss_name, num_classes
+    ):
+        # The queue holds real rows, so the pool is non-empty and the general
+        # path runs: the result equals ranking the queued rows alone, and the
+        # early return (which would give NaN everywhere) is not taken.
+        loss = make_loss(loss_name, num_classes, 64, reduction="none")
+        logits, targets = make_batch(num_classes, 0)
+        loss(logits, targets)  # fills the queue (96 rows > 64, keeps last 64)
+        assert (loss._queue._q_targets != self.IGNORE).any()
+        ref = make_loss(loss_name, num_classes, 0, reduction="none")
+        q_logits = loss._queue._q_logits.clone()
+        q_targets = loss._queue._q_targets.clone()
+        live_logits, live_targets = self._empty_batch(num_classes)
+        out = loss(live_logits, live_targets)
+        expected = ref(q_logits, q_targets)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0, equal_nan=True)
+        assert not torch.isnan(out).all()

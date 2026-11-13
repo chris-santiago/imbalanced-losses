@@ -324,7 +324,11 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
         -------
         loss : torch.Tensor
             Scalar (reduction='mean' or 'sum') or shape [C]
-            (reduction='none').
+            (reduction='none').  When the pool is empty (every row is
+            ``ignore_index``, or a zero-row batch with an empty queue),
+            'none' returns ``nan`` for every class, matching the
+            all-degenerate case; 'mean' and 'sum' return ``0.0`` with a
+            gradient path.
         per_class_loss : torch.Tensor, shape [C]
             Only returned when ``return_per_class=True``.
         valid_classes : torch.Tensor, shape [C], dtype=bool
@@ -440,13 +444,16 @@ class _QueuedRankingLoss(_SampleWeightMixin, nn.Module, abc.ABC):
 
         # --- empty pool check ------------------------------------------------
         if pool.logits.size(0) == 0:
-            out = logits.sum() * 0.0
+            nan_per_class = logits.new_full((self.num_classes,), float("nan"))
             if self.reduction == "none":
-                out = out.expand(self.num_classes)
+                # Same sentinel as a non-empty pool of all-degenerate classes.
+                out = nan_per_class
+            else:
+                out = logits.sum() * 0.0
             if return_per_class:
                 return (
                     out,
-                    logits.new_full((self.num_classes,), float("nan")),
+                    nan_per_class.clone(),
                     torch.zeros(
                         self.num_classes, dtype=torch.bool, device=logits.device
                     ),
