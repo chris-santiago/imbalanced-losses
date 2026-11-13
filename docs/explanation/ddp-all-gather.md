@@ -24,11 +24,13 @@ One caveat: if `max_pool_size` subsampling triggers, each rank draws its own ran
 
 Standard `dist.all_gather` writes into fresh output buffers that have no connection to the computation graph: every gathered slice comes back detached, including the local rank's own. If you simply all-gathered logits and passed them to the loss, *zero* gradient would flow back to the model parameters. The loss value would be correct and training would silently do nothing.
 
-`all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the original tensor (which is connected to the computation graph), while keeping other workers' slices detached:
+`all_gather_with_grad` fixes this by replacing the local rank's slice in the gathered output with the local tensor itself (which is connected to the computation graph), while keeping other workers' slices detached:
 
 ```python
-gathered[rank] = tensor   # restores gradient connection
+gathered[rank] = local_slice   # the local tensor: restores the gradient connection
 ```
+
+`local_slice` has the same values as the tensor you passed in. By default it is a view of it whose backward pass scales the gradient, which the next paragraphs explain.
 
 Each rank therefore backpropagates only through its own slice of the global batch. The other ranks' contributions are not lost: every rank computes the identical global loss, so each rank produces the gradient with respect to its own slice. `DistributedDataParallel` then **averages** parameter gradients across ranks. An average of per-slice gradients is the full-batch gradient divided by `world_size`, so on its own this would shrink every update by that factor, as if the learning rate had been divided by the number of GPUs.
 
@@ -53,7 +55,7 @@ Both gather helpers handle this automatically using a **pad-to-max-then-trim** s
 3. `dist.all_gather` runs on the padded tensors (now equal shape).
 4. Each gathered slice is trimmed back to its true length before concatenation.
 
-Gradient flow is unaffected: the local rank's slice is still replaced with the original (unpadded) tensor, which carries the autograd graph.
+Gradient flow is unaffected: the local rank's slice is still replaced with the local (unpadded) tensor, which carries the autograd graph.
 
 When all ranks contribute the same number of rows, an **equal-size fast path** detects this and skips padding and trimming entirely, adding no overhead compared to the previous behavior.
 

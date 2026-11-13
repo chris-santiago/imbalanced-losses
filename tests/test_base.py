@@ -1550,9 +1550,13 @@ class TestGoldenFixtureCompare:
         key = self._disallowed_key(golden, new_fixture, "|loss", "float32")
         assert new_fixture[key].dtype == torch.float32
         old = dict(new_fixture)
-        old[key] = new_fixture[key].double()
-        # Equal as values, different dtype.
-        assert torch.equal(old[key], new_fixture[key])
+        # Same byte length and the same bytes, so only the dtype differs.
+        old[key] = new_fixture[key].view(torch.int32)
+        assert old[key].dtype != new_fixture[key].dtype
+        assert torch.equal(
+            old[key].reshape(-1).view(torch.uint8),
+            new_fixture[key].reshape(-1).view(torch.uint8),
+        )
         result = self._run_compare(golden, old, tmp_path)
         assert result.returncode != 0
         assert key in result.stderr
@@ -1961,12 +1965,21 @@ class TestQuantileHelper:
             base_module._quantile(x, torch.tensor([0.5, bad]))
 
     def test_real_size_input_above_the_torch_limit(self):
-        n = 2**24 + 1
-        # Reversed, distinct integers 0 .. 2**24 (all exact in float32), so the
-        # order statistic of rank r is r - 2**24 after the negation.
-        x = torch.arange(n, dtype=torch.float32).neg_()
+        # n - 1 = 2**24 + 3 is not a float32 integer: a float32 rank for
+        # q = 1.0 rounds to 2**24 + 4, one past the last index, so this size
+        # fails unless the rank is formed in float64.
+        m = 2**22 + 1
+        n = 4 * m
+        # Each of 0 .. 2**22 four times, descending (all exact in float32):
+        # the order statistic of rank r is r // 4 - 2**22.
+        x = torch.arange(m, dtype=torch.float32).repeat_interleave(4).neg_()
+        assert x.numel() == n
         with pytest.raises(RuntimeError, match="too large"):
             torch.quantile(x, 0.5)
+
+        def statistic(rank):
+            return float(rank // 4 - 2**22)
+
         levels = [0.0, 0.25, 0.5, 0.995, 1.0]
         # The rank is the float32-valued level times n - 1 in float64.
         ranks = [torch.tensor(q, dtype=torch.float32).item() * (n - 1) for q in levels]
@@ -1976,13 +1989,34 @@ class TestQuantileHelper:
         ):
             result = base_module._quantile(x, q, interpolation=mode)
             assert result.dtype == torch.float32
-            assert result.tolist() == [float(pick(r) - 2**24) for r in ranks], mode
+            assert result.tolist() == [statistic(pick(r)) for r in ranks], mode
+        assert result.tolist()[-1] == 0.0  # q = 1.0 is the last order statistic
         # The fractional rank of 0.995 lies between two integers, so the
-        # interpolated value lies strictly between the two picks.
+        # interpolated value lies between the two picks.
         linear = base_module._quantile(x, 0.995, interpolation="linear").item()
-        assert math.floor(ranks[3]) - 2**24 <= linear <= math.ceil(ranks[3]) - 2**24
+        assert statistic(math.floor(ranks[3])) <= linear <= statistic(math.ceil(ranks[3]))
+        # Ranks 2**23 + 1 and 2**23 + 2 both hold 2**21 - 2**22.
         assert base_module._quantile(x, 0.5, interpolation="midpoint").item() == (
-            2**23 - 2**24
+            2**21 - 2**22
+        )
+
+    @pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="MPS not available"
+    )
+    @QUANTILE_MODE_PARAM
+    def test_fallback_on_mps_equals_the_cpu_computation(self, always_fallback, mode):
+        # MPS has no float64, so the ranks must be formed on the CPU.
+        x = _tied_sample(1001, torch.float32)
+        q = torch.tensor(DYADIC_LEVELS + INEXACT_LEVELS, dtype=torch.float32)
+        actual = base_module._quantile(x.to("mps"), q.to("mps"), interpolation=mode)
+        assert actual.device.type == "mps"
+        expected = base_module._quantile(x, q, interpolation=mode)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        scalar = base_module._quantile(x.to("mps"), 0.995, interpolation=mode)
+        assert scalar.ndim == 0
+        torch.testing.assert_close(
+            scalar.cpu(), base_module._quantile(x, 0.995, interpolation=mode),
+            rtol=0, atol=0,
         )
 
 

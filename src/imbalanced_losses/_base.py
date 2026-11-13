@@ -93,11 +93,16 @@ def _quantile(
     (weight ``rank - floor(rank)`` and ``0.5``), and any NaN in *input*
     makes every result NaN.
 
-    One difference: the sort route forms the rank in float64, because a
-    float32 rank cannot represent integers above 2**24, whereas
-    ``torch.quantile`` forms it in the input dtype.  For a float32 input
-    and a *q* whose float32 product with ``n - 1`` is not exact, the two can
-    therefore select the neighbouring order statistic.
+    Callers pass a float or 1-D tensor *q* in ``[0, 1]``, a float32 or
+    float64 input and one of the five interpolation names.  Above the limit
+    the sort route checks only the range of *q*: it does not reject a NaN
+    *q*, an unknown interpolation name (treated as ``"lower"``), a *q* tensor
+    of another dtype or with more than one dimension, or a float16/bfloat16
+    input.  It also forms the rank in float64 (on the CPU), because a float32
+    rank cannot represent integers above 2**24, whereas ``torch.quantile``
+    uses the input dtype.  For a float32 input and a *q* whose float32
+    product with ``n - 1`` is not exact, the two can select the neighbouring
+    order statistic.
 
     Parameters
     ----------
@@ -117,7 +122,9 @@ def _quantile(
     if input.numel() <= _QUANTILE_MAX_NUMEL:
         return torch.quantile(input, q, interpolation=interpolation)
 
-    q_t = torch.as_tensor(q, dtype=input.dtype, device=input.device)
+    # The few levels are handled on the CPU in float64 (MPS has no float64);
+    # only the integer indices and the weights move to the input's device.
+    q_t = torch.as_tensor(q, dtype=input.dtype).cpu()
     if bool(((q_t < 0) | (q_t > 1)).any()):
         raise RuntimeError("quantile() q values must be in the range [0, 1]")
     ordered = input.reshape(-1).sort().values
@@ -132,13 +139,17 @@ def _quantile(
     elif interpolation == "nearest":
         ranks = ranks.round()
     below = ranks.to(torch.long)
-    values = ordered[below]
+    values = ordered[below.to(input.device)]
     if interpolation in ("linear", "midpoint"):
         weights = (
             torch.full_like(ranks, 0.5) if interpolation == "midpoint" else ranks - below
         )
         above = ranks.ceil().to(torch.long)
-        values = torch.lerp(values, ordered[above], weights.to(input.dtype))
+        values = torch.lerp(
+            values,
+            ordered[above.to(input.device)],
+            weights.to(device=input.device, dtype=input.dtype),
+        )
     return values
 
 

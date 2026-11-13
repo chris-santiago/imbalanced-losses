@@ -13,6 +13,7 @@ Helper functions for DDP all-gather with correct gradient handling. Located in `
 ## Usage pattern
 
 ```python
+from imbalanced_losses import SmoothAPLoss
 from imbalanced_losses.distributed import all_gather_with_grad, all_gather_no_grad
 
 # The loss must not gather again: construct it with gather_distributed=False.

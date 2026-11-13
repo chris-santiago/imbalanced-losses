@@ -57,6 +57,6 @@ The core AP computation is O(|P| × M) by construction (only the positive rows o
 
 ## DDP queue synchronization
 
-In distributed training, every worker calls `all_gather` before passing to the loss. This means every worker sees the same global batch and enqueues the same data. No explicit queue synchronization across workers is needed: they are identical by construction.
+In distributed training, every worker calls `all_gather` before passing to the loss. This means every worker sees the same global batch and enqueues the same rows (its non-ignored rows). No explicit queue synchronization across workers is needed: they are identical by construction.
 
-One caveat on loss values (not queues): if `max_pool_size` subsampling triggers, each rank draws its own random subset (unseeded `torch.randperm` per rank), so per-rank loss values can differ slightly on those steps. The queues remain identical, because the full post-gather batch is enqueued, not the subsampled pool.
+One caveat on loss values (not queues): if `max_pool_size` subsampling triggers, each rank draws its own random subset (unseeded `torch.randperm` per rank), so per-rank loss values can differ slightly on those steps. The thresholds of `RecallAtQuantileLoss` and `PAUCAtBudgetLoss` do not differ, because they are estimated on the full gathered pool before subsampling. The queues remain identical, because the non-ignored rows of the post-gather batch are enqueued, not the subsampled pool.

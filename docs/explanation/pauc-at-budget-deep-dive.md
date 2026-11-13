@@ -110,7 +110,7 @@ How many knots are enough depends on where the band starts, not only on how wide
 | 20,000 | −25% | −9% | −3% | −1% |
 | 200,000 | −30% | −11% | −4% | −1% |
 
-At a single-GPU pool (about 1,280 rows) the default is fine. For large pools, such as a DDP-gathered batch plus queue, use `n_knots=5` or more if you want the loss value to track the true pAUC. This is a statement about the estimator's value, not about training outcomes: the default stays at 2, and the lab results in this page were obtained with it.
+At a single-GPU pool (about 1,280 rows) the default is fine. For large pools, such as a DDP-gathered batch plus queue, use `n_knots=5` or more if you want the loss value to track the true pAUC. This is a statement about the estimator's value, not about training outcomes, and the default stays at 2.
 
 **Pairwise** (`surrogate="pairwise"`). Band-restricted Smooth-AP. It compares positives
 against the negatives that land *inside* the band, which carry gradient:
