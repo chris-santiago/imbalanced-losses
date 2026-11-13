@@ -21,11 +21,14 @@ Sections
 
 from __future__ import annotations
 
+import importlib
+import math
 import warnings
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from imbalanced_losses import SigmoidFocalLoss, SoftmaxFocalLoss
 
@@ -1525,11 +1528,6 @@ class TestSampleWeightGatherDistributed:
 # 15. Focal modulator guard and gamma validation
 # ===========================================================================
 
-import importlib
-import math
-
-import torch.nn.functional as F
-
 _focal_module = importlib.import_module("imbalanced_losses.focal_loss")
 
 _DTYPES = [torch.float32, torch.float64]
@@ -1654,7 +1652,6 @@ class TestFocalModulatorGuard:
             assert (loss > 0).all()
 
     def test_half_precision_grad_finite(self, kind):
-        gen = torch.Generator().manual_seed(SEED)
         if kind == "sigmoid":
             targets = torch.ones(8, dtype=torch.float16)
             logits = torch.full((8,), 12.0, dtype=torch.float16)
